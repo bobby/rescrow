@@ -1,0 +1,4 @@
+[
+  {"operation_id":"spend","resource_id":"credits","delta":"-40"},
+  {"operation_id":"tokens","resource_id":"tokens","delta":"-3"}
+]

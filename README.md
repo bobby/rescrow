@@ -1,8 +1,109 @@
 # Rescrow
 
-Rescrow is a proposed Rust implementation of durable escrow transactions for resource budgets. Reserve a bounded quantity, authorize work, and settle actual usage while other agents and workflows continue using the remaining capacity.
+Rescrow is a Rust implementation of local durable escrow transactions for resource budgets. Reserve a bounded quantity, coordinate work, and settle actual usage while other agents and workflows continue using the remaining capacity.
 
-The repository currently contains design documentation. There is no implementation, installable CLI, or measured performance yet. [DESIGN.md](DESIGN.md) specifies the protocol, deployment profiles, security model, and qualification work.
+The first milestone implements a pure Domain, a synchronous Application API with validated transfer types, and a file-backed local CLI. [PLAN.md](PLAN.md) records the scope and completion evidence. [DESIGN.md](DESIGN.md) describes the broader proposed distributed protocol, security model, and enterprise qualification targets. There are no measured performance or enterprise durability claims.
+
+## Build and run locally
+
+Requires Linux and Rust/Cargo 1.96.0, pinned in `rust-toolchain.toml`. No HTTP server, cloud account, or async runtime is required.
+
+```sh
+cargo build -p rescrow-cli --locked
+# Optional installation:
+cargo install --path crates/rescrow-cli --locked
+```
+
+Select a store explicitly with `--store` **before** the command. Its parent directory must already exist. Initialization creates the store with owner-only permissions; an existing directory must also have owner-only permissions. Each command below is a separate process. Use a fresh `.rescrow` directory for this example; `init` never overwrites existing state.
+
+```sh
+target/debug/rescrow --store .rescrow init
+target/debug/rescrow --store .rescrow resource create credits --initial 60 --upper 100 --unit credits
+target/debug/rescrow --store .rescrow resource create tokens --initial 8 --unit tokens
+
+target/debug/rescrow --store .rescrow transaction prepare work --operations examples/operations.json
+target/debug/rescrow --store .rescrow transaction prepare replenishment --operations examples/credit.json
+target/debug/rescrow --store .rescrow resource show credits
+# quantity=60, reserved down=40 up=30, available down=20 up=10
+
+target/debug/rescrow --store .rescrow transaction commit work --actuals examples/actuals.json
+target/debug/rescrow --store .rescrow transaction abort replenishment
+target/debug/rescrow --store .rescrow --json resource list
+# credits=35, tokens=8; both resources have no holds
+
+# Identical retries return the existing outcome and do not consume again:
+target/debug/rescrow --store .rescrow transaction prepare work --operations examples/operations.json
+target/debug/rescrow --store .rescrow transaction commit work --actuals examples/actuals.json
+target/debug/rescrow --store .rescrow transaction show work
+```
+
+`resource list`, `transaction list`, and `transaction show <id>` inspect one consistent ledger. `transaction commit <id>` without `--actuals` commits the full reservation. `resource create` accepts `--lower` (default `0`), optional `--upper` (otherwise unbounded), required `--initial` and `--unit`, and `--scale` (default `0`, maximum `38`). Scale describes the integer's decimal places; no conversion or floating-point arithmetic occurs. Bounds and metadata are immutable.
+
+Operation files contain a nonempty array of `{ "operation_id", "resource_id", "delta" }` records, with distinct operation IDs and at most one operation per resource. Actual files contain `{ "operation_id", "delta" }` records for **every** original operation. Deltas and quantities are canonical signed decimal strings (`"0"`, `"-25"`, `"100"`): no leading zeros, plus sign, whitespace, exponent, or negative zero. Reservations must be nonzero; actual zero releases unused capacity. Actuals must have the reserved direction and no greater magnitude. The signed minimum is a valid quantity/bound when its offsets fit, but cannot be a reservation because its absolute magnitude is unrepresentable.
+
+Transaction IDs are caller-supplied permanent replay identities. Valid IDs use 1–128 ASCII letters, digits, dots, underscores, or hyphens. Operation order is normalized by ID; changing parameters under an existing transaction ID conflicts. Identical resource creation is a no-op even after its quantity changes. Pending credits cannot fund debits, and pending debits cannot supply upward room. A capacity, total-overflow, or missing-resource rejection is durably recorded as an aborted transaction before its business error is returned. It cannot later reserve under that ID. Malformed requests fail before admission. A missing-resource prepare retains its rejected original request even if that resource is later created. Terminal identities are retained indefinitely. Repeated terminal commands must agree with the existing decision and actuals.
+
+Use `--json` for typed Application results on stdout and structured errors on stderr. Quantities remain strings, including values beyond JavaScript's exact integer range. Success has a `result` tag and a `value` payload where applicable. Errors have stable `category` and `code` fields plus a diagnostic `message`. Clap usage/help errors are textual. No prompts or hidden process state are involved.
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | Success. |
+| 2 | Invalid input or CLI usage. |
+| 3 | Domain capacity/overflow rejection (an admitted prepare rejection is retained). |
+| 4 | Identity/terminal conflict, missing referenced object (an admitted prepare rejection is retained), or already initialized. |
+| 5 | Bounded lock contention or exhausted CAS retries; retry the same request. |
+| 6 | Storage failure, missing/corrupt/unsupported/oversized state, or revision exhaustion. |
+| 7 | Unknown publication outcome or failure delivering output; inspect/retry the same identity and request. |
+
+An unknown outcome is never a known rollback. A new transaction ID can reserve again, so preserve the original ID and actuals across retries. After uncertain initialization, inspect the store; retrying `init` validates and synchronizes existing state before reporting `already_initialized`. A directory with an existing lock file but no live snapshot fails closed even for `init`; choose a fresh directory for a new store. A failed initialization before publication may leave such a directory.
+
+## Rust callers and boundaries
+
+The four crates have explicit dependencies:
+
+```text
+rescrow-cli -> rescrow-adapters -> rescrow-application -> rescrow-domain
+           -> rescrow-application
+```
+
+The Domain has no dependencies or serialization. The Application owns `dto::Command`, `dto::Output`, structured errors, versioned snapshots, conversions, and the `SnapshotStore` port. `Application::initialize` and `Application::execute` are the same API the CLI uses. Pure `TryFrom` conversions validate all inbound commands/records; outbound `From` conversions are total. An adapter supplies revisioned load and conditional publication; the Application reevaluates from fresh state on conflicts, up to 32 attempts. Reads and identical replays do not advance the revision.
+
+[The runnable embedded example](crates/rescrow-adapters/examples/embedded.rs) creates a resource, reserves, partially commits, and inspects it through the Rust API. It can share a store with independent CLI invocations:
+
+```sh
+cargo run -p rescrow-adapters --example embedded -- .rescrow
+# Running it again returns the same balance (35 example credits).
+```
+
+`rescrow-adapters::memory::MemoryStore` supplies deterministic tests with conflict, pre-publication, and lost-response injection; it makes no durability promise. File-store fault hooks are explicit Rust constructor options used by qualification tests, never activated by CLI environment variables.
+
+## Local persistence and limits
+
+The selected canonical store directory contains `state.json`, a stable `state.lock`, and possibly orphan `.state-*.tmp` candidates. Every load takes an OS shared lock. Publication takes an exclusive lock, reloads and compares the revision, writes a uniquely created temporary file in the same directory, synchronizes it, renames it over `state.json`, and synchronizes the directory before success. The parent directory is also synchronized at initialization. Reads and replays synchronize the live file and directory to complete a previous uncertain publication. Files use mode `600`, directories `700`; existing broader permissions are rejected. Lock acquisition times out after two seconds, independently of the bounded Application CAS retry policy.
+
+The [Rust rename contract](https://doc.rust-lang.org/std/fs/fn.rename.html) supplies same-filesystem replacement; Linux requires [directory synchronization](https://man7.org/linux/man-pages/man2/fsync.2.html) to persist the directory entry. The adapter never truncates the live state or promotes an orphan candidate. Missing, invalid, oversized (over 16 MiB), or unsupported live snapshots fail closed. There is no automatic backup selection, reset, or rollback after uncertain publication. CLI JSON input files also have a 16 MiB ceiling. Even an unbounded resource has finite representable upward room because quantities, offsets, and totals must fit `i128`.
+
+All participants, holds, replay records, and final effects are published in one ledger snapshot. There are no partially published participants or separate materialization steps to recover. Whole-file validation/rewrites grow with resources and permanently retained transaction history; publications serialize through one lock. This is one logical shard per resource and one cooperating local user per store. It does not enforce budgets against anyone who can directly rewrite the authoritative store. Network filesystems, manual live editing, hard-link/path manipulation, and device loss are outside the local contract.
+
+Reservations never expire automatically. Claims, external execution, trusted metering/refunds, hierarchy, sharding, signed audit history, HTTP, SQLite, and cloud backends remain deferred. The distributed protocol and enterprise RPO/RTO targets in DESIGN.md remain proposed and unqualified.
+
+## Verification
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo build -p rescrow-cli --locked
+cargo tree --workspace --locked
+
+# Select an existing directory on a local persistent filesystem for process tests:
+mkdir -p target/qualification
+RESCROW_TEST_ROOT="$PWD/target/qualification" cargo test --workspace --locked
+```
+
+The suite enumerates small positive/negative reservation sets and partial/zero/abort decisions against independent capacity/balance formulas, tests conversion corruption and replay conflicts, and injects stale revisions and effect failures. Independent CLI processes contend for scarce capacity and race commit/abort and identical retries. File tests kill child publishers before/during writes, after file sync, after rename, and before response delivery, then reload, retry, and check released OS locks. Other tests exercise permission failures, bounded lock contention, unsupported/truncated/oversized state, and injected directory-sync failures.
+
+These checks have been exercised on this development host's Linux tmpfs and Btrfs filesystems. They establish behavior across process termination/restart and simulated I/O failures. They do **not** qualify physical power loss, machine reboot, arbitrary devices/controllers, or regional failover. No performance benchmark has been measured.
 
 ## Guiding values
 
@@ -25,7 +126,7 @@ The same Domain and Application are intended to support:
 - Regional HTTP deployments with explicit backend durability guarantees.
 - Enterprise services spanning multiple US Regions, with qualified regional-loss RPO zero and RTO at most 60 seconds.
 
-Local use is first-class and requires no cloud account or HTTP server. The reference local store is SQLite with transactional cross-process coordination. Local durability covers its tested device/process failure model. Enterprise deployments add globally consistent authority, regional redundancy, identity, isolation, and independent audit evidence. The reference enterprise authority is DynamoDB MRSC; S3 Standard provides checkpoints/retained evidence, and Express can provide disposable acceleration. These are proposed designs and acceptance targets requiring validation.
+Local use is first-class and requires no cloud account or HTTP server. The first implementation uses a versioned JSON file, OS locking, and synchronized atomic replacement so independent CLI invocations share one local authority. Local qualification covers process interruption/restart and simulated I/O failures on the tested filesystems; physical power-loss/device qualification remains outstanding. SQLite remains a possible later adapter if the simple file store becomes insufficient. Enterprise deployments add globally consistent authority, regional redundancy, identity, isolation, and independent audit evidence. The reference enterprise authority is DynamoDB MRSC; S3 Standard provides checkpoints/retained evidence, and Express can provide disposable acceleration. These are proposed designs and acceptance targets requiring validation.
 
 All shapes preserve escrow bounds, durable decisions, retry identity, and safe settlement/refund rules. A backend must meet the selected profile; selecting local operation cannot silently weaken an enterprise namespace.
 
@@ -33,7 +134,7 @@ All shapes preserve escrow bounds, durable decisions, retry identity, and safe s
 
 The following instructions apply to all contributors, human and agent, throughout this repository. Read [DESIGN.md](DESIGN.md) for the current technical proposal. Agent contributors must also read [AGENTS.md](AGENTS.md) for agent-specific instructions. Keep shared contributor guidance here and reserve AGENTS.md for instructions specific to agents.
 
-The repository is currently documentation-only; do not imply that proposed APIs, commands, guarantees, benchmarks, or crates already exist. Keep the public explanation, architecture, and implementation consistent as the project develops.
+The local snapshot milestone is implemented; the broader distributed and enterprise design remains proposed. Do not imply that deferred APIs, commands, guarantees, benchmarks, or crates already exist. Keep the public explanation, architecture, and implementation consistent as the project develops.
 
 ### Simplicity and design judgment
 

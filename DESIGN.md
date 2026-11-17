@@ -1,8 +1,10 @@
 # Rescrow: durable escrow transactions in Rust
 
-Status: proposed design; no implementation or measured performance yet.
+Status: proposed distributed/enterprise design. The local snapshot milestone is implemented; see README.md for supported commands and tested limits. No measured performance or enterprise qualification yet.
 
 Date: 2026-11-13.
+
+The first implementation follows [PLAN.md](PLAN.md): a pure Domain, Application/transfer types, and separate CLI invocations over a local file snapshot. It establishes escrow semantics with atomic whole-ledger publication before adding the distributed protocol. Only the local snapshot milestone is currently implemented; the broader mechanisms and acceptance targets below remain proposed.
 
 Deployment spectrum: embedded Rust, concurrent local CLI use, an optional local service, regional APIs, and the enterprise multi-region service. The enterprise profile requires active capacity across three US AWS Regions, synchronously replicated authority, and automatic regional traffic failover. S3 Standard and Express are the first object-storage backends; the reference enterprise authority is DynamoDB multi-Region strong consistency (MRSC).
 
@@ -65,7 +67,7 @@ The required Domain → Application → entrypoint boundaries isolate business m
 | Shape | Composition | Coordination and durability |
 | --- | --- | --- |
 | Embedded library | Host invokes Application methods with a selected adapter | Host supplies lifecycle and effect implementations; guarantees follow the adapter. |
-| Local CLI | Independent CLI processes invoke the same Application against one local SQLite store | Cross-process transactions/CAS coordinate agents on one machine; durable across process restart. |
+| Local CLI | Independent CLI processes invoke the same Application against one local file store | OS locking and conditional atomic snapshot replacement coordinate agents on one machine; durable across the tested restart model. |
 | Local service | Optional daemon exposes a local socket or loopback endpoint over that Application | Useful for centralized local authorization and continuous recovery; not required for CLI use. |
 | Regional API | HTTP entrypoint and a qualified regional backend | Regional or device failure contract is explicit; no implied multi-region recovery. |
 | Enterprise API | Regional HTTP services and globally consistent authority | Full enterprise security, regional-loss RPO zero, and qualified RTO requirements. |
@@ -174,7 +176,7 @@ flowchart LR
     W[Recovery and materialization workers] --> APP
     APP --> P[Pure domain functions and types]
     APP --> S[Application-defined conditional storage port]
-    S --> B[Profile-qualified authority / SQLite or MRSC]
+    S --> B[Profile-qualified authority / local file or MRSC]
     B --> E[Durable transition history]
     B --> O[S3 Standard checkpoints / Express caches]
     E --> V[Audit exporter and verifier]
@@ -222,6 +224,8 @@ The first four are on the safety path. Enumeration schedules recovery; it never 
 Capabilities must explicitly report consistency scope, durability/failure domain, supported Regions, maximum encoded record size, and behavior under a regional partition. A regional implementation of this interface is insufficient for enterprise admission even if its method names match. Independent writes to three buckets are not a substitute for a globally ordered conditional-write protocol.
 
 An illustrative Rust boundary, defined by the Application and implemented by outer adapters, is:
+
+The first file-backed milestone instead uses the narrower whole-ledger snapshot port in [PLAN.md](PLAN.md). Its atomic multi-resource publication does not implement the separate-key protocol below. Introduce the broader interface when independent participant publication is actually needed.
 
 ```rust
 // Sketch: concrete async/object-safety and buffer types are implementation choices.
@@ -302,9 +306,11 @@ Require `ConsistentRead` on authoritative base-table reads, revision-conditional
 
 Benchmark item size, replicated write units, partition distribution, account quotas, and cross-region latency before sizing a cell. Authority data must contain all information needed during failover; an item may not point to a regional-only S3 payload on the safety path. Native SDK retry behavior requires the same ambiguity tests as S3. A future alternative authority, including a mature quorum-replicated engine with S3 checkpoints, must pass identical partition, membership, and restore tests; implementing a new consensus protocol is not a v1 prerequisite.
 
-**Local disk, first-class v1 shape:** use a proven embedded transactional engine; SQLite is the reference choice for concurrent CLI processes. Store revisioned records in one database and implement conditional mutations transactionally, with bounded busy handling and fresh reads on conflict. Enable WAL and an explicitly verified durable synchronization setting such as `synchronous=FULL`; test actual crash behavior and pin a supported patched version. SQLite documents [WAL concurrency on one host](https://www.sqlite.org/wal.html) and [synchronization settings](https://www.sqlite.org/pragma.html#pragma_synchronous). WAL still serializes writers; benchmark that limit rather than assuming unlimited parallel mutation. Do not place a shared WAL database on a network filesystem.
+**Local disk, first implementation:** use one versioned JSON ledger snapshot and a stable separate OS lock file. Application methods load and validate a snapshot, evaluate pure domain operations, and conditionally publish a replacement against its revision. The adapter holds an exclusive lock while checking the revision and publishing a synchronized temporary file through rename and directory synchronization. Independent CLI invocations share the same store; a daemon is optional. [PLAN.md](PLAN.md) specifies publication, error handling, qualification, and the supported local filesystem scope. Ordinary rename without locking, conditional revision checks, and synchronization is insufficient.
 
-CLI processes open the same configured database directly; a daemon is optional. Preserve the same escrow protocol and outcome rules initially, using the embedded engine to implement the required conditional primitives rather than inventing a second business protocol. Filesystem permissions define the cooperative same-user trust boundary. Enforcing budgets against an untrusted agent requires denying it direct database writes and placing the Application behind a separately privileged local service with authenticated IPC. Durable local state survives the tested process/power failure model, not loss of its only device. Ordinary file rename is not a replacement for transactional cross-process coordination.
+This first local publication boundary atomically updates every affected resource and transaction together. It preserves escrow rules but does not exercise partially prepared participants, separate decision materialization, or the distributed recovery protocol. Add those mechanisms when an adapter actually publishes separate keys. A later SQLite adapter is an option if whole-snapshot rewrites or contention warrant it; no embedded database is needed for the first milestone.
+
+Filesystem permissions define the cooperative same-user trust boundary. Enforcing budgets against an untrusted agent requires denying it direct state writes and placing the Application behind a separately privileged local service with authenticated IPC. Durable local state survives its qualified filesystem/device/process failure model, not loss of its only device. Process-kill tests alone do not qualify survival of arbitrary power loss.
 
 **Other KV stores:** require strong per-key conditions and durable acknowledgements. Eventually consistent replicas or last-writer-wins conflict resolution are insufficient without a stronger coordination layer. A deployment cannot activate an adapter whose capability profile fails the core requirements.
 
@@ -751,7 +757,7 @@ The following is a proposed starting point, not a mandate to create every packag
 crates/
   rescrow-domain/       valid domain types and pure functions
   rescrow-application/  transfer types, conversions, use cases, effect interfaces
-  rescrow-adapters/     selected SQLite, S3, MRSC, identity and signing implementations
+  rescrow-adapters/     local file store; later selected cloud/identity/signing adapters
   rescrow-cli/          local/direct and remote command entrypoint, composition
   rescrow-http/         HTTP entrypoint, composition for regional/enterprise service
 ```
@@ -789,7 +795,7 @@ Use property tests to compare the pure core with a small reference model. Inject
 
 Keep Domain tests free of effect mocks: exercise valid constructors, rejected invalid construction, and pure state transitions. At the Application boundary, test invalid transfer input, invalid stored records, domain-to-transfer-to-domain round trips for supported schemas, stable error categories, publication order, and retry/recovery with deterministic fault adapters. Verify actual serialized contracts separately from domain representation. Once packages exist, check dependency graphs and a local-only build so serialization, runtime, HTTP, and cloud dependencies cannot leak into the Domain or the local composition.
 
-Qualify the local profile using independent OS processes sharing one SQLite store, including simultaneous admission near exhaustion, process death during publication, busy conditions, lost responses, and restart recovery. Demonstrate the same logical outcomes through the direct Rust API and CLI entrypoint. Local progress and authority tests must not depend on enterprise infrastructure being available.
+Qualify the local profile using independent OS processes sharing one file store, including simultaneous admission near exhaustion, process death during publication, lock contention, lost responses, and restart recovery. Demonstrate the same logical outcomes through the direct Rust API and CLI entrypoint. Local progress and authority tests must not depend on enterprise infrastructure being available.
 
 Run adapter conformance and concurrent history tests against a real three-Region MRSC authority and real Standard/Express buckets for their respective roles. Emulators are useful for development but do not establish cloud consistency semantics. Include a test in which a write succeeds remotely and its response is deliberately lost. Check linearizability of per-key transitions and transaction decisions, and check declared escrow invariants rather than asserting nonexistent global snapshot isolation. Intentionally provision an incompatible eventual global table and verify readiness refuses it.
 
@@ -824,8 +830,8 @@ Publish separately measured recovery bounds and residual uncertainty for these d
 ## 13. Delivery sequence and unresolved decisions
 
 1. **Protocol and domain foundation:** executable model, pure Rust Domain, Application transfer types/conversions and use cases, deterministic memory adapter, replay verifier, and explicit deployment/threat profiles. Exit when invalid local states cannot enter through the public API, conversions reject invalid external data, and adversarial schedules preserve the safety properties.
-2. **Local library and CLI:** transactional SQLite adapter, concurrent independent agents/processes, direct Application API, durable prepare/claim/commit/abort, restart recovery, and optional local-service composition. Exit after cross-process contention/crash tests and a local build/run with no cloud or HTTP-server requirement.
-3. **Multi-region authority prototype:** real three-Region MRSC implementing the same Application interface, complete history and work tickets, partial use, abort fences, mandatory ancestor charges, guarded refund rights, HTTP API, and regional endpoint fallback. S3 Standard/Express adapters support archive/cache roles and explicitly regional testing. Exit after regional-loss, claim/expiry, refund, and ambiguity tests.
+2. **Local library and CLI:** file snapshot adapter, concurrent independent agents/processes, direct Application API, multi-resource prepare/commit/abort, partial use, replay identity, and restart qualification. Follow [PLAN.md](PLAN.md); claims, expiry, external execution, hierarchy, and refunds are outside this first milestone. Exit after cross-process contention/interruption tests and a local build/run with no cloud or HTTP-server requirement.
+3. **Multi-region authority prototype:** extend Application orchestration for separate-key publication and real three-Region MRSC while retaining the pure domain rules. Add complete history/work tickets, execution claims and settlement policies, expiry/abort fences, mandatory ancestor charges, guarded refund rights, HTTP API, and regional endpoint fallback. S3 Standard/Express adapters support archive/cache roles and explicitly regional testing. Exit after regional-loss, claim/expiry, refund, and ambiguity tests.
 4. **Enterprise scale and isolation:** deployment cells, fixed rights shards, batching, internal rebalancing, qualified cross-domain grants where needed, N-1 capacity, and representative hierarchical-budget cost/latency results. Exit only with reproducible sustained-load and failover measurements.
 5. **Enterprise GA gate:** independent protocol/security review, penetration testing, signed evidence and retained checkpoints, policy/key failure exercises, repeated RPO/RTO drills, restore qualification, supply-chain controls, 24/7 runbooks, and customer-facing service objectives. Security and regional recovery are not post-GA add-ons.
 6. **Additional adapters and integrations:** alternative authorities that meet the enterprise contract, generated clients, and durable-execution examples. Every adapter declares its profile and passes the applicable safety suite; regional adapters cannot be mislabeled enterprise-capable.

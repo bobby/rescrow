@@ -1,0 +1,16 @@
+[package]
+name = "rescrow-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "rescrow"
+path = "src/main.rs"
+
+[dependencies]
+rescrow-application.workspace = true
+rescrow-adapters.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+clap.workspace = true
