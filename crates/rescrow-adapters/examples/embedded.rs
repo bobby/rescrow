@@ -12,32 +12,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) if e.code == Code::AlreadyInitialized => {}
         Err(e) => return Err(e.into()),
     }
-    app.execute(Command::CreateResource(ResourceSpec {
+    app.create_resource(ResourceSpec {
         resource_id: "example".into(),
         lower: "0".into(),
         upper: Some("100".into()),
         initial: "60".into(),
         unit: "credits".into(),
         scale: 0,
-    }))?;
-    app.execute(Command::Prepare(Prepare {
+    })?;
+    app.prepare(Prepare {
         transaction_id: "example-work".into(),
         operations: vec![Operation {
             operation_id: "spend".into(),
             resource_id: "example".into(),
             delta: "-40".into(),
         }],
-    }))?;
-    app.execute(Command::Commit(Commit {
+    })?;
+    app.commit(Commit {
         transaction_id: "example-work".into(),
         actuals: Some(vec![Actual {
             operation_id: "spend".into(),
             delta: "-25".into(),
         }]),
-    }))?;
-    let result = app.execute(Command::ShowResource {
-        resource_id: "example".into(),
     })?;
+    let result = app.resource("example")?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
 }

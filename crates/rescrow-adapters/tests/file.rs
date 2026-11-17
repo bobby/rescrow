@@ -108,7 +108,7 @@ fn initialize_permissions_missing_files_and_stable_lock_inode() {
 fn stale_revision_corrupt_unsupported_truncated_and_oversized_fail_closed() {
     let temp = Temp::new();
     let store = ready(&temp);
-    let old = store.load().unwrap();
+    let old = store.load().unwrap().to_dto();
     Application::new(FileStore::new(temp.store()).unwrap())
         .execute(prepare())
         .unwrap();
@@ -120,11 +120,13 @@ fn stale_revision_corrupt_unsupported_truncated_and_oversized_fail_closed() {
                     revision: old.revision + 1,
                     ..old.clone()
                 }
+                .try_into()
+                .unwrap()
             )
             .unwrap(),
         Publication::Conflict
     );
-    let good = store.load().unwrap();
+    let good = store.load().unwrap().to_dto();
     for bytes in [b"{".to_vec(), b"{\"schema_version\":99}".to_vec(), {
         let mut bad = good.clone();
         bad.resources[0].quantity = "6".into();
@@ -148,13 +150,13 @@ fn stale_revision_corrupt_unsupported_truncated_and_oversized_fail_closed() {
         serde_json::to_vec(&good).unwrap(),
     )
     .unwrap();
-    assert_eq!(store.load().unwrap(), good);
+    assert_eq!(store.load().unwrap().to_dto(), good);
     let bad_revision = Snapshot {
         revision: good.revision,
         ..good.clone()
     };
     assert!(matches!(
-        store.replace(good.revision, &bad_revision),
+        store.replace(good.revision, &bad_revision.try_into().unwrap()),
         Err(StoreError::Corrupt(_))
     ));
 }
@@ -179,12 +181,14 @@ fn contention_has_a_deadline_and_permission_errors_preserve_state() {
                     revision: 2,
                     ..Snapshot::from_ledger(&Default::default(), 1)
                 }
+                .try_into()
+                .unwrap()
             )
             .unwrap_err(),
         StoreError::Contention
     );
     drop(lock);
-    let good = store.load().unwrap();
+    let good = store.load().unwrap().to_dto();
     fs::set_permissions(
         temp.store().join("state.json"),
         fs::Permissions::from_mode(0o644),
@@ -202,7 +206,7 @@ fn contention_has_a_deadline_and_permission_errors_preserve_state() {
     let attempt = Application::new(FileStore::new(temp.store()).unwrap()).execute(prepare());
     fs::set_permissions(temp.store(), fs::Permissions::from_mode(0o700)).unwrap();
     if attempt.is_err() {
-        assert_eq!(store.load().unwrap(), good);
+        assert_eq!(store.load().unwrap().to_dto(), good);
     } else {
         assert_eq!(std::env::var("USER").as_deref(), Ok("root"));
     }
@@ -227,7 +231,7 @@ fn child_worker() {
     };
     let app = Application::new(FileStore::new(path).unwrap().with_fault_hook(hook));
     let result = if std::env::var("RESCROW_TEST_ACTION").as_deref() == Ok("init") {
-        app.initialize()
+        app.initialize().map(|()| Output::Initialized)
     } else {
         app.execute(prepare())
     };
@@ -265,7 +269,7 @@ fn kill_at_publication_boundaries_exposes_complete_old_or_new_state() {
     ] {
         let temp = Temp::new();
         let store = ready(&temp);
-        let old = store.load().unwrap();
+        let old = store.load().unwrap().to_dto();
         let mut child = child(&temp, stage, "kill");
         let deadline = Instant::now() + Duration::from_secs(10);
         while !temp.0.join("reached").exists() {
@@ -281,7 +285,7 @@ fn kill_at_publication_boundaries_exposes_complete_old_or_new_state() {
         }
         child.kill().unwrap();
         child.wait().unwrap();
-        let next = store.load().unwrap(); // also proves the OS released the killed owner's lock
+        let next = store.load().unwrap().to_dto(); // also proves the OS released the killed owner's lock
         if matches!(stage, Stage::Renamed | Stage::BeforeResponse) {
             assert_eq!(next.transactions.len(), 1);
             assert_eq!(next.resources[0].reserved_down, "3");
@@ -295,13 +299,13 @@ fn kill_at_publication_boundaries_exposes_complete_old_or_new_state() {
             actuals: None,
         }))
         .unwrap();
-        let committed = store.load().unwrap();
+        let committed = store.load().unwrap().to_dto();
         app.execute(rescrow_application::dto::Command::Commit(Commit {
             transaction_id: "t".into(),
             actuals: None,
         }))
         .unwrap();
-        assert_eq!(store.load().unwrap(), committed);
+        assert_eq!(store.load().unwrap().to_dto(), committed);
         assert_eq!(committed.resources[0].quantity, "2");
     }
 }
@@ -318,9 +322,9 @@ fn injected_io_and_directory_sync_failures_preserve_replay_identity() {
     ] {
         let temp = Temp::new();
         let store = ready(&temp);
-        let old = store.load().unwrap();
+        let old = store.load().unwrap().to_dto();
         assert!(child(&temp, stage, "error").wait().unwrap().success());
-        let next = store.load().unwrap();
+        let next = store.load().unwrap().to_dto();
         if matches!(
             stage,
             Stage::Renamed | Stage::DirectorySync | Stage::BeforeResponse
@@ -332,7 +336,10 @@ fn injected_io_and_directory_sync_failures_preserve_replay_identity() {
         Application::new(FileStore::new(temp.store()).unwrap())
             .execute(prepare())
             .unwrap();
-        assert_eq!(store.load().unwrap().resources[0].reserved_down, "3");
+        assert_eq!(
+            store.load().unwrap().to_dto().resources[0].reserved_down,
+            "3"
+        );
     }
 }
 
@@ -365,14 +372,14 @@ fn initialization_failures_never_reset_a_missing_or_published_authority() {
         let store = FileStore::new(temp.store()).unwrap();
         let app = Application::new(FileStore::new(temp.store()).unwrap());
         if post {
-            let snapshot = store.load().unwrap();
+            let snapshot = store.load().unwrap().to_dto();
             assert_eq!(snapshot.revision, 0);
             assert!(snapshot.resources.is_empty() && snapshot.transactions.is_empty());
             assert_eq!(
                 app.initialize().unwrap_err().code,
                 rescrow_application::Code::AlreadyInitialized
             );
-            assert_eq!(store.load().unwrap(), snapshot);
+            assert_eq!(store.load().unwrap().to_dto(), snapshot);
         } else {
             assert_eq!(store.load().unwrap_err(), StoreError::Missing);
             assert_eq!(
@@ -393,7 +400,7 @@ fn readers_share_the_lock_and_exclude_publishers() {
         .open(temp.store().join("state.lock"))
         .unwrap();
     lock.lock_shared().unwrap();
-    let current = store.load().unwrap();
+    let current = store.load().unwrap().to_dto();
     assert_eq!(
         store
             .replace(
@@ -402,10 +409,12 @@ fn readers_share_the_lock_and_exclude_publishers() {
                     revision: current.revision + 1,
                     ..current.clone()
                 }
+                .try_into()
+                .unwrap()
             )
             .unwrap_err(),
         StoreError::Contention
     );
     drop(lock);
-    assert_eq!(store.load().unwrap(), current);
+    assert_eq!(store.load().unwrap().to_dto(), current);
 }

@@ -82,7 +82,9 @@ fn directions_do_not_fund_each_other_and_participants_are_atomic() {
     assert_eq!(rejected.resources(), original.resources());
     assert_eq!(
         rejected.transactions()[&id("multi")].rejection(),
-        Some(Rejection::Capacity)
+        Some(Rejection::Capacity(Some(
+            CapacityFailure::new(id("s"), -2, 1).unwrap()
+        )))
     );
     let missing = original
         .prepare(req("missing", &[("a", "unknown", 1)]))

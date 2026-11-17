@@ -12,7 +12,7 @@ pub enum Error {
     InvalidOperations,
     InvalidActuals,
     Overflow,
-    Capacity,
+    Capacity(CapacityFailure),
     NotFound,
     Conflict,
     InvalidLedger,
@@ -21,6 +21,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::Capacity(failure) => return write!(f, "resource {} requested delta {} but only {} capacity is available", failure.resource.as_str(), failure.requested_delta, failure.available),
             Self::InvalidId => "IDs must contain 1..128 ASCII letters, digits, dots, underscores, or hyphens",
             Self::InvalidQuantity => "quantities must be canonical signed decimal integers",
             Self::InvalidMetadata => "unit must be printable and nonempty (at most 64 bytes); scale must be 0..38",
@@ -28,7 +29,6 @@ impl std::fmt::Display for Error {
             Self::InvalidOperations => "operations must be nonempty, nonzero, and unique by operation and resource ID",
             Self::InvalidActuals => "actuals must name every operation once and stay within its reserved direction and magnitude",
             Self::Overflow => "quantity, magnitude, offset, or reservation total exceeds signed 128-bit range",
-            Self::Capacity => "insufficient unreserved quantity or upward room",
             Self::NotFound => "referenced resource or transaction does not exist",
             Self::Conflict => "request conflicts with an existing identity or terminal decision",
             Self::InvalidLedger => "resource balances, holds, and transaction records disagree",
@@ -214,7 +214,8 @@ impl Actuals {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Rejection {
-    Capacity,
+    /// Details are absent only for legacy stored capacity rejections.
+    Capacity(Option<CapacityFailure>),
     Overflow,
     NotFound,
 }
@@ -241,6 +242,14 @@ impl Transaction {
                 actuals.0.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             ))?;
         }
+        if let State::Aborted(AbortReason::Rejected(Rejection::Capacity(Some(failure)))) = &state
+            && !request
+                .operations
+                .iter()
+                .any(|op| op.resource == failure.resource && op.delta == failure.requested_delta)
+        {
+            return Err(Error::InvalidLedger);
+        }
         Ok(Self { request, state })
     }
     pub fn request(&self) -> &Request {
@@ -257,12 +266,64 @@ impl Transaction {
     }
 }
 
+/// Available capacity and held quantities from one resource value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Availability {
+    available_down: i128,
+    available_up: i128,
+    reserved_down: i128,
+    reserved_up: i128,
+}
+impl Availability {
+    pub fn available_down(&self) -> i128 {
+        self.available_down
+    }
+    pub fn available_up(&self) -> i128 {
+        self.available_up
+    }
+    pub fn reserved_down(&self) -> i128 {
+        self.reserved_down
+    }
+    pub fn reserved_up(&self) -> i128 {
+        self.reserved_up
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapacityFailure {
+    resource: Id,
+    requested_delta: i128,
+    available: i128,
+}
+impl CapacityFailure {
+    pub fn new(resource: Id, requested_delta: i128, available: i128) -> Result<Self, Error> {
+        let magnitude = requested_delta.checked_abs().ok_or(Error::InvalidLedger)?;
+        if available < 0 || magnitude <= available {
+            return Err(Error::InvalidLedger);
+        }
+        Ok(Self {
+            resource,
+            requested_delta,
+            available,
+        })
+    }
+    pub fn resource(&self) -> &Id {
+        &self.resource
+    }
+    pub fn requested_delta(&self) -> i128 {
+        self.requested_delta
+    }
+    pub fn available(&self) -> i128 {
+        self.available
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resource {
     spec: ResourceSpec,
     quantity: i128,
     holds: BTreeMap<Id, i128>,
-    availability: (i128, i128, i128, i128),
+    availability: Availability,
 }
 impl Resource {
     pub fn restore(
@@ -280,7 +341,7 @@ impl Resource {
             spec,
             quantity,
             holds,
-            availability: (0, 0, 0, 0),
+            availability: Availability::default(),
         };
         r.availability = r.calculate_availability()?;
         Ok(r)
@@ -295,12 +356,12 @@ impl Resource {
         &self.holds
     }
     /// Downward capacity, upward capacity, downward holds, upward holds.
-    pub fn availability(&self) -> (i128, i128, i128, i128) {
+    pub fn availability(&self) -> Availability {
         self.availability
     }
     /// Downward capacity, upward capacity, downward holds, upward holds.
     /// Even unbounded resources respect representable i128 offset/quantity limits.
-    fn calculate_availability(&self) -> Result<(i128, i128, i128, i128), Error> {
+    fn calculate_availability(&self) -> Result<Availability, Error> {
         let offset = self
             .quantity
             .checked_sub(self.spec.lower)
@@ -326,9 +387,14 @@ impl Resource {
         }
         let room = ceiling.checked_sub(self.quantity).ok_or(Error::Overflow)?;
         if down > offset || up > room {
-            return Err(Error::Capacity);
+            return Err(Error::InvalidBounds);
         }
-        Ok((offset - down, room - up, down, up))
+        Ok(Availability {
+            available_down: offset - down,
+            available_up: room - up,
+            reserved_down: down,
+            reserved_up: up,
+        })
     }
     /// Reusable participant rule: opposite-direction pending changes never supply capacity.
     pub fn reserve(&self, transaction: &Id, delta: i128) -> Result<Self, Error> {
@@ -339,7 +405,21 @@ impl Resource {
         if next.holds.insert(transaction.clone(), delta).is_some() {
             return Err(Error::Conflict);
         }
-        next.availability = next.calculate_availability()?;
+        next.availability = match next.calculate_availability() {
+            Err(Error::InvalidBounds) => {
+                let available = if delta < 0 {
+                    self.availability.available_down
+                } else {
+                    self.availability.available_up
+                };
+                return Err(Error::Capacity(CapacityFailure::new(
+                    self.spec.id.clone(),
+                    delta,
+                    available,
+                )?));
+            }
+            other => other?,
+        };
         Ok(next)
     }
     fn settle(&self, transaction: &Id, actual: i128) -> Result<Self, Error> {
@@ -412,7 +492,7 @@ impl Ledger {
                 }
                 Err(e) => {
                     let reason = match e {
-                        Error::Capacity => Rejection::Capacity,
+                        Error::Capacity(failure) => Rejection::Capacity(Some(failure)),
                         Error::Overflow => Rejection::Overflow,
                         other => return Err(other),
                     };

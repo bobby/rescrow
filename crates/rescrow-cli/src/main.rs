@@ -153,7 +153,7 @@ fn run(cli: &Cli) -> Result<Output, Error> {
     let app = Application::new(FileStore::new(&cli.store)?);
     match command {
         Some(c) => app.execute(c),
-        None => app.initialize(),
+        None => app.initialize().map(|()| Output::Initialized),
     }
 }
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Error> {
@@ -217,7 +217,7 @@ fn transaction_text(t: &Transaction) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        State::Aborted { cause } => format!("aborted ({cause:?})"),
+        State::Aborted { cause, .. } => format!("aborted ({cause:?})"),
     };
     format!(
         "{}: {state}; operations: {}",

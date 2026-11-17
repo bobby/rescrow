@@ -1,6 +1,8 @@
 //! Cooperative same-user Linux authority. Path manipulation and network filesystems
 //! are outside this adapter's contract. The lock inode is never replaced or removed.
-use rescrow_application::{Publication, SnapshotStore, StoreError, dto::Snapshot};
+use rescrow_application::{
+    Publication, SnapshotStore, StoreError, ValidatedSnapshot, dto::Snapshot,
+};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::{
@@ -37,6 +39,7 @@ pub struct FileStore {
     directory: PathBuf,
     timeout: Duration,
     hook: Hook,
+    max_bytes: u64,
 }
 impl FileStore {
     /// A missing store may be selected, but only initialize will create it.
@@ -61,7 +64,17 @@ impl FileStore {
             directory,
             timeout: Duration::from_secs(2),
             hook: no_fault,
+            max_bytes: MAX_SNAPSHOT_BYTES,
         })
+    }
+    /// A smaller explicit ceiling is useful for embedded budgets and qualification.
+    /// It applies to reads and to publication including reserved settlement space.
+    pub fn with_size_limit(mut self, bytes: u64) -> Result<Self, StoreError> {
+        if bytes == 0 || bytes > MAX_SNAPSHOT_BYTES {
+            return Err(StoreError::Io("snapshot limit must be 1..=16 MiB".into()));
+        }
+        self.max_bytes = bytes;
+        Ok(self)
     }
     pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -123,18 +136,18 @@ impl FileStore {
             }
         }
     }
-    fn read(&self, directory: &File) -> Result<Snapshot, StoreError> {
+    fn read(&self, directory: &File) -> Result<ValidatedSnapshot, StoreError> {
         let mut file = File::open(self.directory.join("state.json")).map_err(missing)?;
         check_file(&file)?;
-        if file.metadata().map_err(io)?.len() > MAX_SNAPSHOT_BYTES {
+        if file.metadata().map_err(io)?.len() > self.max_bytes {
             return Err(StoreError::TooLarge);
         }
         let mut bytes = Vec::new();
         (&mut file)
-            .take(MAX_SNAPSHOT_BYTES + 1)
+            .take(self.max_bytes + 1)
             .read_to_end(&mut bytes)
             .map_err(io)?;
-        if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
+        if bytes.len() as u64 > self.max_bytes {
             return Err(StoreError::TooLarge);
         }
         // Decode only the version first so unsupported schemas have a distinct error.
@@ -149,9 +162,7 @@ impl FileStore {
         }
         let snapshot: Snapshot =
             serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-        snapshot
-            .validate()
-            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        let snapshot = ValidatedSnapshot::try_from(snapshot)?;
         // Complete a previous writer's potentially uncertain rename before confirming
         // even a read or idempotent retry. Shared locks exclude every publisher.
         (self.hook)(Stage::ReadSync).map_err(unknown)?;
@@ -162,14 +173,12 @@ impl FileStore {
             .map_err(|e| StoreError::Unknown(e.to_string()))?;
         Ok(snapshot)
     }
-    fn publish(&self, snapshot: &Snapshot, directory: &File) -> Result<(), StoreError> {
-        snapshot
-            .validate()
-            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
-        let bytes = serde_json::to_vec(snapshot).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-        if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
+    fn publish(&self, snapshot: &ValidatedSnapshot, directory: &File) -> Result<(), StoreError> {
+        let encoded = crate::encoding::encode(snapshot)?;
+        if encoded.settlement_bytes > self.max_bytes {
             return Err(StoreError::TooLarge);
         }
+        let bytes = encoded.bytes;
         let (path, mut file) = loop {
             let seq = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
             let path = self
@@ -205,11 +214,10 @@ impl FileStore {
     }
 }
 impl SnapshotStore for FileStore {
-    fn initialize(&self, empty: &Snapshot) -> Result<(), StoreError> {
-        if empty.schema_version != 1
-            || empty.revision != 0
-            || !empty.resources.is_empty()
-            || !empty.transactions.is_empty()
+    fn initialize(&self, empty: &ValidatedSnapshot) -> Result<(), StoreError> {
+        if empty.revision() != 0
+            || !empty.ledger().resources().is_empty()
+            || !empty.ledger().transactions().is_empty()
         {
             return Err(StoreError::Corrupt(
                 "initial snapshot must be empty at revision zero".into(),
@@ -250,19 +258,23 @@ impl SnapshotStore for FileStore {
         }
         self.publish(empty, &directory)
     }
-    fn load(&self) -> Result<Snapshot, StoreError> {
+    fn load(&self) -> Result<ValidatedSnapshot, StoreError> {
         let directory = self.directory_file()?;
         let (_lock, _) = self.lock(false, false)?;
         self.read(&directory)
     }
-    fn replace(&self, expected: u64, candidate: &Snapshot) -> Result<Publication, StoreError> {
+    fn replace(
+        &self,
+        expected: u64,
+        candidate: &ValidatedSnapshot,
+    ) -> Result<Publication, StoreError> {
         let directory = self.directory_file()?;
         let (_lock, _) = self.lock(true, false)?;
         let current = self.read(&directory)?;
-        if current.revision != expected {
+        if current.revision() != expected {
             return Ok(Publication::Conflict);
         }
-        if expected.checked_add(1) != Some(candidate.revision) {
+        if expected.checked_add(1) != Some(candidate.revision()) {
             return Err(StoreError::Corrupt(
                 "candidate revision must advance exactly once".into(),
             ));

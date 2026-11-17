@@ -1,5 +1,7 @@
 //! Deterministic snapshot port for embedding tests, with single-shot effect faults.
-use rescrow_application::{Publication, SnapshotStore, StoreError, dto::Snapshot};
+use rescrow_application::{
+    Publication, SnapshotStore, StoreError, ValidatedSnapshot, dto::Snapshot,
+};
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
@@ -10,9 +12,21 @@ pub enum Fault {
     BeforePublication,
     LostResponse,
 }
+enum Image {
+    Validated(ValidatedSnapshot),
+    Raw(Snapshot),
+}
+impl Image {
+    fn validated(&self) -> Result<ValidatedSnapshot, StoreError> {
+        match self {
+            Self::Validated(snapshot) => Ok(snapshot.clone()),
+            Self::Raw(snapshot) => snapshot.clone().try_into(),
+        }
+    }
+}
 #[derive(Default)]
 struct State {
-    snapshot: Option<Snapshot>,
+    snapshot: Option<Image>,
     faults: VecDeque<Fault>,
     evaluations: usize,
 }
@@ -24,18 +38,17 @@ impl MemoryStore {
     }
     /// Deliberately bypass validation for corruption tests.
     pub fn set_raw(&self, snapshot: Snapshot) {
-        self.0.lock().unwrap().snapshot = Some(snapshot);
+        self.0.lock().unwrap().snapshot = Some(Image::Raw(snapshot));
     }
     pub fn evaluations(&self) -> usize {
         self.0.lock().unwrap().evaluations
     }
 }
 impl SnapshotStore for MemoryStore {
-    fn initialize(&self, empty: &Snapshot) -> Result<(), StoreError> {
-        if empty.schema_version != 1
-            || empty.revision != 0
-            || !empty.resources.is_empty()
-            || !empty.transactions.is_empty()
+    fn initialize(&self, empty: &ValidatedSnapshot) -> Result<(), StoreError> {
+        if empty.revision() != 0
+            || !empty.ledger().resources().is_empty()
+            || !empty.ledger().transactions().is_empty()
         {
             return Err(StoreError::Corrupt(
                 "initial snapshot must be empty at revision zero".into(),
@@ -45,29 +58,39 @@ impl SnapshotStore for MemoryStore {
         if state.snapshot.is_some() {
             return Err(StoreError::Exists);
         }
-        state.snapshot = Some(empty.clone());
+        state.snapshot = Some(Image::Validated(empty.clone()));
         Ok(())
     }
-    fn load(&self) -> Result<Snapshot, StoreError> {
+    fn load(&self) -> Result<ValidatedSnapshot, StoreError> {
         self.0
             .lock()
             .unwrap()
             .snapshot
-            .clone()
-            .ok_or(StoreError::Missing)
+            .as_ref()
+            .ok_or(StoreError::Missing)?
+            .validated()
     }
-    fn replace(&self, expected: u64, candidate: &Snapshot) -> Result<Publication, StoreError> {
+    fn replace(
+        &self,
+        expected: u64,
+        candidate: &ValidatedSnapshot,
+    ) -> Result<Publication, StoreError> {
         let mut state = self.0.lock().unwrap();
         state.evaluations += 1;
-        if state.snapshot.as_ref().ok_or(StoreError::Missing)?.revision != expected {
+        if state
+            .snapshot
+            .as_ref()
+            .ok_or(StoreError::Missing)?
+            .validated()?
+            .revision()
+            != expected
+        {
             return Ok(Publication::Conflict);
         }
-        if expected.checked_add(1) != Some(candidate.revision) {
+        if expected.checked_add(1) != Some(candidate.revision()) {
             return Err(StoreError::Corrupt("invalid revision".into()));
         }
-        candidate
-            .validate()
-            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+
         let fault = state.faults.pop_front();
         match fault {
             Some(Fault::Conflict) => return Ok(Publication::Conflict),
@@ -76,7 +99,7 @@ impl SnapshotStore for MemoryStore {
             }
             _ => {}
         }
-        state.snapshot = Some(candidate.clone());
+        state.snapshot = Some(Image::Validated(candidate.clone()));
         if matches!(fault, Some(Fault::LostResponse)) {
             return Err(StoreError::Unknown("injected lost response".into()));
         }
