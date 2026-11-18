@@ -109,6 +109,21 @@ The suite enumerates small positive/negative reservation sets and partial/zero/a
 
 These checks have been exercised on this development host's Linux tmpfs and Btrfs filesystems. They establish behavior across process termination/restart and simulated I/O failures. They do **not** qualify physical power loss, machine reboot, arbitrary devices/controllers, or regional failover. The local benchmark below measures only this development setup.
 
+### Generated histories
+
+Proptest is a development-only dependency of `rescrow-adapters`; it adds no dependency to the Domain or installed CLI. [generated_histories.rs](crates/rescrow-adapters/tests/generated_histories.rs) checks the Application against an independent small-integer model in [escrow_model.rs](crates/rescrow-adapters/tests/support/escrow_model.rs). The model derives materialized quantities and pending minimum/maximum quantities from transaction history, rather than maintaining the production ledger's quantity/hold structures or calling production transition functions.
+
+The history property generates up to 128 commands over finite and unbounded resources: creation, multi-resource preparation, normalized replays, changed requests, full/partial/zero commits, aborts, reads, malformed operation/actual sets, and missing references. After each command it compares the full stored snapshot, returned result/error, frozen capacity diagnostics, and revision behavior with the model. Selected publication points inject CAS conflicts, known pre-publication failures, or applied writes with lost responses; retries use the identical command through a new Application instance. Selected steps round-trip typed JSON and reload through the inbound validation boundary.
+
+A separate generated lifecycle property guarantees successful multi-resource preparations, partial/zero/full settlement or abort, terminal retries, and terminal conflicts. Each property runs 256 cases by default and shrinks failures into smaller inputs. Run them independently or increase the case count with a reproducible seed:
+
+```sh
+cargo test -p rescrow-adapters --test generated_histories --locked
+PROPTEST_CASES=2048 PROPTEST_RNG_SEED=42 cargo test -p rescrow-adapters --test generated_histories --locked
+```
+
+Failure seeds are persisted in `crates/rescrow-adapters/proptest-regressions/generated_histories.txt` and replayed on subsequent runs. Commit files from genuine failures with their fixes. Seed replay depends on the strategies and dependency version; a seed is not an OS schedule. These tests cover sequential histories, small-integer business rules, serialization, and simulated publication faults. Existing numeric-edge, conversion, filesystem-interruption, and concurrent CLI tests remain necessary; the generated model does not qualify process concurrency or device durability.
+
 ## Local benchmark
 
 `crates/rescrow-adapters/examples/snapshot_bench.rs` seeds 0, 1,000, and 10,000 retained zero-usage commits, then measures resource inspection, identical resource-create replay, and a prepare/abort pair. It uses the real file adapter, locks, and synchronization. The output reports seeded snapshot bytes and median microseconds over seven samples after two warm-up cycles; each mutation cycle retains another terminal transaction.
