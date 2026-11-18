@@ -2,7 +2,7 @@
 
 Rescrow is a Rust implementation of local durable escrow transactions for resource budgets. Reserve a bounded quantity, coordinate work, and settle actual usage while other agents and workflows continue using the remaining capacity.
 
-The first milestone implements a pure Domain, a synchronous Application API with validated transfer types, and a file-backed local CLI. [PLAN.md](PLAN.md) records the scope and completion evidence. [DESIGN.md](DESIGN.md) describes the broader proposed distributed protocol, security model, and enterprise qualification targets. There are no measured performance or enterprise durability claims.
+The first milestone implements a pure Domain, a synchronous Application API with validated transfer types, and a file-backed local CLI. [PLAN.md](PLAN.md) records the scope and completion evidence. [DESIGN.md](DESIGN.md) describes the broader proposed distributed protocol, security model, and enterprise qualification targets. Enterprise performance and durability remain unqualified. A small local benchmark is described below; it is not a throughput or latency guarantee.
 
 ## Build and run locally
 
@@ -43,7 +43,7 @@ Operation files contain a nonempty array of `{ "operation_id", "resource_id", "d
 
 Transaction IDs are caller-supplied permanent replay identities. Valid IDs use 1–128 ASCII letters, digits, dots, underscores, or hyphens. Operation order is normalized by ID; changing parameters under an existing transaction ID conflicts. Identical resource creation is a no-op even after its quantity changes. Pending credits cannot fund debits, and pending debits cannot supply upward room. A capacity, total-overflow, or missing-resource rejection is durably recorded as an aborted transaction before its business error is returned. It cannot later reserve under that ID. Malformed requests fail before admission. A missing-resource prepare retains its rejected original request even if that resource is later created. Terminal identities are retained indefinitely. Repeated terminal commands must agree with the existing decision and actuals.
 
-Use `--json` for typed Application results on stdout and structured errors on stderr. Quantities remain strings, including values beyond JavaScript's exact integer range. Success has a `result` tag and a `value` payload where applicable. Errors have stable `category` and `code` fields plus a diagnostic `message`. Clap usage/help errors are textual. No prompts or hidden process state are involved.
+Use `--json` for typed Application results on stdout and structured errors on stderr. Quantities remain strings, including values beyond JavaScript's exact integer range. Success has a `result` tag and a `value` payload where applicable. Errors have stable `category` and `code` fields plus a diagnostic `message`. Transaction operations also include `transaction_id`. New capacity rejections include `capacity.resource_id`, `capacity.requested_delta`, and `capacity.available`, with quantities encoded as strings. These are frozen admission facts: replay returns the original diagnostic even after available capacity changes. Clap usage/help errors are textual. No prompts or hidden process state are involved.
 
 | Exit | Meaning |
 | --- | --- |
@@ -66,7 +66,9 @@ rescrow-cli -> rescrow-adapters -> rescrow-application -> rescrow-domain
            -> rescrow-application
 ```
 
-The Domain has no dependencies or serialization. The Application owns `dto::Command`, `dto::Output`, structured errors, versioned snapshots, conversions, and the `SnapshotStore` port. `Application::initialize` and `Application::execute` are the same API the CLI uses. Pure `TryFrom` conversions validate all inbound commands/records; outbound `From` conversions are total. An adapter supplies revisioned load and conditional publication; the Application reevaluates from fresh state on conflicts, up to 32 attempts. Reads and identical replays do not advance the revision.
+The Domain has no dependencies or serialization. The Application owns `dto::Command`, `dto::Output`, structured errors, versioned snapshots, conversions, and the `SnapshotStore` port. Rust callers can use `create_resource`, `resource`, `resources`, `prepare`, `commit`, `abort`, `transaction`, and `transactions`, each returning its specific DTO type. `initialize` returns `Result<(), Error>`. `execute` dispatches the CLI command enum through those same methods. Domain availability is a named `Availability` value with `available_down`, `available_up`, `reserved_down`, and `reserved_up` getters.
+
+The snapshot port now exchanges `ValidatedSnapshot` values. Adapters convert each decoded `dto::Snapshot` through `TryFrom` once; the result contains a private, shared immutable ledger plus its revision. Candidates built from domain transitions already have their construction proof, so publication needs no domain → DTO → domain validation round trip. `to_dto` provides the storage representation. Custom adapter implementations must update their port signatures to this type. Outbound conversions remain total; reads and CAS checks still validate every newly loaded image and perform the required synchronization. An adapter supplies revisioned load and conditional publication; the Application reevaluates from fresh state on conflicts, up to 32 attempts. Reads and identical replays do not advance the revision.
 
 [The runnable embedded example](crates/rescrow-adapters/examples/embedded.rs) creates a resource, reserves, partially commits, and inspects it through the Rust API. It can share a store with independent CLI invocations:
 
@@ -75,13 +77,15 @@ cargo run -p rescrow-adapters --example embedded -- .rescrow
 # Running it again returns the same balance (35 example credits).
 ```
 
+Schema-1 snapshots remain readable. Capacity details are optional only to represent legacy rejected records that did not retain those facts; new admissions always retain them. The conversion validates any supplied detail against the original operation and rejects details attached to other abort causes. Older binaries with strict DTO decoding may reject new records containing this added field.
+
 `rescrow-adapters::memory::MemoryStore` supplies deterministic tests with conflict, pre-publication, and lost-response injection; it makes no durability promise. File-store fault hooks are explicit Rust constructor options used by qualification tests, never activated by CLI environment variables.
 
 ## Local persistence and limits
 
 The selected canonical store directory contains `state.json`, a stable `state.lock`, and possibly orphan `.state-*.tmp` candidates. Every load takes an OS shared lock. Publication takes an exclusive lock, reloads and compares the revision, writes a uniquely created temporary file in the same directory, synchronizes it, renames it over `state.json`, and synchronizes the directory before success. The parent directory is also synchronized at initialization. Reads and replays synchronize the live file and directory to complete a previous uncertain publication. Files use mode `600`, directories `700`; existing broader permissions are rejected. Lock acquisition times out after two seconds, independently of the bounded Application CAS retry policy.
 
-The [Rust rename contract](https://doc.rust-lang.org/std/fs/fn.rename.html) supplies same-filesystem replacement; Linux requires [directory synchronization](https://man7.org/linux/man-pages/man2/fsync.2.html) to persist the directory entry. The adapter never truncates the live state or promotes an orphan candidate. Missing, invalid, oversized (over 16 MiB), or unsupported live snapshots fail closed. There is no automatic backup selection, reset, or rollback after uncertain publication. CLI JSON input files also have a 16 MiB ceiling. Even an unbounded resource has finite representable upward room because quantities, offsets, and totals must fit `i128`.
+The [Rust rename contract](https://doc.rust-lang.org/std/fs/fn.rename.html) supplies same-filesystem replacement; Linux requires [directory synchronization](https://man7.org/linux/man-pages/man2/fsync.2.html) to persist the directory entry. The adapter never truncates the live state or promotes an orphan candidate. Missing, invalid, oversized (over 16 MiB), or unsupported live snapshots fail closed. There is no automatic backup selection, reset, or rollback after uncertain publication. Every publication also reserves settlement space: the encoded snapshot must fit with every outstanding transaction's largest committed/aborted state, all mutable resource numbers at their maximum decimal widths, and a 20-digit revision. Holds disappearing during settlement only reduce the bound. This check applies to resource creation and admitted rejection records as well as preparations, so later commands cannot spend earlier holds' settlement space. A write can return `too_large` before the live file reaches 16 MiB. Embedded callers may select a smaller limit with `FileStore::with_size_limit`; cooperating callers should select the same limit for a store. The CLI uses 16 MiB. The guarantee covers size growth for snapshots published under this policy, not disk-full errors or revision exhaustion. Older snapshots remain readable, but an existing image that already lacks headroom cannot acquire this guarantee retroactively; writes still fail closed if the bound does not fit. CLI JSON input files also have a 16 MiB ceiling. Even an unbounded resource has finite representable upward room because quantities, offsets, and totals must fit `i128`.
 
 All participants, holds, replay records, and final effects are published in one ledger snapshot. There are no partially published participants or separate materialization steps to recover. Whole-file validation/rewrites grow with resources and permanently retained transaction history; publications serialize through one lock. This is one logical shard per resource and one cooperating local user per store. It does not enforce budgets against anyone who can directly rewrite the authoritative store. Network filesystems, manual live editing, hard-link/path manipulation, and device loss are outside the local contract.
 
@@ -103,7 +107,28 @@ RESCROW_TEST_ROOT="$PWD/target/qualification" cargo test --workspace --locked
 
 The suite enumerates small positive/negative reservation sets and partial/zero/abort decisions against independent capacity/balance formulas, tests conversion corruption and replay conflicts, and injects stale revisions and effect failures. Independent CLI processes contend for scarce capacity and race commit/abort and identical retries. File tests kill child publishers before/during writes, after file sync, after rename, and before response delivery, then reload, retry, and check released OS locks. Other tests exercise permission failures, bounded lock contention, unsupported/truncated/oversized state, and injected directory-sync failures.
 
-These checks have been exercised on this development host's Linux tmpfs and Btrfs filesystems. They establish behavior across process termination/restart and simulated I/O failures. They do **not** qualify physical power loss, machine reboot, arbitrary devices/controllers, or regional failover. No performance benchmark has been measured.
+These checks have been exercised on this development host's Linux tmpfs and Btrfs filesystems. They establish behavior across process termination/restart and simulated I/O failures. They do **not** qualify physical power loss, machine reboot, arbitrary devices/controllers, or regional failover. The local benchmark below measures only this development setup.
+
+## Local benchmark
+
+`crates/rescrow-adapters/examples/snapshot_bench.rs` seeds 0, 1,000, and 10,000 retained zero-usage commits, then measures resource inspection, identical resource-create replay, and a prepare/abort pair. It uses the real file adapter, locks, and synchronization. The output reports seeded snapshot bytes and median microseconds over seven samples after two warm-up cycles; each mutation cycle retains another terminal transaction.
+
+```sh
+mkdir -p target/bench
+cargo run --release --locked -p rescrow-adapters --example snapshot_bench -- target/bench
+# For isolating CPU/encoding overhead from persistent-device latency:
+cargo run --release --locked -p rescrow-adapters --example snapshot_bench -- /tmp
+```
+
+Development measurement on 2026-11-17, Rust 1.96.0 release builds, Linux tmpfs: alternating two runs of baseline `f20e048` and two of this implementation, using the same harness (adapted only for the snapshot port). Seeded sizes were 262, 191,261, and 1,910,261 bytes. The table gives the range of each run's median at 10,000 retained transactions:
+
+| Operation | Baseline | Updated |
+| --- | --- | --- |
+| Resource inspection | 124.7–138.5 ms | 56.7–72.0 ms |
+| Identical create replay | 120.7–258.5 ms | 79.0–88.4 ms |
+| Prepare + abort | 857.7–1,124.7 ms | 548.1–757.1 ms |
+
+Whole-harness user+system CPU time, including fixture construction and all three sizes, was 5.40–5.51 seconds before and 4.03–4.05 seconds after. Scheduler contention and persistent-filesystem synchronization made wall-clock results noisy; these small samples are evidence of reduced repeated-conversion work on this host, not an SLO, throughput qualification, or a power-loss test. In particular, tmpfs does not measure persistent-device durability latency. Snapshot validation and rewrites still scale with retained history.
 
 ## Guiding values
 

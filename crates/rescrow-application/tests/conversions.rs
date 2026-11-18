@@ -26,6 +26,11 @@ fn sample() -> Snapshot {
 }
 #[test]
 fn canonical_decimal_and_typed_json() {
+    assert_eq!(decimal("not-an-integer"), Err(d::Error::InvalidQuantity));
+    assert_eq!(
+        decimal("170141183460469231731687303715884105728"),
+        Err(d::Error::Overflow)
+    );
     for s in [
         "+1",
         "01",
@@ -120,6 +125,7 @@ fn reject_impossible_records_without_dropping_entries() {
         |s| {
             s.transactions[0].state = State::Aborted {
                 cause: AbortReason::Requested,
+                capacity: None,
             }
         },
         |s| {
@@ -191,5 +197,53 @@ fn documented_json_examples_use_the_validated_contract() {
     assert!(
         serde_json::from_str::<AbortReason>(r#"{"reason":"requested","rejection":"capacity"}"#)
             .is_err()
+    );
+}
+
+#[test]
+fn capacity_details_validate_and_legacy_rejections_still_decode() {
+    let prepared = validated_snapshot(sample()).unwrap();
+    let rejected = prepared
+        .prepare(
+            Prepare {
+                transaction_id: "reject".into(),
+                operations: vec![Operation {
+                    operation_id: "o".into(),
+                    resource_id: "r".into(),
+                    delta: "-6".into(),
+                }],
+            }
+            .try_into()
+            .unwrap(),
+        )
+        .unwrap();
+    let dto = Snapshot::from_ledger(&rejected, 4);
+    for change in [0, 1, 2, 3] {
+        let mut invalid = dto.clone();
+        let State::Aborted { cause, capacity } = &mut invalid.transactions[0].state else {
+            panic!()
+        };
+        match change {
+            0 => capacity.as_mut().unwrap().available = "6".into(),
+            1 => capacity.as_mut().unwrap().requested_delta = "-7".into(),
+            2 => capacity.as_mut().unwrap().resource_id = "other".into(),
+            _ => *cause = AbortReason::Requested,
+        }
+        assert_eq!(
+            validated_snapshot(invalid).unwrap_err().code,
+            Code::CorruptState
+        );
+    }
+    let mut legacy = dto;
+    let State::Aborted { capacity, .. } = &mut legacy.transactions[0].state else {
+        panic!()
+    };
+    *capacity = None;
+    let json = serde_json::to_string(&legacy).unwrap();
+    assert!(!json.contains("\"capacity\":"));
+    let restored = validated_snapshot(serde_json::from_str(&json).unwrap()).unwrap();
+    assert_eq!(
+        restored.transactions()[&d::Id::new("reject".into()).unwrap()].rejection(),
+        Some(d::Rejection::Capacity(None))
     );
 }

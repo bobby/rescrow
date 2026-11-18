@@ -3,6 +3,7 @@ pub mod dto;
 use dto::{Command, Output, Snapshot};
 use rescrow_domain as d;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,18 +37,42 @@ pub struct Error {
     pub category: Category,
     pub code: Code,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<Box<dto::CapacityFailure>>,
 }
 impl Error {
+    fn with_transaction(mut self, id: &str) -> Self {
+        self.transaction_id = Some(id.into());
+        self
+    }
+    fn rejection(reason: d::Rejection) -> Self {
+        match reason {
+            d::Rejection::Capacity(Some(failure)) => Self::domain(d::Error::Capacity(failure)),
+            d::Rejection::Capacity(None) => Self {
+                category: Category::Domain,
+                code: Code::Capacity,
+                message: "insufficient unreserved quantity or upward room (legacy rejection without details)".into(),
+                transaction_id: None,
+                capacity: None,
+            },
+            d::Rejection::Overflow => Self::domain(d::Error::Overflow),
+            d::Rejection::NotFound => Self::domain(d::Error::NotFound),
+        }
+    }
     pub fn input(message: impl Into<String>) -> Self {
         Self {
             category: Category::Input,
             code: Code::InvalidInput,
             message: message.into(),
+            transaction_id: None,
+            capacity: None,
         }
     }
     fn domain(e: d::Error) -> Self {
         let code = match e {
-            d::Error::Capacity => Code::Capacity,
+            d::Error::Capacity(_) => Code::Capacity,
             d::Error::Overflow => Code::Overflow,
             d::Error::NotFound => Code::NotFound,
             d::Error::Conflict => Code::Conflict,
@@ -57,12 +82,21 @@ impl Error {
             category: Category::Domain,
             code,
             message: e.to_string(),
+            transaction_id: None,
+            capacity: match &e {
+                d::Error::Capacity(failure) => Some(Box::new(failure.into())),
+                _ => None,
+            },
         }
     }
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}: {}", self.code, self.message)
+        write!(f, "{:?}: {}", self.code, self.message)?;
+        if let Some(id) = &self.transaction_id {
+            write!(f, " [transaction {id}]")?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for Error {}
@@ -94,7 +128,9 @@ impl std::fmt::Display for StoreError {
                 write!(f, "unsupported snapshot schema version {version}")
             }
             Self::Io(detail) => write!(f, "storage I/O failed: {detail}"),
-            Self::TooLarge => f.write_str("snapshot exceeds the adapter's size limit"),
+            Self::TooLarge => f.write_str(
+                "snapshot or its reserved settlement space exceeds the adapter's size limit",
+            ),
             Self::Unknown(detail) => write!(
                 f,
                 "publication outcome uncertain: {detail}; inspect/retry the same identity and request"
@@ -119,6 +155,8 @@ impl From<StoreError> for Error {
             category,
             code,
             message: e.to_string(),
+            transaction_id: None,
+            capacity: None,
         }
     }
 }
@@ -128,64 +166,63 @@ pub enum Publication {
     Conflict,
 }
 
+/// A validated immutable ledger with storage metadata. Adapters validate each
+/// decoded image once, before returning it. Sharing this value never permits mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedSnapshot {
+    revision: u64,
+    ledger: Arc<d::Ledger>,
+}
+impl ValidatedSnapshot {
+    pub fn from_ledger(ledger: d::Ledger, revision: u64) -> Self {
+        Self {
+            revision,
+            ledger: Arc::new(ledger),
+        }
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn ledger(&self) -> &d::Ledger {
+        &self.ledger
+    }
+    pub fn to_dto(&self) -> Snapshot {
+        Snapshot::from_ledger(&self.ledger, self.revision)
+    }
+}
+impl TryFrom<Snapshot> for ValidatedSnapshot {
+    type Error = StoreError;
+    fn try_from(snapshot: Snapshot) -> Result<Self, Self::Error> {
+        if snapshot.schema_version != 1 {
+            return Err(StoreError::Unsupported(snapshot.schema_version));
+        }
+        let revision = snapshot.revision;
+        let ledger =
+            d::Ledger::try_from(snapshot).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        Ok(Self::from_ledger(ledger, revision))
+    }
+}
+
 /// A load acknowledges durability, including a prior publication with a lost response.
-/// CAS must compare under the same coordination boundary as publication. Errors after
-/// publication must be Unknown, never Io. Initialization must never replace live state.
+/// CAS compares under the publication lock. Every decoded image crosses TryFrom
+/// once; candidates already carry the Application's construction proof. Errors
+/// after publication must be Unknown, never Io. Initialization never replaces state.
 pub trait SnapshotStore {
-    fn initialize(&self, empty: &Snapshot) -> Result<(), StoreError>;
-    fn load(&self) -> Result<Snapshot, StoreError>;
+    fn initialize(&self, empty: &ValidatedSnapshot) -> Result<(), StoreError>;
+    fn load(&self) -> Result<ValidatedSnapshot, StoreError>;
     fn replace(
         &self,
         expected_revision: u64,
-        candidate: &Snapshot,
+        candidate: &ValidatedSnapshot,
     ) -> Result<Publication, StoreError>;
 }
 
 pub fn validated_snapshot(snapshot: Snapshot) -> Result<d::Ledger, Error> {
-    if snapshot.schema_version != 1 {
-        return Err(StoreError::Unsupported(snapshot.schema_version).into());
-    }
-    d::Ledger::try_from(snapshot).map_err(|e| StoreError::Corrupt(e.to_string()).into())
+    let validated = ValidatedSnapshot::try_from(snapshot)?;
+    Ok(Arc::unwrap_or_clone(validated.ledger))
 }
 
-enum Validated {
-    Create(d::ResourceSpec),
-    Prepare(d::Request),
-    Commit(d::Id, Option<Vec<(d::Id, i128)>>),
-    Abort(d::Id),
-    Resource(d::Id),
-    Resources,
-    Transaction(d::Id),
-    Transactions,
-}
-impl TryFrom<Command> for Validated {
-    type Error = d::Error;
-    fn try_from(c: Command) -> Result<Self, Self::Error> {
-        Ok(match c {
-            Command::CreateResource(v) => Self::Create(v.try_into()?),
-            Command::Prepare(v) => Self::Prepare(v.try_into()?),
-            Command::Commit(v) => Self::Commit(
-                d::Id::new(v.transaction_id)?,
-                v.actuals
-                    .map(|a| {
-                        a.into_iter()
-                            .map(|a| Ok((d::Id::new(a.operation_id)?, dto::decimal(&a.delta)?)))
-                            .collect::<Result<_, d::Error>>()
-                    })
-                    .transpose()?,
-            ),
-            Command::Abort { transaction_id } => Self::Abort(d::Id::new(transaction_id)?),
-            Command::ShowResource { resource_id } => Self::Resource(d::Id::new(resource_id)?),
-            Command::ListResources => Self::Resources,
-            Command::ShowTransaction { transaction_id } => {
-                Self::Transaction(d::Id::new(transaction_id)?)
-            }
-            Command::ListTransactions => Self::Transactions,
-        })
-    }
-}
-
-/// A host supplies one snapshot adapter; no daemon or asynchronous runtime is required.
+/// Synchronous typed use cases shared by CLI and embedded Rust callers.
 pub struct Application<S> {
     store: S,
     attempts: usize,
@@ -197,83 +234,160 @@ impl<S: SnapshotStore> Application<S> {
             attempts: 32,
         }
     }
-    pub fn initialize(&self) -> Result<Output, Error> {
+    pub fn initialize(&self) -> Result<(), Error> {
         self.store
-            .initialize(&Snapshot::from_ledger(&d::Ledger::default(), 0))?;
-        Ok(Output::Initialized)
+            .initialize(&ValidatedSnapshot::from_ledger(d::Ledger::default(), 0))?;
+        Ok(())
     }
+    /// Transport dispatcher; Rust callers may use the specific methods below.
     pub fn execute(&self, command: Command) -> Result<Output, Error> {
-        let command = Validated::try_from(command).map_err(|e| Error::input(e.to_string()))?;
+        match command {
+            Command::CreateResource(v) => self.create_resource(v).map(Output::Resource),
+            Command::Prepare(v) => self.prepare(v).map(Output::Transaction),
+            Command::Commit(v) => self.commit(v).map(Output::Transaction),
+            Command::Abort { transaction_id } => {
+                self.abort(&transaction_id).map(Output::Transaction)
+            }
+            Command::ShowResource { resource_id } => {
+                self.resource(&resource_id).map(Output::Resource)
+            }
+            Command::ListResources => self.resources().map(Output::Resources),
+            Command::ShowTransaction { transaction_id } => {
+                self.transaction(&transaction_id).map(Output::Transaction)
+            }
+            Command::ListTransactions => self.transactions().map(Output::Transactions),
+        }
+    }
+    pub fn create_resource(&self, spec: dto::ResourceSpec) -> Result<dto::Resource, Error> {
+        let spec: d::ResourceSpec = spec.try_into().map_err(input)?;
+        self.mutate(
+            |ledger| ledger.create(spec.clone()),
+            |next| Ok((&next.resources()[spec.id()]).into()),
+        )
+    }
+    /// Admit a frozen request; business rejections are persisted before returning an error.
+    pub fn prepare(&self, request: dto::Prepare) -> Result<dto::Transaction, Error> {
+        let id = request.transaction_id.clone();
+        let result = (|| {
+            let request: d::Request = request.try_into().map_err(input)?;
+            self.mutate(
+                |ledger| ledger.prepare(request.clone()),
+                |next| {
+                    let tx = &next.transactions()[request.id()];
+                    match tx.rejection() {
+                        Some(reason) => Err(Error::rejection(reason)),
+                        None => Ok(tx.into()),
+                    }
+                },
+            )
+        })();
+        result.map_err(|e| e.with_transaction(&id))
+    }
+    /// Settle full or explicit actual usage; terminal retries must select the same actuals.
+    pub fn commit(&self, command: dto::Commit) -> Result<dto::Transaction, Error> {
+        let id = command.transaction_id;
+        let result = (|| {
+            let transaction = d::Id::new(id.clone()).map_err(input)?;
+            let actuals = command
+                .actuals
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|a| Ok((d::Id::new(a.operation_id)?, dto::decimal(&a.delta)?)))
+                        .collect::<Result<Vec<_>, d::Error>>()
+                })
+                .transpose()
+                .map_err(input)?;
+            self.mutate(
+                |ledger| ledger.commit(&transaction, actuals.clone()),
+                |next| Ok((&next.transactions()[&transaction]).into()),
+            )
+        })();
+        result.map_err(|e| e.with_transaction(&id))
+    }
+    /// Release a prepared hold. An existing committed decision conflicts.
+    pub fn abort(&self, id: &str) -> Result<dto::Transaction, Error> {
+        let result = (|| {
+            let transaction = d::Id::new(id.into()).map_err(input)?;
+            self.mutate(
+                |ledger| ledger.abort(&transaction),
+                |next| Ok((&next.transactions()[&transaction]).into()),
+            )
+        })();
+        result.map_err(|e| e.with_transaction(id))
+    }
+    pub fn resource(&self, id: &str) -> Result<dto::Resource, Error> {
+        let id = d::Id::new(id.into()).map_err(input)?;
+        self.store
+            .load()?
+            .ledger()
+            .resources()
+            .get(&id)
+            .map(Into::into)
+            .ok_or_else(|| Error::domain(d::Error::NotFound))
+    }
+    pub fn resources(&self) -> Result<Vec<dto::Resource>, Error> {
+        Ok(self
+            .store
+            .load()?
+            .ledger()
+            .resources()
+            .values()
+            .map(Into::into)
+            .collect())
+    }
+    pub fn transaction(&self, id: &str) -> Result<dto::Transaction, Error> {
+        let result = (|| {
+            let transaction = d::Id::new(id.into()).map_err(input)?;
+            self.store
+                .load()?
+                .ledger()
+                .transactions()
+                .get(&transaction)
+                .map(Into::into)
+                .ok_or_else(|| Error::domain(d::Error::NotFound))
+        })();
+        result.map_err(|e| e.with_transaction(id))
+    }
+    pub fn transactions(&self) -> Result<Vec<dto::Transaction>, Error> {
+        Ok(self
+            .store
+            .load()?
+            .ledger()
+            .transactions()
+            .values()
+            .map(Into::into)
+            .collect())
+    }
+    fn mutate<R>(
+        &self,
+        change: impl Fn(&d::Ledger) -> Result<d::Ledger, d::Error>,
+        result: impl Fn(&d::Ledger) -> Result<R, Error>,
+    ) -> Result<R, Error> {
         for _ in 0..self.attempts {
             let snapshot = self.store.load()?;
-            let revision = snapshot.revision;
-            let ledger = validated_snapshot(snapshot)?;
-            let (next, output) = match &command {
-                Validated::Resource(id) => {
-                    return ledger
-                        .resources()
-                        .get(id)
-                        .map(|r| Output::Resource(r.into()))
-                        .ok_or_else(|| Error::domain(d::Error::NotFound));
-                }
-                Validated::Resources => {
-                    return Ok(Output::Resources(
-                        ledger.resources().values().map(Into::into).collect(),
-                    ));
-                }
-                Validated::Transaction(id) => {
-                    return ledger
-                        .transactions()
-                        .get(id)
-                        .map(|t| Output::Transaction(t.into()))
-                        .ok_or_else(|| Error::domain(d::Error::NotFound));
-                }
-                Validated::Transactions => {
-                    return Ok(Output::Transactions(
-                        ledger.transactions().values().map(Into::into).collect(),
-                    ));
-                }
-                Validated::Create(spec) => {
-                    let next = ledger.create(spec.clone()).map_err(Error::domain)?;
-                    let result = Output::Resource((&next.resources()[spec.id()]).into());
-                    (next, Ok(result))
-                }
-                Validated::Prepare(request) => {
-                    let next = ledger.prepare(request.clone()).map_err(Error::domain)?;
-                    let tx = &next.transactions()[request.id()];
-                    let result = match tx.rejection() {
-                        Some(d::Rejection::Capacity) => Err(Error::domain(d::Error::Capacity)),
-                        Some(d::Rejection::Overflow) => Err(Error::domain(d::Error::Overflow)),
-                        Some(d::Rejection::NotFound) => Err(Error::domain(d::Error::NotFound)),
-                        None => Ok(Output::Transaction(tx.into())),
-                    };
-                    (next, result)
-                }
-                Validated::Commit(id, actuals) => {
-                    let next = ledger.commit(id, actuals.clone()).map_err(Error::domain)?;
-                    let result = Output::Transaction((&next.transactions()[id]).into());
-                    (next, Ok(result))
-                }
-                Validated::Abort(id) => {
-                    let next = ledger.abort(id).map_err(Error::domain)?;
-                    let result = Output::Transaction((&next.transactions()[id]).into());
-                    (next, Ok(result))
-                }
-            };
-            if next == ledger {
+            let ledger = snapshot.ledger();
+            let next = change(ledger).map_err(Error::domain)?;
+            let output = result(&next);
+            if next == *ledger {
                 return output;
             }
-            let revision_next = revision.checked_add(1).ok_or_else(|| Error {
+            let revision = snapshot.revision().checked_add(1).ok_or_else(|| Error {
                 category: Category::Storage,
                 code: Code::RevisionExhausted,
                 message: "snapshot revision exhausted".into(),
+                transaction_id: None,
+                capacity: None,
             })?;
-            let candidate = Snapshot::from_ledger(&next, revision_next);
-            match self.store.replace(revision, &candidate)? {
+            let candidate = ValidatedSnapshot::from_ledger(next, revision);
+            match self.store.replace(snapshot.revision(), &candidate)? {
                 Publication::Applied => return output,
                 Publication::Conflict => continue,
             }
         }
         Err(StoreError::Contention.into())
     }
+}
+fn input(error: d::Error) -> Error {
+    Error::input(error.to_string())
 }

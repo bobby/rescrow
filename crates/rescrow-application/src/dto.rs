@@ -96,9 +96,43 @@ pub enum AbortReason {
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum State {
     Prepared {},
-    Committed { actuals: Vec<Actual> },
-    Aborted { cause: AbortReason },
+    Committed {
+        actuals: Vec<Actual>,
+    },
+    Aborted {
+        cause: AbortReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capacity: Option<CapacityFailure>,
+    },
 }
+/// Frozen admission facts, shared by persisted rejections and structured errors.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityFailure {
+    pub resource_id: String,
+    pub requested_delta: String,
+    pub available: String,
+}
+impl TryFrom<CapacityFailure> for d::CapacityFailure {
+    type Error = d::Error;
+    fn try_from(v: CapacityFailure) -> Result<Self, Self::Error> {
+        Self::new(
+            id(v.resource_id)?,
+            decimal(&v.requested_delta)?,
+            decimal(&v.available)?,
+        )
+    }
+}
+impl From<&d::CapacityFailure> for CapacityFailure {
+    fn from(v: &d::CapacityFailure) -> Self {
+        Self {
+            resource_id: v.resource().as_str().into(),
+            requested_delta: v.requested_delta().to_string(),
+            available: v.available().to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Transaction {
@@ -126,9 +160,6 @@ impl Snapshot {
                 .collect(),
         }
     }
-    pub fn validate(&self) -> Result<(), super::Error> {
-        super::validated_snapshot(self.clone()).map(|_| ())
-    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -152,7 +183,12 @@ fn required_option<'de, D: serde::Deserializer<'de>>(
 }
 
 pub fn decimal(value: &str) -> Result<i128, d::Error> {
-    let parsed = value.parse::<i128>().map_err(|_| d::Error::Overflow)?;
+    let parsed = value.parse::<i128>().map_err(|error| match error.kind() {
+        std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+            d::Error::Overflow
+        }
+        _ => d::Error::InvalidQuantity,
+    })?;
     if parsed.to_string() != value {
         return Err(d::Error::InvalidQuantity);
     }
@@ -232,14 +268,11 @@ impl TryFrom<Resource> for d::Resource {
                 .map(|h| Ok((id(h.transaction_id)?, decimal(&h.delta)?)))
                 .collect::<Result<_, d::Error>>()?,
         )?;
-        let (down, up, reserved_down, reserved_up) = r.availability();
-        if (down, up, reserved_down, reserved_up)
-            != (
-                decimal(&v.available_down)?,
-                decimal(&v.available_up)?,
-                decimal(&v.reserved_down)?,
-                decimal(&v.reserved_up)?,
-            )
+        let a = r.availability();
+        if a.available_down() != decimal(&v.available_down)?
+            || a.available_up() != decimal(&v.available_up)?
+            || a.reserved_down() != decimal(&v.reserved_down)?
+            || a.reserved_up() != decimal(&v.reserved_up)?
         {
             return Err(d::Error::InvalidLedger);
         }
@@ -249,7 +282,7 @@ impl TryFrom<Resource> for d::Resource {
 impl From<&d::Resource> for Resource {
     fn from(v: &d::Resource) -> Self {
         // All constructors and transitions preserve this invariant. No fallible encoding here.
-        let (down, up, reserved_down, reserved_up) = v.availability();
+        let a = v.availability();
         Self {
             spec: v.spec().into(),
             quantity: v.quantity().to_string(),
@@ -261,10 +294,10 @@ impl From<&d::Resource> for Resource {
                     delta: delta.to_string(),
                 })
                 .collect(),
-            reserved_down: reserved_down.to_string(),
-            reserved_up: reserved_up.to_string(),
-            available_down: down.to_string(),
-            available_up: up.to_string(),
+            reserved_down: a.reserved_down().to_string(),
+            reserved_up: a.reserved_up().to_string(),
+            available_down: a.available_down().to_string(),
+            available_up: a.available_up().to_string(),
         }
     }
 }
@@ -282,14 +315,21 @@ impl TryFrom<Transaction> for d::Transaction {
                         .collect::<Result<_, d::Error>>()?,
                 ))?,
             ),
-            State::Aborted { cause } => d::State::Aborted(match cause {
-                AbortReason::Requested => d::AbortReason::Requested,
-                AbortReason::Rejected(r) => d::AbortReason::Rejected(match r {
-                    Rejection::Capacity => d::Rejection::Capacity,
-                    Rejection::Overflow => d::Rejection::Overflow,
-                    Rejection::NotFound => d::Rejection::NotFound,
-                }),
-            }),
+            State::Aborted { cause, capacity } => {
+                if capacity.is_some() && cause != AbortReason::Rejected(Rejection::Capacity) {
+                    return Err(d::Error::InvalidLedger);
+                }
+                d::State::Aborted(match cause {
+                    AbortReason::Requested => d::AbortReason::Requested,
+                    AbortReason::Rejected(r) => d::AbortReason::Rejected(match r {
+                        Rejection::Capacity => d::Rejection::Capacity(
+                            capacity.map(d::CapacityFailure::try_from).transpose()?,
+                        ),
+                        Rejection::Overflow => d::Rejection::Overflow,
+                        Rejection::NotFound => d::Rejection::NotFound,
+                    }),
+                })
+            }
         };
         Self::restore(request, state)
     }
@@ -309,10 +349,16 @@ impl From<&d::Transaction> for Transaction {
                     .collect(),
             },
             d::State::Aborted(cause) => State::Aborted {
+                capacity: match cause {
+                    d::AbortReason::Rejected(d::Rejection::Capacity(Some(failure))) => {
+                        Some(failure.into())
+                    }
+                    _ => None,
+                },
                 cause: match cause {
                     d::AbortReason::Requested => AbortReason::Requested,
                     d::AbortReason::Rejected(r) => AbortReason::Rejected(match r {
-                        d::Rejection::Capacity => Rejection::Capacity,
+                        d::Rejection::Capacity(_) => Rejection::Capacity,
                         d::Rejection::Overflow => Rejection::Overflow,
                         d::Rejection::NotFound => Rejection::NotFound,
                     }),

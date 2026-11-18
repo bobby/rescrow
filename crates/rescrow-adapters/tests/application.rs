@@ -1,6 +1,6 @@
 use rescrow_adapters::memory::{Fault, MemoryStore};
 use rescrow_application::{
-    Application, Category, Code, Publication, SnapshotStore, StoreError, dto::*,
+    Application, Category, Code, Publication, SnapshotStore, StoreError, ValidatedSnapshot, dto::*,
 };
 fn create() -> Command {
     Command::CreateResource(ResourceSpec {
@@ -33,14 +33,14 @@ fn ready() -> (MemoryStore, Application<MemoryStore>) {
 fn direct_api_publishes_rejections_and_replays_do_not_advance_revision() {
     let (store, app) = ready();
     app.execute(prepare("t", "-3")).unwrap();
-    let before = store.load().unwrap();
+    let before = store.load().unwrap().to_dto();
     app.execute(prepare("t", "-3")).unwrap();
     app.execute(create()).unwrap();
     app.execute(Command::ListResources).unwrap();
-    assert_eq!(store.load().unwrap(), before);
+    assert_eq!(store.load().unwrap().to_dto(), before);
     let err = app.execute(prepare("rejected", "-3")).unwrap_err();
     assert_eq!(err.code, Code::Capacity);
-    let rejected = store.load().unwrap();
+    let rejected = store.load().unwrap().to_dto();
     assert_eq!(rejected.revision, before.revision + 1);
     assert_eq!(rejected.resources, before.resources);
     assert_eq!(rejected.transactions.len(), 2);
@@ -61,20 +61,20 @@ fn direct_api_publishes_rejections_and_replays_do_not_advance_revision() {
         .code,
         Code::Conflict
     );
-    let revision = store.load().unwrap().revision;
+    let revision = store.load().unwrap().to_dto().revision;
     app.execute(Command::Abort {
         transaction_id: "t".into(),
     })
     .unwrap();
-    assert_eq!(store.load().unwrap().revision, revision);
+    assert_eq!(store.load().unwrap().to_dto().revision, revision);
 }
 #[test]
 fn bounded_retries_prepublication_failures_and_lost_response() {
     let (store, app) = ready();
-    let old = store.load().unwrap();
+    let old = store.load().unwrap().to_dto();
     store.inject(Fault::BeforePublication);
     assert_eq!(app.execute(prepare("t", "-3")).unwrap_err().code, Code::Io);
-    assert_eq!(store.load().unwrap(), old);
+    assert_eq!(store.load().unwrap().to_dto(), old);
     store.inject(Fault::Conflict);
     store.inject(Fault::Conflict);
     let evaluations = store.evaluations();
@@ -92,9 +92,9 @@ fn bounded_retries_prepublication_failures_and_lost_response() {
         app.execute(commit.clone()).unwrap_err().category,
         Category::UnknownOutcome
     );
-    let published = store.load().unwrap();
+    let published = store.load().unwrap().to_dto();
     app.execute(commit).unwrap();
-    assert_eq!(store.load().unwrap(), published);
+    assert_eq!(store.load().unwrap().to_dto(), published);
     assert_eq!(published.resources[0].quantity, "3");
     for _ in 0..32 {
         store.inject(Fault::Conflict);
@@ -113,7 +113,7 @@ fn lost_prepare_rejection_and_abort_responses_keep_identity() {
             app.execute(prepare("t", delta)).unwrap_err().category,
             Category::UnknownOutcome
         );
-        let before = store.load().unwrap();
+        let before = store.load().unwrap().to_dto();
         let retry = app.execute(prepare("t", delta));
         match &expected {
             Some(code) => assert_eq!(&retry.unwrap_err().code, code),
@@ -121,7 +121,7 @@ fn lost_prepare_rejection_and_abort_responses_keep_identity() {
                 retry.unwrap();
             }
         }
-        assert_eq!(store.load().unwrap(), before);
+        assert_eq!(store.load().unwrap().to_dto(), before);
         if expected.is_none() {
             store.inject(Fault::LostResponse);
             assert_eq!(
@@ -132,19 +132,19 @@ fn lost_prepare_rejection_and_abort_responses_keep_identity() {
                 .category,
                 Category::UnknownOutcome
             );
-            let before = store.load().unwrap();
+            let before = store.load().unwrap().to_dto();
             app.execute(Command::Abort {
                 transaction_id: "t".into(),
             })
             .unwrap();
-            assert_eq!(store.load().unwrap(), before);
+            assert_eq!(store.load().unwrap().to_dto(), before);
         }
     }
 }
 #[test]
 fn corrupt_storage_bad_input_and_revision_overflow_fail_closed() {
     let (store, app) = ready();
-    let mut snapshot = store.load().unwrap();
+    let mut snapshot = store.load().unwrap().to_dto();
     snapshot.resources[0].quantity = "6".into();
     store.set_raw(snapshot);
     assert_eq!(
@@ -156,7 +156,7 @@ fn corrupt_storage_bad_input_and_revision_overflow_fail_closed() {
         Category::Input
     );
     let (store, app) = ready();
-    let mut snapshot = store.load().unwrap();
+    let mut snapshot = store.load().unwrap().to_dto();
     snapshot.schema_version = 2;
     store.set_raw(snapshot);
     assert_eq!(
@@ -164,14 +164,14 @@ fn corrupt_storage_bad_input_and_revision_overflow_fail_closed() {
         Code::UnsupportedSchema
     );
     let (store, app) = ready();
-    let mut snapshot = store.load().unwrap();
+    let mut snapshot = store.load().unwrap().to_dto();
     snapshot.revision = u64::MAX;
     store.set_raw(snapshot.clone());
     assert_eq!(
         app.execute(prepare("t", "-1")).unwrap_err().code,
         Code::RevisionExhausted
     );
-    assert_eq!(store.load().unwrap(), snapshot);
+    assert_eq!(store.load().unwrap().to_dto(), snapshot);
     let store = MemoryStore::default();
     let app = Application::new(store);
     assert_eq!(
@@ -186,13 +186,13 @@ struct Competing {
     first: std::cell::Cell<bool>,
 }
 impl SnapshotStore for Competing {
-    fn initialize(&self, s: &Snapshot) -> Result<(), StoreError> {
+    fn initialize(&self, s: &ValidatedSnapshot) -> Result<(), StoreError> {
         self.inner.initialize(s)
     }
-    fn load(&self) -> Result<Snapshot, StoreError> {
+    fn load(&self) -> Result<ValidatedSnapshot, StoreError> {
         self.inner.load()
     }
-    fn replace(&self, r: u64, s: &Snapshot) -> Result<Publication, StoreError> {
+    fn replace(&self, r: u64, s: &ValidatedSnapshot) -> Result<Publication, StoreError> {
         if self.first.replace(false) {
             Application::new(self.inner.clone())
                 .execute(prepare("winner", "-5"))
@@ -214,7 +214,7 @@ fn conflict_reloads_and_recomputes_admission() {
         app.execute(prepare("loser", "-1")).unwrap_err().code,
         Code::Capacity
     );
-    let snapshot = store.load().unwrap();
+    let snapshot = store.load().unwrap().to_dto();
     assert_eq!(snapshot.resources[0].reserved_down, "5");
     assert_eq!(snapshot.transactions.len(), 2);
     assert_eq!(snapshot.revision, 3);
@@ -229,16 +229,16 @@ fn missing_resource_rejection_remains_terminal_after_resource_creation() {
         app.execute(prepare("missing", "-1")).unwrap_err().code,
         Code::NotFound
     );
-    let rejected = store.load().unwrap();
+    let rejected = store.load().unwrap().to_dto();
     assert_eq!(rejected.transactions.len(), 1);
     assert!(rejected.resources.is_empty());
     app.execute(create()).unwrap();
-    let before = store.load().unwrap();
+    let before = store.load().unwrap().to_dto();
     assert_eq!(
         app.execute(prepare("missing", "-1")).unwrap_err().code,
         Code::NotFound
     );
-    assert_eq!(store.load().unwrap(), before);
+    assert_eq!(store.load().unwrap().to_dto(), before);
     assert_eq!(
         app.execute(Command::Commit(Commit {
             transaction_id: "missing".into(),
@@ -248,4 +248,64 @@ fn missing_resource_rejection_remains_terminal_after_resource_creation() {
         .code,
         Code::Conflict
     );
+}
+
+#[test]
+fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
+    let (store, app) = ready();
+    app.prepare(Prepare {
+        transaction_id: "held".into(),
+        operations: vec![Operation {
+            operation_id: "o".into(),
+            resource_id: "r".into(),
+            delta: "-3".into(),
+        }],
+    })
+    .unwrap();
+    let request = Prepare {
+        transaction_id: "rejected".into(),
+        operations: vec![Operation {
+            operation_id: "a".into(),
+            resource_id: "r".into(),
+            delta: "-4".into(),
+        }],
+    };
+    let error = app.prepare(request.clone()).unwrap_err();
+    assert_eq!(error.transaction_id.as_deref(), Some("rejected"));
+    assert_eq!(
+        error.capacity.as_deref(),
+        Some(&CapacityFailure {
+            resource_id: "r".into(),
+            requested_delta: "-4".into(),
+            available: "2".into()
+        })
+    );
+    let serialized = serde_json::to_string(&error).unwrap();
+    app.abort("held").unwrap();
+    assert_eq!(
+        serde_json::to_string(&app.prepare(request).unwrap_err()).unwrap(),
+        serialized
+    );
+    assert!(matches!(
+        app.transaction("rejected").unwrap().state,
+        State::Aborted {
+            capacity: Some(_),
+            ..
+        }
+    ));
+    assert_eq!(app.resource("r").unwrap().quantity, "5");
+    assert_eq!(app.resources().unwrap().len(), 1);
+    assert_eq!(app.transactions().unwrap().len(), 2);
+    // The snapshot's shared construction proof does not make corrupt raw data trusted.
+    let mut bad = store.load().unwrap().to_dto();
+    bad.transactions[1].state = State::Aborted {
+        cause: AbortReason::Rejected(Rejection::Capacity),
+        capacity: Some(CapacityFailure {
+            resource_id: "other".into(),
+            requested_delta: "-4".into(),
+            available: "2".into(),
+        }),
+    };
+    store.set_raw(bad);
+    assert_eq!(app.transactions().unwrap_err().code, Code::CorruptState);
 }

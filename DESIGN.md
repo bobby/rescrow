@@ -1,6 +1,6 @@
 # Rescrow: durable escrow transactions in Rust
 
-Status: proposed distributed/enterprise design. The local snapshot milestone is implemented; see README.md for supported commands and tested limits. No measured performance or enterprise qualification yet.
+Status: proposed distributed/enterprise design. The local snapshot milestone is implemented; see README.md for supported commands and tested limits. Local development benchmark measurements are recorded in README.md; enterprise performance and durability remain unqualified.
 
 Date: 2026-11-13.
 
