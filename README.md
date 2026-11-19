@@ -124,6 +124,22 @@ PROPTEST_CASES=2048 PROPTEST_RNG_SEED=42 cargo test -p rescrow-adapters --test g
 
 Failure seeds are persisted in `crates/rescrow-adapters/proptest-regressions/generated_histories.txt` and replayed on subsequent runs. Commit files from genuine failures with their fixes. Seed replay depends on the strategies and dependency version; a seed is not an OS schedule. These tests cover sequential histories, small-integer business rules, serialization, and simulated publication faults. Existing numeric-edge, conversion, filesystem-interruption, and concurrent CLI tests remain necessary; the generated model does not qualify process concurrency or device durability.
 
+### Concurrent histories
+
+[`concurrent_histories.rs`](crates/rescrow-cli/tests/concurrent_histories.rs) runs 16 bounded scenarios, each with three concurrent clients issuing four separate CLI processes in sequence against one store. The scenarios vary reservation direction and magnitude, finite/unbounded resources, normalized/changed prepare retries, and full/zero settlement. They mix multi-resource prepares, partial commits and identical commit retries, commit/abort races, capacity rejections, and resource/transaction reads. The first call intervals overlap through a client barrier; subsequent calls follow each client's observed completion, without imposing a publication order.
+
+Each call records invocation/completion events from one shared monotonic counter, its model command, typed result/error, exit status, and stdout/stderr. The checker reuses the independent transaction-history model above and searches for a sequential ordering matching every observation while preserving completion-before-invocation order. It also checks the final complete snapshot, including holds, retained rejections, and revision. The search memoizes failed states and fails explicitly on its limits of 16 calls or 100,000 explored states. Checker regression tests challenge backtracking, real-time constraints, impossible reads, duplicate effects, replay revisions, frozen capacity diagnostics, and saved-history decoding.
+
+```sh
+cargo test -p rescrow-cli --test concurrent_histories --locked
+# Repeat one workload; the OS schedule can differ on every run:
+RESCROW_HISTORY_CASE=7 cargo test -p rescrow-cli --test concurrent_histories --locked
+# Recheck an exact recorded observation history without starting new processes:
+RESCROW_HISTORY_REPLAY=/path/to/history.json cargo test -p rescrow-cli --test concurrent_histories --locked
+```
+
+Failures preserve `history.json`, input files, and the live store under `target/concurrent-histories/history-*` by default, or under `RESCROW_TEST_ROOT` when selected. Separate `setup.json` and `calls.json` preserve observations even if the final snapshot cannot be decoded. Successful cases remove their directories. Use failing commands and observations to construct regression tests with their fixes. Replay checks recorded evidence and does not reproduce the OS schedule; an impossible recorded history remains impossible after an implementation fix. These bounded scenarios do not shrink automatically or exhaust all concurrent schedules. They run on Unix hosts for smoke coverage; Linux CI exercises the supported local profile. Process concurrency checks do not qualify physical power-loss or device durability.
+
 ## Local benchmark
 
 `crates/rescrow-adapters/examples/snapshot_bench.rs` seeds 0, 1,000, and 10,000 retained zero-usage commits, then measures resource inspection, identical resource-create replay, and a prepare/abort pair. It uses the real file adapter, locks, and synchronization. The output reports seeded snapshot bytes and median microseconds over seven samples after two warm-up cycles; each mutation cycle retains another terminal transaction.
