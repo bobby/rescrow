@@ -2,9 +2,10 @@
 //! extrema are derived from accepted transaction history, never cached or updated
 //! using the production transition functions. DTOs are used only for observation.
 use rescrow_application::dto;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Spec {
     pub lower: i64,
     pub upper: Option<i64>,
@@ -12,13 +13,13 @@ pub struct Spec {
     pub unit: u8,
     pub scale: u8,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Op {
     pub id: u8,
     pub resource: u8,
     pub delta: i64,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
     Create(u8, Spec),
     Prepare(u16, Vec<Op>),
