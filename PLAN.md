@@ -172,7 +172,7 @@ The snapshot store rewrites and revalidates the whole ledger, including permanen
                       once when segment <n> is sealed
 ```
 
-Record kinds: `ResourceCreated`, `Prepared`, `Committed` (with actual deltas), and `Aborted` (requested or admitted rejection, including its retained capacity facts). Sealed segments and indexes are immutable write-once units. They correspond to create-if-absent objects in later object-storage adapters, whose tail would be immutable batch objects behind a conditionally replaced head rather than an appended file.
+Record kinds: `ResourceCreated`, `Prepared`, `Committed` (with actual deltas), and `Aborted` (requested or admitted rejection, including its retained capacity facts). Sealed segments and indexes are immutable write-once units, matching create-if-absent objects or items in later adapters. The active tail needs a conditional append: S3 Express One Zone appends at an expected write offset, and DynamoDB can conditionally update a bounded item with an appended body. Where no append exists, as in S3 general purpose buckets, the tail can be immutable batch objects behind a conditionally replaced head. Choose per backend by cost and failure domain: DynamoDB bills an update by the larger of the item's old and new size, and Express is a single-AZ durability choice (DESIGN.md section 6.3).
 
 ## Steps
 
