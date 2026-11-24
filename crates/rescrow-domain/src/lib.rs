@@ -3,6 +3,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod transition;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     InvalidId,
@@ -449,95 +451,36 @@ impl Ledger {
         &self.transactions
     }
     pub fn create(&self, spec: ResourceSpec) -> Result<Self, Error> {
-        if let Some(existing) = self.resources.get(&spec.id) {
-            return if existing.spec == spec {
-                Ok(self.clone())
-            } else {
-                Err(Error::Conflict)
-            };
-        }
-        let mut next = self.clone();
-        next.resources.insert(
-            spec.id.clone(),
-            Resource::restore(spec.clone(), spec.initial, vec![])?,
-        );
-        Ok(next)
+        let changes = transition::create(spec.clone(), self.resources.get(spec.id()))?;
+        Ok(self.apply(changes))
     }
     pub fn prepare(&self, request: Request) -> Result<Self, Error> {
-        if let Some(tx) = self.transactions.get(&request.id) {
-            return if tx.request == request {
-                Ok(self.clone())
-            } else {
-                Err(Error::Conflict)
-            };
-        }
-        let mut next = self.clone();
-        let mut state = State::Prepared;
-        // Missing current resources are a business rejection of a valid request,
-        // so its identity must remain rejected even if the resource is later created.
-        if request
-            .operations
-            .iter()
-            .any(|o| !self.resources.contains_key(&o.resource))
-        {
-            state = State::Aborted(AbortReason::Rejected(Rejection::NotFound));
-        }
-        for op in &request.operations {
-            if state != State::Prepared {
-                break;
-            }
-            match self.resources[&op.resource].reserve(&request.id, op.delta) {
-                Ok(resource) => {
-                    next.resources.insert(op.resource.clone(), resource);
-                }
-                Err(e) => {
-                    let reason = match e {
-                        Error::Capacity(failure) => Rejection::Capacity(Some(failure)),
-                        Error::Overflow => Rejection::Overflow,
-                        other => return Err(other),
-                    };
-                    next = self.clone();
-                    state = State::Aborted(AbortReason::Rejected(reason));
-                    break;
-                }
-            }
-        }
-        next.transactions
-            .insert(request.id.clone(), Transaction { request, state });
-        Ok(next)
+        let changes = transition::prepare(
+            request.clone(),
+            self.transactions.get(request.id()),
+            &self.resources,
+        )?;
+        Ok(self.apply(changes))
     }
     pub fn commit(&self, id: &Id, supplied: Option<Vec<(Id, i128)>>) -> Result<Self, Error> {
         let tx = self.transactions.get(id).ok_or(Error::NotFound)?;
-        let actuals = tx.request.actuals(supplied)?;
-        match &tx.state {
-            State::Committed(old) if *old == actuals => return Ok(self.clone()),
-            State::Committed(_) | State::Aborted(_) => return Err(Error::Conflict),
-            State::Prepared => {}
-        }
-        self.finish(id, State::Committed(actuals))
+        Ok(self.apply(transition::commit(tx, supplied, &self.resources)?))
     }
     pub fn abort(&self, id: &Id) -> Result<Self, Error> {
-        match self.transactions.get(id).ok_or(Error::NotFound)?.state {
-            State::Aborted(_) => Ok(self.clone()),
-            State::Committed(_) => Err(Error::Conflict),
-            State::Prepared => self.finish(id, State::Aborted(AbortReason::Requested)),
-        }
+        let tx = self.transactions.get(id).ok_or(Error::NotFound)?;
+        Ok(self.apply(transition::abort(tx, &self.resources)?))
     }
-    fn finish(&self, id: &Id, state: State) -> Result<Self, Error> {
+    fn apply(&self, changes: transition::Changes) -> Self {
         let mut next = self.clone();
-        for op in &self.transactions[id].request.operations {
-            let actual = match &state {
-                State::Committed(a) => a.0[&op.id],
-                _ => 0,
-            };
-            let resource = self.resources[&op.resource].settle(id, actual)?;
-            next.resources.insert(op.resource.clone(), resource);
+        for resource in changes.resources() {
+            next.resources
+                .insert(resource.spec().id().clone(), resource.clone());
         }
-        next.transactions
-            .get_mut(id)
-            .ok_or(Error::InvalidLedger)?
-            .state = state;
-        Ok(next)
+        if let Some(tx) = changes.transaction() {
+            next.transactions
+                .insert(tx.request().id().clone(), tx.clone());
+        }
+        next
     }
     /// Reconstruct trusted state only after validating every cross-record invariant.
     pub fn restore(

@@ -227,6 +227,8 @@ An illustrative Rust boundary, defined by the Application and implemented by out
 
 The first file-backed milestone instead uses the narrower whole-ledger snapshot port in [PLAN.md](PLAN.md). Its atomic multi-resource publication does not implement the separate-key protocol below. Introduce the broader interface when independent participant publication is actually needed.
 
+An experimental alternative now uses Application-owned `RecordStore`/`ReadView` interfaces and an Emriss adapter in the standalone `experiments/emriss` package. It retains one authoritative root per ledger while structurally sharing immutable record pages, so multi-resource changes still publish atomically without cloning or rewriting all retained history. Domain transitions operate on affected records; codecs, root versions and asynchronous access remain outside the Domain. This is a single-root experiment, not the separate-key protocol below or a qualified distributed authority. Full import/audit validation and incremental access validation have different corruption-detection scopes; see the README's Emriss prototype section for limits, format identity and reproduction commands.
+
 ```rust
 // Sketch: concrete async/object-safety and buffer types are implementation choices.
 trait ConditionalStore {

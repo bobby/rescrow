@@ -1,5 +1,7 @@
-//! Synchronous use cases and validated transfer boundary, independent of adapters.
+//! Snapshot and incremental-record use cases with a validated transfer boundary,
+//! independent of adapters.
 pub mod dto;
+pub mod records;
 use dto::{Command, Output, Snapshot};
 use rescrow_domain as d;
 use serde::{Deserialize, Serialize};

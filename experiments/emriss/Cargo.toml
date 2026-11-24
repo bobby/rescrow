@@ -1,0 +1,21 @@
+[package]
+name = "rescrow-emriss"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+
+# The private sibling checkout is an explicit requirement only for this experiment.
+# The ordinary Rescrow workspace remains independently buildable.
+[workspace]
+
+[dependencies]
+rescrow-application = { path = "../../crates/rescrow-application" }
+emriss = { path = "../../../../evidentsystems/emriss" }
+emriss-atom = { path = "../../../../evidentsystems/emriss/crates/emriss-atom" }
+serde_json = "1.0"
+
+[dev-dependencies]
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+proptest = { version = "1.12", default-features = false, features = ["std", "handle-panics"] }
