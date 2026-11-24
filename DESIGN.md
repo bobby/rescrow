@@ -290,7 +290,7 @@ Cap cell size, pending entry count, participant count, descriptor size, and comp
 
 S3 provides strong object reads and atomic updates to a key within its bucket authority; it does not provide an atomic update across keys or a globally ordered CAS across regional buckets. The direct S3 adapter is useful for protocol development and explicitly regional deployments. It cannot serve the enterprise authority by itself. See the [S3 consistency model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel).
 
-Use `PutObject` with `If-None-Match: *` for creation and `If-Match: <ETag>` for replacement. AWS documents these conditional writes for both general purpose and directory buckets. Handle `412` as a failed condition and reconcile conflicting or ambiguous writes with fresh reads before retrying. Use small whole-object writes, explicit transport checksums, and no append or multipart dependency. See [conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) and [PutObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html).
+Use `PutObject` with `If-None-Match: *` for creation and `If-Match: <ETag>` for replacement. AWS documents these conditional writes for both general purpose and directory buckets. Handle `412` as a failed condition and reconcile conflicting or ambiguous writes with fresh reads before retrying. Use small writes with explicit transport checksums and no multipart dependency. A log tail (see [PLAN.md](PLAN.md), log-structured local store) may use conditional append where the bucket supports it: on directory buckets, append only at the expected write offset, so a concurrent or repeated append fails rather than interleaving. Frame each appended record with its length, checksum and sequence number. Treat an ambiguous append like any other unknown outcome, resolving it by rereading the object's length and final record. General purpose buckets have no append; there, write each tail batch as an immutable object behind a conditionally replaced head. See [conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) and [PutObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html).
 
 | Aspect | S3 Standard | S3 Express One Zone |
 | --- | --- | --- |
@@ -298,6 +298,7 @@ Use `PutObject` with `If-None-Match: *` for creation and `If-Match: <ETag>` for 
 | Failure domain | Regional, across multiple AZs | One chosen AZ |
 | Placement | Regional application placement | Prefer compute near the chosen AZ |
 | Versioning / Object Lock | Available; configure explicitly | Unsupported |
+| Append | Unsupported; use immutable batch objects | Conditional append at the expected write offset |
 | Native replication | Available; not synchronous commit | Unsupported |
 | Listing | Adapter follows documented general bucket behavior | Do not assume lexicographic ordering |
 | Authorization | IAM and bucket policy | Directory-bucket permissions and session handling |
