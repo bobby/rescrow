@@ -561,3 +561,87 @@ fn checked_sum(values: &[i128]) -> Result<i128, Error> {
         }
     }
 }
+
+/// Current resources and the transactions still holding capacity. Terminal
+/// history lives outside this value, so its size depends only on resources and
+/// open reservations.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Live {
+    resources: BTreeMap<Id, Resource>,
+    prepared: BTreeMap<Id, Transaction>,
+}
+impl Live {
+    pub fn resources(&self) -> &BTreeMap<Id, Resource> {
+        &self.resources
+    }
+    pub fn prepared(&self) -> &BTreeMap<Id, Transaction> {
+        &self.prepared
+    }
+    /// Validate that holds and prepared transactions describe each other exactly.
+    /// Balances are not reconstructed from history; a full Ledger restore does that.
+    pub fn restore(resources: Vec<Resource>, prepared: Vec<Transaction>) -> Result<Self, Error> {
+        let mut live = Self::default();
+        for r in resources {
+            if live.resources.insert(r.spec.id.clone(), r).is_some() {
+                return Err(Error::InvalidLedger);
+            }
+        }
+        let mut expected: BTreeMap<&Id, BTreeMap<Id, i128>> = live
+            .resources
+            .keys()
+            .map(|id| (id, BTreeMap::new()))
+            .collect();
+        for tx in &prepared {
+            if tx.state != State::Prepared {
+                return Err(Error::InvalidLedger);
+            }
+            for op in &tx.request.operations {
+                expected
+                    .get_mut(&op.resource)
+                    .ok_or(Error::InvalidLedger)?
+                    .insert(tx.request.id.clone(), op.delta);
+            }
+        }
+        for (id, r) in &live.resources {
+            if r.holds != expected[id] {
+                return Err(Error::InvalidLedger);
+            }
+        }
+        for tx in prepared {
+            if live.prepared.insert(tx.request.id.clone(), tx).is_some() {
+                return Err(Error::InvalidLedger);
+            }
+        }
+        Ok(live)
+    }
+    /// Make a transition's replacements visible together.
+    pub fn apply(&self, changes: &transition::Changes) -> Self {
+        let mut next = self.clone();
+        for resource in changes.resources() {
+            next.resources
+                .insert(resource.spec.id.clone(), resource.clone());
+        }
+        if let Some(tx) = changes.transaction() {
+            if tx.state == State::Prepared {
+                next.prepared.insert(tx.request.id.clone(), tx.clone());
+            } else {
+                next.prepared.remove(&tx.request.id);
+            }
+        }
+        next
+    }
+}
+impl Ledger {
+    /// The live part of a validated ledger.
+    pub fn live(&self) -> Live {
+        Live {
+            resources: self.resources.clone(),
+            prepared: self
+                .transactions
+                .iter()
+                .filter(|(_, tx)| tx.state == State::Prepared)
+                .map(|(id, tx)| (id.clone(), tx.clone()))
+                .collect(),
+        }
+    }
+}

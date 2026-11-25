@@ -1,6 +1,8 @@
-//! Deterministic snapshot port for embedding tests, with single-shot effect faults.
+//! Deterministic log store for embedding tests, with single-shot effect faults.
+//! It stores transfer values as decoded; the Application validates every load.
 use rescrow_application::{
-    Publication, SnapshotStore, StoreError, ValidatedSnapshot, dto::Snapshot,
+    Loaded, LogStore, Publication, StoreError,
+    dto::{Checkpoint, Entry, Record, State as TxState},
 };
 use std::{
     collections::VecDeque,
@@ -12,21 +14,10 @@ pub enum Fault {
     BeforePublication,
     LostResponse,
 }
-enum Image {
-    Validated(ValidatedSnapshot),
-    Raw(Snapshot),
-}
-impl Image {
-    fn validated(&self) -> Result<ValidatedSnapshot, StoreError> {
-        match self {
-            Self::Validated(snapshot) => Ok(snapshot.clone()),
-            Self::Raw(snapshot) => snapshot.clone().try_into(),
-        }
-    }
-}
 #[derive(Default)]
 struct State {
-    snapshot: Option<Image>,
+    checkpoint: Option<Checkpoint>,
+    entries: Vec<Entry>,
     faults: VecDeque<Fault>,
     evaluations: usize,
 }
@@ -36,61 +27,74 @@ impl MemoryStore {
     pub fn inject(&self, fault: Fault) {
         self.0.lock().unwrap().faults.push_back(fault);
     }
-    /// Deliberately bypass validation for corruption tests.
-    pub fn set_raw(&self, snapshot: Snapshot) {
-        self.0.lock().unwrap().snapshot = Some(Image::Raw(snapshot));
+    /// The stored checkpoint and entries, for corruption tests.
+    pub fn raw(&self) -> (Option<Checkpoint>, Vec<Entry>) {
+        let state = self.0.lock().unwrap();
+        (state.checkpoint.clone(), state.entries.clone())
     }
+    /// Deliberately bypass validation for corruption tests.
+    pub fn set_raw(&self, checkpoint: Checkpoint, entries: Vec<Entry>) {
+        let mut state = self.0.lock().unwrap();
+        state.checkpoint = Some(checkpoint);
+        state.entries = entries;
+    }
+    /// Number of conditional appends attempted.
     pub fn evaluations(&self) -> usize {
         self.0.lock().unwrap().evaluations
     }
 }
-impl SnapshotStore for MemoryStore {
-    fn initialize(&self, empty: &ValidatedSnapshot) -> Result<(), StoreError> {
-        if empty.revision() != 0
-            || !empty.ledger().resources().is_empty()
-            || !empty.ledger().transactions().is_empty()
+impl LogStore for MemoryStore {
+    fn initialize(&self, empty: &Checkpoint) -> Result<(), StoreError> {
+        if empty.position != 0
+            || empty.recorded_at_ms != 0
+            || !empty.resources.is_empty()
+            || !empty.prepared.is_empty()
         {
             return Err(StoreError::Corrupt(
-                "initial snapshot must be empty at revision zero".into(),
+                "initial checkpoint must be empty at position zero".into(),
             ));
         }
         let mut state = self.0.lock().unwrap();
-        if state.snapshot.is_some() {
+        if state.checkpoint.is_some() {
             return Err(StoreError::Exists);
         }
-        state.snapshot = Some(Image::Validated(empty.clone()));
+        state.checkpoint = Some(empty.clone());
         Ok(())
     }
-    fn load(&self) -> Result<ValidatedSnapshot, StoreError> {
-        self.0
-            .lock()
-            .unwrap()
-            .snapshot
-            .as_ref()
-            .ok_or(StoreError::Missing)?
-            .validated()
+    fn import(&self, checkpoint: &Checkpoint, entries: &[Entry]) -> Result<(), StoreError> {
+        let ordered = entries.iter().zip(0..).all(|(e, n)| e.sequence == n);
+        if !ordered || checkpoint.position != entries.len() as u64 {
+            return Err(StoreError::Corrupt(
+                "imported entries must be numbered from zero, with the checkpoint at their end"
+                    .into(),
+            ));
+        }
+        let mut state = self.0.lock().unwrap();
+        if state.checkpoint.is_some() {
+            return Err(StoreError::Exists);
+        }
+        state.checkpoint = Some(checkpoint.clone());
+        state.entries = entries.to_vec();
+        Ok(())
     }
-    fn replace(
-        &self,
-        expected: u64,
-        candidate: &ValidatedSnapshot,
-    ) -> Result<Publication, StoreError> {
+    fn load(&self) -> Result<Loaded, StoreError> {
+        let state = self.0.lock().unwrap();
+        let checkpoint = state.checkpoint.clone().ok_or(StoreError::Missing)?;
+        let tail = usize::try_from(checkpoint.position)
+            .ok()
+            .and_then(|position| state.entries.get(position..))
+            .map(<[Entry]>::to_vec)
+            .unwrap_or_default();
+        Ok(Loaded { checkpoint, tail })
+    }
+    fn append(&self, entry: &Entry) -> Result<Publication, StoreError> {
         let mut state = self.0.lock().unwrap();
         state.evaluations += 1;
-        if state
-            .snapshot
-            .as_ref()
-            .ok_or(StoreError::Missing)?
-            .validated()?
-            .revision()
-            != expected
-        {
+        let checkpoint = state.checkpoint.as_ref().ok_or(StoreError::Missing)?;
+        let length = (state.entries.len() as u64).max(checkpoint.position);
+        if entry.sequence != length {
             return Ok(Publication::Conflict);
         }
-        if expected.checked_add(1) != Some(candidate.revision()) {
-            return Err(StoreError::Corrupt("invalid revision".into()));
-        }
-
         let fault = state.faults.pop_front();
         match fault {
             Some(Fault::Conflict) => return Ok(Publication::Conflict),
@@ -99,10 +103,39 @@ impl SnapshotStore for MemoryStore {
             }
             _ => {}
         }
-        state.snapshot = Some(Image::Validated(candidate.clone()));
+        state.entries.push(entry.clone());
         if matches!(fault, Some(Fault::LostResponse)) {
             return Err(StoreError::Unknown("injected lost response".into()));
         }
         Ok(Publication::Applied)
+    }
+    fn checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), StoreError> {
+        let mut state = self.0.lock().unwrap();
+        let current = state.checkpoint.as_ref().ok_or(StoreError::Missing)?;
+        if checkpoint.position > current.position
+            && checkpoint.position <= state.entries.len() as u64
+        {
+            state.checkpoint = Some(checkpoint.clone());
+        }
+        Ok(())
+    }
+    fn find(&self, transaction_id: &str, since_ms: u64) -> Result<Option<Entry>, StoreError> {
+        let state = self.0.lock().unwrap();
+        Ok(state
+            .entries
+            .iter()
+            .rev()
+            .take_while(|entry| entry.recorded_at_ms >= since_ms)
+            .find(|entry| match &entry.record {
+                Record::Transaction(tx) => {
+                    tx.request.transaction_id == transaction_id
+                        && !matches!(tx.state, TxState::Prepared {})
+                }
+                Record::ResourceCreated(_) => false,
+            })
+            .cloned())
+    }
+    fn history(&self) -> Result<Vec<Entry>, StoreError> {
+        Ok(self.0.lock().unwrap().entries.clone())
     }
 }

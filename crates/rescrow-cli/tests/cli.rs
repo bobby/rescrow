@@ -7,6 +7,19 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 static NEXT: AtomicU64 = AtomicU64::new(0);
+fn created() -> u64 {
+    static CREATED: std::sync::LazyLock<u64> =
+        std::sync::LazyLock::new(rescrow_application::system_clock);
+    *CREATED
+}
+/// The UUIDv7 a test names `name`, created when the test process started, so
+/// re-running a prepare is a retry.
+fn tx(name: &str) -> String {
+    let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    rescrow_application::uuid_v7(created(), hash.into())
+}
 struct Case {
     root: PathBuf,
 }
@@ -51,6 +64,18 @@ impl Case {
             .spawn()
             .unwrap()
     }
+    /// Waits for a spawned command. Bounded lock contention (exit 5) means "retry
+    /// the same request", so this does, as a client following the contract would.
+    fn settle(&self, child: Child, args: &[&str]) -> ProcessOutput {
+        let mut output = child.wait_with_output().unwrap();
+        for _ in 0..10 {
+            if output.status.code() != Some(5) {
+                break;
+            }
+            output = self.run(args);
+        }
+        output
+    }
     fn file(&self, name: &str, contents: &str) -> String {
         let path = self.root.join(name);
         fs::write(&path, contents).unwrap();
@@ -70,8 +95,13 @@ impl Case {
             "u",
         ]);
     }
+    /// The whole validated ledger, read through the same file store the CLI uses.
     fn snapshot(&self) -> Snapshot {
-        serde_json::from_slice(&fs::read(self.root.join("store/state.json")).unwrap()).unwrap()
+        rescrow_application::Application::new(
+            rescrow_adapters::file::FileStore::new(self.root.join("store")).unwrap(),
+        )
+        .snapshot()
+        .unwrap()
     }
 }
 impl Drop for Case {
@@ -93,12 +123,18 @@ fn separate_process_walkthrough_partial_commit_abort_and_replay() {
         "tokens",
     ]);
     let ops=c.file("ops.json",r#"[{"operation_id":"a","resource_id":"r","delta":"-40"},{"operation_id":"b","resource_id":"s","delta":"-3"}]"#);
-    c.ok(&["transaction", "prepare", "work", "--operations", &ops]);
+    c.ok(&["transaction", "prepare", &tx("work"), "--operations", &ops]);
     let other = c.file(
         "other.json",
         r#"[{"operation_id":"a","resource_id":"r","delta":"30"}]"#,
     );
-    c.ok(&["transaction", "prepare", "other", "--operations", &other]);
+    c.ok(&[
+        "transaction",
+        "prepare",
+        &tx("other"),
+        "--operations",
+        &other,
+    ]);
     let Output::Resource(r) = c.ok(&["resource", "show", "r"]) else {
         panic!()
     };
@@ -110,12 +146,12 @@ fn separate_process_walkthrough_partial_commit_abort_and_replay() {
         "actual.json",
         r#"[{"operation_id":"a","delta":"-25"},{"operation_id":"b","delta":"0"}]"#,
     );
-    c.ok(&["transaction", "commit", "work", "--actuals", &actual]);
+    c.ok(&["transaction", "commit", &tx("work"), "--actuals", &actual]);
     let before = c.snapshot();
-    c.ok(&["transaction", "commit", "work", "--actuals", &actual]);
-    c.ok(&["transaction", "prepare", "work", "--operations", &ops]);
+    c.ok(&["transaction", "commit", &tx("work"), "--actuals", &actual]);
+    c.ok(&["transaction", "prepare", &tx("work"), "--operations", &ops]);
     assert_eq!(c.snapshot(), before);
-    c.ok(&["transaction", "abort", "other"]);
+    c.ok(&["transaction", "abort", &tx("other")]);
     let Output::Resource(r) = c.ok(&["resource", "show", "r"]) else {
         panic!()
     };
@@ -127,13 +163,15 @@ fn separate_process_walkthrough_partial_commit_abort_and_replay() {
     assert_eq!(s.quantity, "8");
     c.ok(&["resource", "list"]);
     c.ok(&["transaction", "list"]);
-    c.ok(&["transaction", "show", "work"]);
+    c.ok(&["transaction", "show", &tx("work")]);
     assert_eq!(
-        c.run(&["transaction", "abort", "work"]).status.code(),
+        c.run(&["transaction", "abort", &tx("work")]).status.code(),
         Some(4)
     );
     assert_eq!(
-        c.run(&["transaction", "commit", "other"]).status.code(),
+        c.run(&["transaction", "commit", &tx("other")])
+            .status
+            .code(),
         Some(4)
     );
 }
@@ -145,19 +183,15 @@ fn independent_processes_cannot_over_reserve_scarce_capacity() {
         "ops.json",
         r#"[{"operation_id":"o","resource_id":"r","delta":"-1"}]"#,
     );
-    let mut children = Vec::new();
-    for n in 0..20 {
-        children.push(c.spawn(&[
-            "transaction",
-            "prepare",
-            &format!("t{n}"),
-            "--operations",
-            &ops,
-        ]));
-    }
+    let ids: Vec<_> = (0..20).map(|n| tx(&format!("t{n}"))).collect();
+    let requests: Vec<_> = ids
+        .iter()
+        .map(|id| ["transaction", "prepare", id, "--operations", &ops])
+        .collect();
+    let children: Vec<_> = requests.iter().map(|args| c.spawn(args)).collect();
     let mut successes = 0;
-    for child in children {
-        let result = child.wait_with_output().unwrap();
+    for (child, args) in children.into_iter().zip(&requests) {
+        let result = c.settle(child, args);
         match result.status.code() {
             Some(0) => successes += 1,
             Some(3) => {}
@@ -182,13 +216,13 @@ fn identical_prepare_and_commit_replays_publish_once() {
         r#"[{"operation_id":"o","resource_id":"r","delta":"-3"}]"#,
     );
     for args in [
-        vec!["transaction", "prepare", "same", "--operations", &ops],
-        vec!["transaction", "commit", "same"],
+        vec!["transaction", "prepare", &tx("same"), "--operations", &ops],
+        vec!["transaction", "commit", &tx("same")],
     ] {
         let before = c.snapshot().revision;
         let children: Vec<_> = (0..12).map(|_| c.spawn(&args)).collect();
         for child in children {
-            let out = child.wait_with_output().unwrap();
+            let out = c.settle(child, &args);
             assert!(
                 out.status.success(),
                 "{}",
@@ -209,12 +243,16 @@ fn commit_abort_race_has_exactly_one_terminal_decision() {
     );
     let mut commits = 0;
     for n in 0..12 {
-        let tx = format!("t{n}");
-        c.ok(&["transaction", "prepare", &tx, "--operations", &ops]);
-        let commit = c.spawn(&["transaction", "commit", &tx]);
-        let abort = c.spawn(&["transaction", "abort", &tx]);
-        let committed = commit.wait_with_output().unwrap();
-        let aborted = abort.wait_with_output().unwrap();
+        let id = tx(&format!("t{n}"));
+        c.ok(&["transaction", "prepare", &id, "--operations", &ops]);
+        let (commit_args, abort_args) = (
+            ["transaction", "commit", id.as_str()],
+            ["transaction", "abort", id.as_str()],
+        );
+        let commit = c.spawn(&commit_args);
+        let abort = c.spawn(&abort_args);
+        let committed = c.settle(commit, &commit_args);
+        let aborted = c.settle(abort, &abort_args);
         assert_ne!(committed.status.success(), aborted.status.success());
         if committed.status.success() {
             commits += 1;
@@ -224,9 +262,9 @@ fn commit_abort_race_has_exactly_one_terminal_decision() {
         }
         let before = c.snapshot();
         if committed.status.success() {
-            c.ok(&["transaction", "commit", &tx]);
+            c.ok(&["transaction", "commit", &id]);
         } else {
-            c.ok(&["transaction", "abort", &tx]);
+            c.ok(&["transaction", "abort", &id]);
         }
         assert_eq!(c.snapshot(), before);
     }
@@ -235,6 +273,28 @@ fn commit_abort_race_has_exactly_one_terminal_decision() {
         (50 - commits).to_string()
     );
     assert!(c.snapshot().resources[0].holds.is_empty());
+}
+#[test]
+fn new_id_prints_distinct_current_uuid_v7s() {
+    let id = || {
+        let out = Process::new(env!("CARGO_BIN_EXE_rescrow"))
+            .arg("new-id")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim_end().to_owned()
+    };
+    let (before, first, second) = (rescrow_application::system_clock(), id(), id());
+    assert_ne!(first, second);
+    let millis = rescrow_application::uuid_v7_millis(&first).unwrap();
+    assert!((before..=rescrow_application::system_clock()).contains(&millis));
+    let c = Case::new();
+    c.ready("5");
+    let ops = c.file(
+        "ops.json",
+        r#"[{"operation_id":"o","resource_id":"r","delta":"-1"}]"#,
+    );
+    c.ok(&["transaction", "prepare", &first, "--operations", &ops]);
 }
 #[test]
 fn machine_errors_invalid_inputs_and_exact_large_signed_values() {
@@ -265,7 +325,13 @@ fn machine_errors_invalid_inputs_and_exact_large_signed_values() {
         r#"[{"operation_id":"o","resource_id":"large","delta":-1}]"#,
     );
     let before = c.snapshot();
-    let output = c.run(&["transaction", "prepare", "bad", "--operations", &invalid]);
+    let output = c.run(&[
+        "transaction",
+        "prepare",
+        &tx("bad"),
+        "--operations",
+        &invalid,
+    ]);
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     assert_eq!(c.snapshot(), before);
@@ -274,9 +340,15 @@ fn machine_errors_invalid_inputs_and_exact_large_signed_values() {
         r#"[{"operation_id":"o","resource_id":"large","delta":"-2"}]"#,
     );
     assert_eq!(
-        c.run(&["transaction", "prepare", "reject", "--operations", &ops])
-            .status
-            .code(),
+        c.run(&[
+            "transaction",
+            "prepare",
+            &tx("reject"),
+            "--operations",
+            &ops
+        ])
+        .status
+        .code(),
         Some(3)
     );
     assert_eq!(c.snapshot().transactions.len(), 1);
@@ -293,4 +365,45 @@ fn machine_errors_invalid_inputs_and_exact_large_signed_values() {
             .unwrap()
             .contains("quantity=-9007199254740993")
     );
+}
+#[test]
+fn migrate_converts_a_schema_1_store_once() {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let c = Case::new();
+    c.ready("60");
+    let ops = c.file(
+        "ops.json",
+        r#"[{"operation_id":"o","resource_id":"r","delta":"-3"}]"#,
+    );
+    c.ok(&["transaction", "prepare", &tx("held"), "--operations", &ops]);
+    // Rewrite the same ledger in the schema-1 layout.
+    let mut source = c.snapshot();
+    source.schema_version = 1;
+    let store = c.root.join("store");
+    fs::remove_dir_all(&store).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(&store).unwrap();
+    for (name, bytes) in [
+        ("state.lock", Vec::new()),
+        ("state.json", serde_json::to_vec(&source).unwrap()),
+    ] {
+        use std::io::Write;
+        fs::File::options()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(store.join(name))
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+    }
+    let refused = c.run(&["transaction", "list"]);
+    assert_eq!(refused.status.code(), Some(6), "{refused:?}");
+    assert_eq!(c.ok(&["migrate"]), Output::Migrated);
+    let Output::Transactions(transactions) = c.ok(&["transaction", "list"]) else {
+        panic!()
+    };
+    assert_eq!(transactions, source.transactions);
+    c.ok(&["transaction", "commit", &tx("held")]);
+    assert_eq!(c.snapshot().resources[0].quantity, "57");
+    assert_eq!(c.run(&["migrate"]).status.code(), Some(4));
 }

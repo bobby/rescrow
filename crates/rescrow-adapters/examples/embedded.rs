@@ -20,8 +20,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         unit: "credits".into(),
         scale: 0,
     })?;
+    // A client creates the ID once per request and repeats it on every retry.
+    // Real clients fill its random bits from a random source; this example
+    // stands in the process ID and clock nanoseconds.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .subsec_nanos();
+    let work = rescrow_application::uuid_v7(
+        rescrow_application::system_clock(),
+        u128::from(std::process::id()) << 32 | u128::from(nanos),
+    );
     app.prepare(Prepare {
-        transaction_id: "example-work".into(),
+        transaction_id: work.clone(),
         operations: vec![Operation {
             operation_id: "spend".into(),
             resource_id: "example".into(),
@@ -29,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }],
     })?;
     app.commit(Commit {
-        transaction_id: "example-work".into(),
+        transaction_id: work,
         actuals: Some(vec![Actual {
             operation_id: "spend".into(),
             delta: "-25".into(),

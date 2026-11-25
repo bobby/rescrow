@@ -300,15 +300,16 @@ fn run(case: u8) {
             .flat_map(|handle| handle.join().unwrap())
             .collect()
     });
-    // Retain the observations even if decoding the final live image fails.
+    // Retain the observations even if validating the final ledger fails.
     directory.input("calls", &calls);
     let history = History {
         case,
         setup,
         calls,
-        final_snapshot: serde_json::from_slice(
-            &fs::read(directory.0.join("store/state.json")).unwrap(),
+        final_snapshot: rescrow_application::Application::new(
+            rescrow_adapters::file::FileStore::new(directory.0.join("store")).unwrap(),
         )
+        .snapshot()
         .unwrap(),
     };
     if let Err(error) = check(&history) {

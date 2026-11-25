@@ -1,6 +1,6 @@
 # First implementation: file-backed local CLI
 
-Status: implemented local milestone. See README.md for commands, reproduction steps, and qualification limits.
+Status: implemented local milestone. See README.md for commands, reproduction steps, and qualification limits. The log-structured store below has since replaced its whole-file snapshot store.
 
 Build the smallest useful vertical slice of [the design](DESIGN.md): a pure Domain, an Application with validated transfer types, and independent CLI invocations sharing a local file store. File persistence replaces the earlier in-memory-only scope. Memory storage remains useful for deterministic tests.
 
@@ -156,7 +156,7 @@ The local follow-up also replaces tuple availability with named fields, retains 
 
 # Next milestone: log-structured local store
 
-Status: proposed. Nothing below is implemented.
+Status: implemented. README.md documents the layout, costs, limits, migration, and benchmark. One change from the steps below: rather than keeping every terminal ID reserved forever, retries are bounded by a time window (step 11).
 
 The snapshot store rewrites and revalidates the whole ledger, including permanently retained terminal transactions, on every publication. Following the escrow paper's storage design (DESIGN.md section 2), separate small live state from append-only history. Live state holds resources, their holds and `PREPARED` transactions. History is an append-only log whose durable append is the commit point, with checkpoints written lazily. A write's cost should depend on its record and the outstanding reservations, not on retained history. Domain rules, CLI commands and outputs, and the existing history checks stay unchanged.
 
@@ -181,11 +181,12 @@ Record kinds: `ResourceCreated`, `Prepared`, `Committed` (with actual deltas), a
 3. **Commit point.** Under the exclusive lock, append one record and synchronize the segment before acknowledging. This applies to preparation too, which is always durable (the paper's `recover=YES`). Sequence numbers play the role of the paper's timestamps: recovery applies exactly the records after the checkpoint's position. After a failed synchronization, report an unknown outcome, never retry synchronization on that handle, and let the next load decide.
 4. **Torn and corrupt records.** An invalid frame at the end of the newest segment was never acknowledged. Loads ignore it, and the next writer truncates it under the exclusive lock before appending. An invalid frame anywhere else, a sequence gap, or a record that fails validation fails closed.
 5. **Checkpoints.** When the tail exceeds a record or byte threshold, the writer publishes a new `live.json` through the existing temporary-file, synchronize, rename, and directory-synchronize discipline. No background worker is required. A crash before rename leaves the previous checkpoint and a longer tail.
-6. **Segments and the terminal index.** Roll a segment at a size threshold. Sealing writes its sorted index of terminal transaction IDs, request digests and record offsets as a synchronized, create-if-absent file. Replay and conflict lookups use live state, then the in-memory active-segment tail, then sealed indexes newest-first. Indexes are derived and rebuildable from their segment; a missing or invalid index fails closed until rebuilt. Segments are retained indefinitely so terminal IDs remain reserved. Index merging is deferred.
+6. **Segments and the terminal index.** Roll a segment at a size threshold. Sealing writes its sorted index of terminal transaction IDs, request digests and record offsets as a synchronized, create-if-absent file. Replay and conflict lookups use live state, then the in-memory active-segment tail, then sealed indexes newest-first. Indexes are derived and rebuildable from their segment; a missing or invalid index fails closed until rebuilt. Segments are retained indefinitely for inspection; step 11 bounds how far back a lookup reads. Index merging is deferred.
 7. **Full scans.** `list` commands and an explicit audit replay all segments sequentially, validating checksums, sequences, transitions and checkpointed balances against full replay. Only these operations pay history-proportional cost.
 8. **Migration.** An explicit step converts a schema-1 `state.json` into a checkpoint plus a log containing its terminal transactions, preserving replay identities and capacity facts. Ordinary commands fail closed on an unmigrated store rather than upgrading it silently.
 9. **Removals.** Remove whole-ledger publication and the snapshot settlement-space policy. Commit and abort shrink live state and append one bounded record, so a per-record size cap replaces reserved settlement headroom. Disk-full remains outside the contract.
 10. **Memory store.** The deterministic memory implementation implements the same port, with conflict, pre-append and lost-response injection.
+11. **Retry window.** Retries are tightly bounded in time, so keeping every decision searchable forever only serves temporally close duplicates. A new prepare's ID is a client-generated UUIDv7 whose timestamp is the request's creation time. Every record carries its recording time, never earlier than its predecessor's. A request older than 24 hours expires, one more than 5 minutes ahead of the clock is invalid, and an admitted one searches only records since its timestamp less that skew bound; commit and abort search the last 24 hours plus skew. Prepared transactions are live and never expire. An ID cannot recur as a new transaction, because inside the window its original is found and after it the ID has expired (DESIGN.md §8.2).
 
 ## Qualification
 

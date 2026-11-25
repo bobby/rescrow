@@ -391,11 +391,18 @@ impl Transaction {
     }
 }
 pub fn tx_id(id: u16) -> String {
-    format!("t{id}")
+    rescrow_application::uuid_v7(created(), id.into())
 }
 fn resource_id(id: u8) -> String {
     format!("r{id}")
 }
 fn op_id(id: u8) -> String {
     format!("o{id}")
+}
+
+/// Every request in this process is created at its start, so retries match.
+pub fn created() -> u64 {
+    static CREATED: std::sync::LazyLock<u64> =
+        std::sync::LazyLock::new(rescrow_application::system_clock);
+    *CREATED
 }
