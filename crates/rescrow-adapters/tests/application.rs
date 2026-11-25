@@ -268,14 +268,14 @@ impl LogStore for Competing {
     fn load(&self) -> Result<Loaded, StoreError> {
         self.inner.load()
     }
-    fn append(&self, entry: &Entry) -> Result<Publication, StoreError> {
+    fn append(&self, entries: &[Entry]) -> Result<Publication, StoreError> {
         if self.first.replace(false) {
             Application::new(self.inner.clone())
                 .execute(prepare("winner", "-5"))
                 .unwrap();
             Ok(Publication::Conflict)
         } else {
-            self.inner.append(entry)
+            self.inner.append(entries)
         }
     }
     fn checkpoint(&self, c: &Checkpoint) -> Result<(), StoreError> {

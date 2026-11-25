@@ -1,6 +1,7 @@
 //! Synchronous use cases over an append-only log, with a validated transfer
 //! boundary, independent of adapters.
 pub mod dto;
+pub mod service;
 use dto::{Command, Output, Snapshot};
 use rescrow_domain::{self as d, transition};
 use serde::{Deserialize, Serialize};
@@ -50,7 +51,7 @@ pub struct Error {
     pub capacity: Option<Box<dto::CapacityFailure>>,
 }
 impl Error {
-    fn with_transaction(mut self, id: &str) -> Self {
+    pub(crate) fn with_transaction(mut self, id: &str) -> Self {
         self.transaction_id = Some(id.into());
         self
     }
@@ -201,8 +202,11 @@ pub trait LogStore {
         entries: &[dto::Entry],
     ) -> Result<(), StoreError>;
     fn load(&self) -> Result<Loaded, StoreError>;
-    /// Append at `entry.sequence` only if the log holds exactly that many entries.
-    fn append(&self, entry: &dto::Entry) -> Result<Publication, StoreError>;
+    /// Append consecutive entries only if the log holds exactly
+    /// `entries[0].sequence` entries. Entries are never empty. A failure may
+    /// leave a prefix of them appended, which is the same as only the first
+    /// writes having happened; report `Unknown` whenever that is possible.
+    fn append(&self, entries: &[dto::Entry]) -> Result<Publication, StoreError>;
     /// Replace the checkpoint when this one is at a later position; otherwise do nothing.
     fn checkpoint(&self, checkpoint: &dto::Checkpoint) -> Result<(), StoreError>;
     /// The most recent terminal entry for a transaction among those recorded
@@ -222,7 +226,8 @@ pub fn validated_snapshot(snapshot: Snapshot) -> Result<d::Ledger, Error> {
 
 /// Validated live state at a log position, plus terminal transactions found
 /// in the tail after the checkpoint, each with its recording time.
-struct View {
+#[derive(Clone)]
+pub(crate) struct View {
     position: u64,
     /// When the last entry was recorded.
     recorded_at_ms: u64,
@@ -232,6 +237,89 @@ struct View {
     /// The time a new entry would be recorded: the clock, but never earlier
     /// than the last entry.
     now_ms: u64,
+}
+impl View {
+    /// The state after appending one entry of `changes`, recorded at `now_ms`.
+    fn advance(&mut self, changes: &transition::Changes) -> Result<(), Error> {
+        self.position = self.position.checked_add(1).ok_or_else(|| Error {
+            category: Category::Storage,
+            code: Code::RevisionExhausted,
+            message: "log position exhausted".into(),
+            transaction_id: None,
+            capacity: None,
+        })?;
+        self.live = self.live.apply(changes);
+        self.recorded_at_ms = self.now_ms;
+        self.tail += 1;
+        if let Some(tx) = changes.transaction()
+            && *tx.state() != d::State::Prepared
+        {
+            self.terminal
+                .insert(tx.request().id().clone(), (self.now_ms, tx.clone()));
+        }
+        Ok(())
+    }
+    /// A checkpoint now covers every entry. Terminal transactions it dropped
+    /// are found through the store instead.
+    fn checkpointed(&mut self) {
+        self.tail = 0;
+        self.terminal.clear();
+    }
+    pub(crate) fn live(&self) -> &d::Live {
+        &self.live
+    }
+}
+pub(crate) fn resource_in(view: &View, id: &str) -> Result<dto::Resource, Error> {
+    let id = d::Id::new(id.into()).map_err(input)?;
+    view.live
+        .resources()
+        .get(&id)
+        .map(Into::into)
+        .ok_or_else(|| Error::domain(d::Error::NotFound))
+}
+
+/// A validated write command.
+pub(crate) enum Write {
+    Create(d::ResourceSpec),
+    Prepare(d::Request),
+    Commit {
+        id: d::Id,
+        actuals: Option<Vec<(d::Id, i128)>>,
+    },
+    Abort(d::Id),
+}
+impl Write {
+    pub(crate) fn create(spec: dto::ResourceSpec) -> Result<Self, Error> {
+        Ok(Self::Create(spec.try_into().map_err(input)?))
+    }
+    pub(crate) fn prepare(request: dto::Prepare) -> Result<Self, Error> {
+        Ok(Self::Prepare(request.try_into().map_err(input)?))
+    }
+    pub(crate) fn commit(command: dto::Commit) -> Result<Self, Error> {
+        let id = d::Id::new(command.transaction_id).map_err(input)?;
+        let actuals = command
+            .actuals
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|a| Ok((d::Id::new(a.operation_id)?, dto::decimal(&a.delta)?)))
+                    .collect::<Result<Vec<_>, d::Error>>()
+            })
+            .transpose()
+            .map_err(input)?;
+        Ok(Self::Commit { id, actuals })
+    }
+    pub(crate) fn abort(id: &str) -> Result<Self, Error> {
+        Ok(Self::Abort(d::Id::new(id.into()).map_err(input)?))
+    }
+}
+/// A write's changes, and its result once they are durable.
+type Evaluation = (transition::Changes, Result<Output, Error>);
+fn transaction_output(output: Output) -> dto::Transaction {
+    match output {
+        Output::Transaction(tx) => tx,
+        _ => unreachable!("transaction commands output transactions"),
+    }
 }
 
 /// How long a prepare can be retried and replayed, and how far a client's
@@ -327,105 +415,53 @@ impl<S: LogStore> Application<S> {
         }
     }
     pub fn create_resource(&self, spec: dto::ResourceSpec) -> Result<dto::Resource, Error> {
-        let spec: d::ResourceSpec = spec.try_into().map_err(input)?;
-        self.mutate(|view| {
-            let changes = transition::create(spec.clone(), view.live.resources().get(spec.id()))
-                .map_err(Error::domain)?;
-            let next = view.live.apply(&changes);
-            Ok((changes, Ok((&next.resources()[spec.id()]).into())))
-        })
+        match self.write(&Write::create(spec)?)? {
+            Output::Resource(resource) => Ok(resource),
+            _ => unreachable!("resource creation outputs a resource"),
+        }
     }
     /// Admit a frozen request; business rejections are persisted before returning an error.
     pub fn prepare(&self, request: dto::Prepare) -> Result<dto::Transaction, Error> {
         let id = request.transaction_id.clone();
-        let result = (|| {
-            let request: d::Request = request.try_into().map_err(input)?;
-            self.mutate(|view| {
-                let existing = match view.live.prepared().get(request.id()) {
-                    Some(prepared) => Some(prepared.clone()),
-                    None => self.lookup(view, request.id(), self.admit(view, &request)?)?,
-                };
-                let changes =
-                    transition::prepare(request.clone(), existing.as_ref(), view.live.resources())
-                        .map_err(Error::domain)?;
-                let tx = changes
-                    .transaction()
-                    .or(existing.as_ref())
-                    .ok_or(Error::domain(d::Error::InvalidLedger))?;
-                let output = match tx.rejection() {
-                    Some(reason) => Err(Error::rejection(reason)),
-                    None => Ok(tx.into()),
-                };
-                Ok((changes, output))
-            })
-        })();
-        result.map_err(|e| e.with_transaction(&id))
+        Write::prepare(request)
+            .and_then(|w| self.write(&w))
+            .map(transaction_output)
+            .map_err(|e| e.with_transaction(&id))
     }
     /// Settle full or explicit actual usage; terminal retries must select the same actuals.
     pub fn commit(&self, command: dto::Commit) -> Result<dto::Transaction, Error> {
-        let id = command.transaction_id;
-        let result = (|| {
-            let transaction = d::Id::new(id.clone()).map_err(input)?;
-            let actuals = command
-                .actuals
-                .map(|entries| {
-                    entries
-                        .into_iter()
-                        .map(|a| Ok((d::Id::new(a.operation_id)?, dto::decimal(&a.delta)?)))
-                        .collect::<Result<Vec<_>, d::Error>>()
-                })
-                .transpose()
-                .map_err(input)?;
-            self.mutate(|view| {
-                let tx = self
-                    .lookup(view, &transaction, self.decided_since(view))?
-                    .ok_or(Error::domain(d::Error::NotFound))?;
-                let changes = transition::commit(&tx, actuals.clone(), view.live.resources())
-                    .map_err(Error::domain)?;
-                let output = changes.transaction().unwrap_or(&tx).into();
-                Ok((changes, Ok(output)))
-            })
-        })();
-        result.map_err(|e| e.with_transaction(&id))
+        let id = command.transaction_id.clone();
+        Write::commit(command)
+            .and_then(|w| self.write(&w))
+            .map(transaction_output)
+            .map_err(|e| e.with_transaction(&id))
     }
     /// Release a prepared hold. An existing committed decision conflicts.
     pub fn abort(&self, id: &str) -> Result<dto::Transaction, Error> {
-        let result = (|| {
-            let transaction = d::Id::new(id.into()).map_err(input)?;
-            self.mutate(|view| {
-                let tx = self
-                    .lookup(view, &transaction, self.decided_since(view))?
-                    .ok_or(Error::domain(d::Error::NotFound))?;
-                let changes =
-                    transition::abort(&tx, view.live.resources()).map_err(Error::domain)?;
-                let output = changes.transaction().unwrap_or(&tx).into();
-                Ok((changes, Ok(output)))
-            })
-        })();
-        result.map_err(|e| e.with_transaction(id))
+        Write::abort(id)
+            .and_then(|w| self.write(&w))
+            .map(transaction_output)
+            .map_err(|e| e.with_transaction(id))
     }
     pub fn resource(&self, id: &str) -> Result<dto::Resource, Error> {
-        let id = d::Id::new(id.into()).map_err(input)?;
-        self.view()?
-            .live
-            .resources()
-            .get(&id)
-            .map(Into::into)
-            .ok_or_else(|| Error::domain(d::Error::NotFound))
+        resource_in(&self.view()?, id)
     }
     pub fn resources(&self) -> Result<Vec<dto::Resource>, Error> {
         Ok(self.snapshot()?.resources)
     }
     pub fn transaction(&self, id: &str) -> Result<dto::Transaction, Error> {
-        let result = (|| {
-            let transaction = d::Id::new(id.into()).map_err(input)?;
-            let view = self.view()?;
-            self.lookup(&view, &transaction, 0)?
-                .as_ref()
-                .map(Into::into)
-                .ok_or_else(|| Error::domain(d::Error::NotFound))
-        })();
-        result.map_err(|e| e.with_transaction(id))
+        self.view()
+            .and_then(|view| self.transaction_in(&view, id))
+            .map_err(|e| e.with_transaction(id))
+    }
+    /// A transaction in `view`, or a terminal one anywhere in history.
+    pub(crate) fn transaction_in(&self, view: &View, id: &str) -> Result<dto::Transaction, Error> {
+        let transaction = d::Id::new(id.into()).map_err(input)?;
+        self.lookup(view, &transaction, 0)?
+            .as_ref()
+            .map(Into::into)
+            .ok_or_else(|| Error::domain(d::Error::NotFound))
+            .map_err(|e| e.with_transaction(id))
     }
     pub fn transactions(&self) -> Result<Vec<dto::Transaction>, Error> {
         Ok(self.snapshot()?.transactions)
@@ -497,7 +533,7 @@ impl<S: LogStore> Application<S> {
         .map_err(corrupt)?;
         Ok(Snapshot::from_ledger(&ledger, view.position))
     }
-    fn view(&self) -> Result<View, Error> {
+    pub(crate) fn view(&self) -> Result<View, Error> {
         let loaded = self.store.load()?;
         let (position, recorded_at_ms, live) = live_from(loaded.checkpoint)?;
         let mut view = View {
@@ -563,7 +599,7 @@ impl<S: LogStore> Application<S> {
             .saturating_sub(millis(self.window.skew))
     }
     /// A prepared transaction, or the latest terminal one recorded at or after `since_ms`.
-    fn lookup(
+    pub(crate) fn lookup(
         &self,
         view: &View,
         id: &d::Id,
@@ -590,45 +626,116 @@ impl<S: LogStore> Application<S> {
         }
         Ok(Some(tx))
     }
-    fn mutate<R>(
+    /// One write, evaluated against freshly loaded state and appended alone.
+    fn write(&self, write: &Write) -> Result<Output, Error> {
+        let (_, mut outputs) = self.commit_batch(self.view()?, &[write]);
+        outputs.pop().expect("one output per write")
+    }
+    /// Evaluate writes in order, each against the state the previous ones
+    /// leave, and append all their records together. A lost race reloads and
+    /// evaluates them again, so every output describes durable state. Returns
+    /// the state after the batch, or `None` if it is unknown.
+    pub(crate) fn commit_batch(
         &self,
-        evaluate: impl Fn(&View) -> Result<(transition::Changes, Result<R, Error>), Error>,
-    ) -> Result<R, Error> {
+        mut view: View,
+        writes: &[&Write],
+    ) -> (Option<View>, Vec<Result<Output, Error>>) {
         for _ in 0..self.attempts {
-            let view = self.view()?;
-            let (changes, output) = evaluate(&view)?;
-            if changes.is_empty() {
-                return output;
+            view.now_ms = (self.clock)().max(view.recorded_at_ms);
+            // A lost race reloads, so evaluation can advance this state in place.
+            let mut entries = Vec::new();
+            let mut outputs = Vec::with_capacity(writes.len());
+            for write in writes {
+                outputs.push(self.evaluate(&view, write).and_then(|(changes, output)| {
+                    if !changes.is_empty() {
+                        let sequence = view.position;
+                        view.advance(&changes)?;
+                        entries.push(dto::Entry {
+                            sequence,
+                            recorded_at_ms: view.now_ms,
+                            record: record(&changes),
+                        });
+                    }
+                    output
+                }));
             }
-            let next = view.position.checked_add(1).ok_or_else(|| Error {
-                category: Category::Storage,
-                code: Code::RevisionExhausted,
-                message: "log position exhausted".into(),
-                transaction_id: None,
-                capacity: None,
-            })?;
-            let entry = dto::Entry {
-                sequence: view.position,
-                recorded_at_ms: view.now_ms,
-                record: record(&changes),
-            };
-            match self.store.append(&entry)? {
-                Publication::Applied => {
-                    if view.tail + 1 >= self.checkpoint_interval {
+            if entries.is_empty() {
+                return (Some(view), outputs);
+            }
+            match self.store.append(&entries) {
+                Ok(Publication::Applied) => {
+                    if view.tail >= self.checkpoint_interval {
                         // Checkpoints only shorten later replay. A failure leaves a
                         // longer tail for the next writer, never a wrong answer.
-                        let _ = self.store.checkpoint(&checkpoint_dto(
-                            &view.live.apply(&changes),
-                            next,
-                            view.now_ms,
-                        ));
+                        let checkpoint = checkpoint_dto(&view.live, view.position, view.now_ms);
+                        if self.store.checkpoint(&checkpoint).is_ok() {
+                            view.checkpointed();
+                        }
                     }
-                    return output;
+                    return (Some(view), outputs);
                 }
-                Publication::Conflict => continue,
+                Ok(Publication::Conflict) => match self.view() {
+                    Ok(fresh) => view = fresh,
+                    Err(e) => return (None, writes.iter().map(|_| Err(e.clone())).collect()),
+                },
+                Err(e) => {
+                    let e = Error::from(e);
+                    return (None, writes.iter().map(|_| Err(e.clone())).collect());
+                }
             }
         }
-        Err(StoreError::Contention.into())
+        let e = Error::from(StoreError::Contention);
+        (Some(view), writes.iter().map(|_| Err(e.clone())).collect())
+    }
+    /// The changes a write makes to `view` and its result. Rejections the
+    /// domain records are changes with an error result.
+    fn evaluate(&self, view: &View, write: &Write) -> Result<Evaluation, Error> {
+        match write {
+            Write::Create(spec) => {
+                let changes =
+                    transition::create(spec.clone(), view.live.resources().get(spec.id()))
+                        .map_err(Error::domain)?;
+                let next = view.live.apply(&changes);
+                let resource = (&next.resources()[spec.id()]).into();
+                Ok((changes, Ok(Output::Resource(resource))))
+            }
+            Write::Prepare(request) => {
+                let existing = match view.live.prepared().get(request.id()) {
+                    Some(prepared) => Some(prepared.clone()),
+                    None => self.lookup(view, request.id(), self.admit(view, request)?)?,
+                };
+                let changes =
+                    transition::prepare(request.clone(), existing.as_ref(), view.live.resources())
+                        .map_err(Error::domain)?;
+                let tx = changes
+                    .transaction()
+                    .or(existing.as_ref())
+                    .ok_or(Error::domain(d::Error::InvalidLedger))?;
+                let output = match tx.rejection() {
+                    Some(reason) => Err(Error::rejection(reason)),
+                    None => Ok(Output::Transaction(tx.into())),
+                };
+                Ok((changes, output))
+            }
+            Write::Commit { id, actuals } => {
+                let tx = self
+                    .lookup(view, id, self.decided_since(view))?
+                    .ok_or(Error::domain(d::Error::NotFound))?;
+                let changes = transition::commit(&tx, actuals.clone(), view.live.resources())
+                    .map_err(Error::domain)?;
+                let output = changes.transaction().unwrap_or(&tx).into();
+                Ok((changes, Ok(Output::Transaction(output))))
+            }
+            Write::Abort(id) => {
+                let tx = self
+                    .lookup(view, id, self.decided_since(view))?
+                    .ok_or(Error::domain(d::Error::NotFound))?;
+                let changes =
+                    transition::abort(&tx, view.live.resources()).map_err(Error::domain)?;
+                let output = changes.transaction().unwrap_or(&tx).into();
+                Ok((changes, Ok(Output::Transaction(output))))
+            }
+        }
     }
 }
 

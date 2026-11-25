@@ -87,12 +87,12 @@ impl LogStore for MemoryStore {
             .unwrap_or_default();
         Ok(Loaded { checkpoint, tail })
     }
-    fn append(&self, entry: &Entry) -> Result<Publication, StoreError> {
+    fn append(&self, entries: &[Entry]) -> Result<Publication, StoreError> {
         let mut state = self.0.lock().unwrap();
         state.evaluations += 1;
         let checkpoint = state.checkpoint.as_ref().ok_or(StoreError::Missing)?;
         let length = (state.entries.len() as u64).max(checkpoint.position);
-        if entry.sequence != length {
+        if entries[0].sequence != length {
             return Ok(Publication::Conflict);
         }
         let fault = state.faults.pop_front();
@@ -103,7 +103,7 @@ impl LogStore for MemoryStore {
             }
             _ => {}
         }
-        state.entries.push(entry.clone());
+        state.entries.extend_from_slice(entries);
         if matches!(fault, Some(Fault::LostResponse)) {
             return Err(StoreError::Unknown("injected lost response".into()));
         }

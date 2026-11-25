@@ -87,6 +87,8 @@ A `LogStore` keeps a checkpoint of live state (resources and prepared transactio
 
 The Application validates every record through the transfer-type boundary, checks each entry against the transition it records, and reevaluates from fresh state on conflicts, up to 32 attempts. Point commands replay only the entries after the checkpoint; listing commands and `snapshot` rebuild and check the whole ledger from history. Reads and identical replays append nothing. Retry lookups are bounded by the window above (`with_retry_window`), and the Application's clock is replaceable for tests (`with_clock`). `uuid_v7` builds an ID from a timestamp and caller-supplied random bits.
 
+`service::Service` wraps an Application for a long-lived process, such as a server. Reads come from the last durable state, held in memory behind an [`ArcSwap`](https://docs.rs/arc-swap), so they take no lock and do no I/O; listing transactions still reads history. One writer thread takes every write waiting for it, evaluates them in order, and appends their records together with one synchronization (group commit), answering each caller once its record is durable. An append that fails part-way can leave a prefix of a batch, which is the same as only its first writes succeeding, so every write in that batch reports an unknown outcome and the next batch reloads. Other processes may still write the store: appends stay conditional, so the service detects the race and reloads, but its reads can lag their writes until it next writes. `ListResources` reads the validated live state instead of replaying history.
+
 [The runnable embedded example](crates/rescrow-adapters/examples/embedded.rs) creates a resource, reserves, partially commits, and inspects it through the Rust API. It can share a store with independent CLI invocations:
 
 ```sh
@@ -101,11 +103,11 @@ cargo run -p rescrow-adapters --example embedded -- .rescrow
 
 ## Local persistence and limits
 
-The selected canonical store directory contains `live.json`, a `log/` directory of numbered segments, a stable `state.lock`, and possibly orphan temporary candidates. Every load takes an OS shared lock; writes take it exclusively and reload before appending. Each log record is length- and checksum-framed; an append writes one record at the end of the active segment and synchronizes it before success. Bytes after the last valid record are an unacknowledged torn append, removed by the next writer. When the active segment passes 4 MiB (`with_segment_size`), it is sealed by writing an immutable index of its finished transactions, sorted by ID, and a new segment starts. `live.json` holds the checkpoint and the log position it covers. It is replaced by writing a uniquely created temporary file in the same directory, synchronizing it, renaming it over the old one, and synchronizing the directory; a lost checkpoint only means a longer replay. Files use mode `600`, directories `700`; existing broader permissions are rejected. Lock acquisition times out after two seconds, independently of the bounded Application retry policy.
+The selected canonical store directory contains `live.json`, a `log/` directory of numbered segments, a stable `state.lock`, and possibly orphan temporary candidates. Reads take no lock. Segments only grow and every other file is replaced by atomic rename, so a read sees a prefix of the log ending at its last complete record; it synchronizes what it read before returning it, so it never reports a write that a crash could still undo. A read that finds anything invalid may have raced a writer removing a torn append, so it is repeated under the OS shared lock, which excludes writers, before failing closed. Writes take the lock exclusively, reload, and append. Each log record is length- and checksum-framed; an append writes its records at the end of the active segment and synchronizes it once before success. That synchronization also covers every earlier record in the segment, so a writer needs no other synchronization unless it starts a segment. Bytes after the last valid record are an unacknowledged torn append, removed by the next writer. When the active segment passes 4 MiB (`with_segment_size`), it is sealed by writing an immutable index of its finished transactions, sorted by ID, and a new segment starts. `live.json` holds the checkpoint and the log position it covers. It is replaced by writing a uniquely created temporary file in the same directory, synchronizing it, renaming it over the old one, and synchronizing the directory; a lost checkpoint only means a longer replay. Files use mode `600`, directories `700`; existing broader permissions are rejected. Writers' lock acquisition times out after two seconds, independently of the bounded Application retry policy.
 
 The [Rust rename contract](https://doc.rust-lang.org/std/fs/fn.rename.html) supplies same-filesystem replacement; Linux requires [directory synchronization](https://man7.org/linux/man-pages/man2/fsync.2.html) to persist the directory entry. Missing, invalid, oversized, or unsupported state fails closed, as does a sealed segment that changed after sealing or an index that disagrees with it. There is no automatic backup selection, reset, or rollback after uncertain publication. `live.json` and each record are limited to 16 MiB (`FileStore::with_size_limit`); a write beyond it returns `too_large`. CLI JSON input files have the same ceiling. Even an unbounded resource has finite representable upward room because quantities, offsets, and totals must fit `i128`.
 
-A retry lookup walks segments newest-first and stops at the first segment recorded entirely before its time bound, reading only each sealed segment's index and first record along the way. A write appends one record and a point read replays at most one checkpoint interval, however long history grows; `live.json` grows with resources and prepared transactions, not with settled ones. Listing commands still read all history. Publications serialize through one lock. This is one logical shard per resource and one cooperating local user per store. It does not enforce budgets against anyone who can directly rewrite the authoritative store. Network filesystems, manual live editing, hard-link/path manipulation, and device loss are outside the local contract.
+A retry lookup walks segments newest-first and stops at the first segment recorded entirely before its time bound, reading only each sealed segment's index and first record along the way. A write appends one record and a point read replays at most one checkpoint interval, however long history grows; `live.json` grows with resources and prepared transactions, not with settled ones. Listing commands still read all history. Writes serialize through one lock; reads never wait for it. This is one logical shard per resource and one cooperating local user per store. It does not enforce budgets against anyone who can directly rewrite the authoritative store. Network filesystems, manual live editing, hard-link/path manipulation, and device loss are outside the local contract.
 
 History is retained indefinitely for inspection, although no retry reads entries older than the window. Reservations never expire automatically. Claims, external execution, trusted metering/refunds, hierarchy, sharding, signed audit history, HTTP, SQLite, and cloud backends remain deferred. The distributed protocol and enterprise RPO/RTO targets in DESIGN.md remain proposed and unqualified.
 
@@ -176,6 +178,35 @@ Development measurement on 2026-11-25, Rust 1.96.0 release build, one run in a L
 | 10,000 | 577 B | 6.4 MB | 2.1 ms | 0.16 ms | 20.0 ms |
 
 The snapshot store this replaced measured 56.7–72.0 ms inspection and 548.1–757.1 ms prepare + abort at 10,000 transactions on a different host and filesystem (Linux tmpfs), so the two are not directly comparable; the comparison that matters is that the cost no longer grows with retained history. The 0-history row includes first-run costs. These small samples are not an SLO, throughput qualification, or a power-loss test.
+
+### Concurrency
+
+`crates/rescrow-adapters/examples/concurrency_bench.rs` runs writer threads doing 25 prepare/abort pairs each, alongside reader threads reading a resource until the writers finish. In `clients` mode every thread opens the store itself, so file locks contend exactly as separate CLI processes' would. In `service` mode the threads share one `Service`. Writers retry `contention` as the contract says and the benchmark counts it.
+
+```sh
+cargo run --release --locked -p rescrow-adapters --example concurrency_bench -- target/bench 8 8 clients
+cargo run --release --locked -p rescrow-adapters --example concurrency_bench -- target/bench 8 8 service
+```
+
+Development measurement on 2026-11-25, Rust 1.96.0 release builds, a 12-CPU Linux container (OrbStack on macOS), two runs of each. First, readers that read continuously, before and after readers stopped taking the lock:
+
+| Writers + readers | Shared-lock reads: writes/s, p99 | Lock-free reads: writes/s, p99 |
+| --- | --- | --- |
+| 1 + 0 | 493, 5 ms (one run of 15) | 375–476, 3–5 ms |
+| 8 + 0 | 197–235, 582–592 ms | 243–415, 173–231 ms |
+| 8 + 8 | did not finish in 240 s | 232–267, 183–212 ms; 14,000–16,000 reads/s |
+| 16 + 16 | did not finish in 240 s | 138–141, 675–886 ms; 21,000 reads/s |
+
+With shared-lock reads, a writer could take the lock only at an instant when no reader held it, so continuous readers starved writers. Readers pausing 100 µs between reads, as requests arriving at a server would, then compare separate clients with one service:
+
+| Writers + readers | Clients: writes/s, p99 | Service: writes/s, p99 |
+| --- | --- | --- |
+| 1 + 0 | 280–375, 3–5 ms | 286–799, 2–6 ms |
+| 8 + 0 | 288–302, 211–319 ms | 670–1,256, 11–57 ms |
+| 8 + 8 | 438–442, 120–129 ms | 893–1,255, 12–20 ms |
+| 16 + 16 | 306–316, 369–392 ms; 2–3 contention retries | 1,174–1,182, 25–49 ms |
+
+Separate clients still serialize on the lock and evaluate optimistically, so with many writers one can lose the race repeatedly; 16 writers occasionally exhausted the 32 attempts and retried. The service evaluates every waiting write in one batch with one synchronization, so throughput grows with concurrency instead. Its reads are served from memory: continuous readers did 11–15 million reads/s, against about 20,000 for clients. But continuous readers without pauses, more threads than cores, starved the service's writer thread of CPU (56–775 writes/s); a server should leave its writer a core. Run-to-run variation on this shared host was large, so these ranges show direction, not capacity.
 
 ## Guiding values
 
