@@ -79,9 +79,23 @@ Several processes using separate in-memory instances do not share a budget. Conc
 
 ## 2. Relationship to the original method
 
-Patrick O'Neil's [The Escrow Transactional Method](https://dl.acm.org/doi/10.1145/7239.7265), also available as an [author-hosted PDF](https://www.cs.umb.edu/~poneil/EscrowTM.pdf), describes durable reservations that let long-lived transactions coexist on aggregate fields. Its safety criterion permits any combination of outstanding transactions to commit or abort. Its interface distinguishes the quantity reserved from the quantity ultimately used, and supports recovery before commit.
+Patrick O'Neil's [The Escrow Transactional Method](https://dl.acm.org/doi/10.1145/7239.7265) (ACM TODS 11(4), 1986), also available as a scanned [author-hosted PDF](https://www.cs.umb.edu/~poneil/EscrowTM.pdf), describes nonblocking reservations that let long-lived transactions update aggregate fields concurrently. Section references below are to that paper.
 
-Rescrow adopts those principles for bounded integer resources. Preparation is durable by default. Clients reserve a maximum change and may commit a smaller change in the same direction. Unlike the paper's broader interface, version one permits only resource-wide fixed bounds and a fixed participant set; it excludes transaction-specific predicates, incremental enlargement, and nested transactions. Distributed rights partitioning, conditional object updates, HTTP integration, and cryptographic audit evidence are engineering choices in this proposal rather than claims about the paper.
+**What the paper specifies.** An `ESCROW` request succeeds only if its update can be applied "at any time in the future, and in any order with any subset" of already guaranteed updates (§1.4). Each field tracks `inf`, `val` and `sup`, the extremes reachable under any combination of commits and aborts; a debit's test uses `inf`, so pending credits never fund it (§2.2). A transaction `USE`s at most what it escrowed, and commit returns the unused remainder (§2.1). Requests fail immediately rather than wait, so escrow alone cannot deadlock (§3.1). The paper restricts tests to simple bounds and argues that fixed, administrator-set bounds are preferable to per-request conditions (§2.2.3).
+
+Durability of a reservation is opt-in. A request with `recover=NO` is rolled back by crash recovery like any incomplete update; `recover=YES` forces the field to stable storage before the request returns (§2.1, §2.3). That recovery of intermediate results is presented as a sketch, with its interface left to future research (§4.4).
+
+**Storage and recovery in the paper.** Each outstanding request has an escrow journal (transaction ID, pool, test bounds, escrowed and used quantities) kept with its field as one "extended logical field," so field and journals reach stable storage together (§1.4, §2.2.2). On commit, the journal is removed from the field and a logical copy, with the quantity actually used, is written to a transaction commit log; that log write is the commit point (§2.2.1, §2.3). Field write-out is lazy and checkpointed rather than synchronized with each transaction. Recovery replays commit logs since the checkpoint and decides whether each was already applied by matching journals and comparing timestamps (§2.3). Increments commute, so journals can be applied in any order (§1.4, §5).
+
+For distributed work, the paper outlines two-phase commit in which each subordinate durably records its escrow before acknowledging and the coordinator logs participants and its decision; because escrow does not lock the field, "there is no hurry at all about sending the commit message" (§3.4). Extending the method to replicated data is left open (§4.5).
+
+**What Rescrow adopts and changes.** Rescrow keeps the any-subset safety criterion, conservative bounds (section 4.2), reserve-then-use with a smaller same-direction commit, fixed resource-wide bounds, and immediate failure rather than waiting. Departures:
+
+- Preparation is always durable, the paper's `recover=YES`, because holds back long-lived and cross-process work.
+- Version one freezes each transaction's operation list when it is created; it omits per-request test conditions and the paper's additional `ESCROW` calls within a live transaction.
+- The commit point is a conditional update of the transaction's own descriptor (section 7.3) rather than an append to a shared commit log. Cells hold pending entries in the role of journals, and removing an entry under a terminal decision is the evidence of application, as in the paper's recovery matching.
+- In the paper, commit adjusts the in-memory field immediately. Rescrow materializes decisions into cells asynchronously and keeps the full maximum reserved until then.
+- Partitioning one resource across shards, conditional object updates, HTTP integration, and cryptographic audit evidence are this proposal's engineering choices rather than claims about the paper.
 
 ## 3. Guarantees and assumptions
 
@@ -276,7 +290,7 @@ Cap cell size, pending entry count, participant count, descriptor size, and comp
 
 S3 provides strong object reads and atomic updates to a key within its bucket authority; it does not provide an atomic update across keys or a globally ordered CAS across regional buckets. The direct S3 adapter is useful for protocol development and explicitly regional deployments. It cannot serve the enterprise authority by itself. See the [S3 consistency model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel).
 
-Use `PutObject` with `If-None-Match: *` for creation and `If-Match: <ETag>` for replacement. AWS documents these conditional writes for both general purpose and directory buckets. Handle `412` as a failed condition and reconcile conflicting or ambiguous writes with fresh reads before retrying. Use small whole-object writes, explicit transport checksums, and no append or multipart dependency. See [conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) and [PutObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html).
+Use `PutObject` with `If-None-Match: *` for creation and `If-Match: <ETag>` for replacement. AWS documents these conditional writes for both general purpose and directory buckets. Handle `412` as a failed condition and reconcile conflicting or ambiguous writes with fresh reads before retrying. Use small writes with explicit transport checksums and no multipart dependency. A log tail (see [PLAN.md](PLAN.md), log-structured local store) may use conditional append where the bucket supports it: on directory buckets, [append](https://docs.aws.amazon.com/AmazonS3/latest/userguide/directory-buckets-objects-append.html) with `PutObject` and `x-amz-write-offset-bytes` set to the expected object size. AWS documents an `InvalidWriteOffset` failure when the offset does not match the current size, so a stale or repeated append fails rather than interleaving; qualify that behavior under concurrent appenders before relying on it. Each object accepts at most 10,000 appends, so roll segments before that limit. Frame each appended record with its length, checksum and sequence number. Treat an ambiguous append like any other unknown outcome, resolving it by rereading the object's length and final record. General purpose buckets have no append; there, write each tail batch as an immutable object behind a conditionally replaced head. See [conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html) and [PutObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html).
 
 | Aspect | S3 Standard | S3 Express One Zone |
 | --- | --- | --- |
@@ -284,6 +298,7 @@ Use `PutObject` with `If-None-Match: *` for creation and `If-Match: <ETag>` for 
 | Failure domain | Regional, across multiple AZs | One chosen AZ |
 | Placement | Regional application placement | Prefer compute near the chosen AZ |
 | Versioning / Object Lock | Available; configure explicitly | Unsupported |
+| Append | Unsupported; use immutable batch objects | Conditional append at the expected write offset |
 | Native replication | Available; not synchronous commit | Unsupported |
 | Listing | Adapter follows documented general bucket behavior | Do not assume lexicographic ordering |
 | Authorization | IAM and bucket policy | Directory-bucket permissions and session handling |

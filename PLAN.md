@@ -153,3 +153,46 @@ Completion means that an independent Rust caller and separate CLI invocations ca
 
 
 The local follow-up also replaces tuple availability with named fields, retains structured capacity-rejection facts for stable replay diagnostics, and removes repeated full-ledger conversion through validated immutable snapshots. The benchmark example and README record development measurements and their limits. Existing schema-1 capacity rejections remain readable without fabricated historical details; the Rust snapshot-port signatures change to `ValidatedSnapshot`.
+
+# Next milestone: log-structured local store
+
+Status: proposed. Nothing below is implemented.
+
+The snapshot store rewrites and revalidates the whole ledger, including permanently retained terminal transactions, on every publication. Following the escrow paper's storage design (DESIGN.md section 2), separate small live state from append-only history. Live state holds resources, their holds and `PREPARED` transactions. History is an append-only log whose durable append is the commit point, with checkpoints written lazily. A write's cost should depend on its record and the outstanding reservations, not on retained history. Domain rules, CLI commands and outputs, and the existing history checks stay unchanged.
+
+## Layout
+
+```text
+<store>/
+  state.lock          unchanged stable coordination file
+  live.json           checkpoint: resources, holds, PREPARED transactions,
+                      and the log position it reflects
+  log/<n>.seg         append-only framed records (length, checksum, sequence)
+  log/<n>.idx         immutable sorted terminal-transaction index, written
+                      once when segment <n> is sealed
+```
+
+Record kinds: `ResourceCreated`, `Prepared`, `Committed` (with actual deltas), and `Aborted` (requested or admitted rejection, including its retained capacity facts). Sealed segments and indexes are immutable write-once units, matching create-if-absent objects or items in later adapters. The active tail needs a conditional append: S3 Express One Zone appends at an expected write offset, and DynamoDB can conditionally update a bounded item with an appended body. Where no append exists, as in S3 general purpose buckets, the tail can be immutable batch objects behind a conditionally replaced head. Choose per backend by cost and failure domain: DynamoDB bills an update by the larger of the item's old and new size, and Express is a single-AZ durability choice (DESIGN.md section 6.3).
+
+## Steps
+
+1. **Affected-record transitions.** Restore `rescrow-domain::transition` and its tests from the parked `prototype-emriss-ledger` branch, without Emriss code. The whole-ledger API delegates to it, and log replay applies the same pure transitions.
+2. **Port.** Replace `SnapshotStore` with an Application-owned port: load a checkpoint and the records after it, conditionally append one record against an expected log position (`Applied`, `Conflict`, or unknown outcome), write a checkpoint for a position, and find a terminal transaction by ID. Log records get transfer types with fallible `TryFrom` validation, including replayed records. The Application replays and evaluates; the adapter frames, synchronizes, locks and indexes bytes.
+3. **Commit point.** Under the exclusive lock, append one record and synchronize the segment before acknowledging. This applies to preparation too, which is always durable (the paper's `recover=YES`). Sequence numbers play the role of the paper's timestamps: recovery applies exactly the records after the checkpoint's position. After a failed synchronization, report an unknown outcome, never retry synchronization on that handle, and let the next load decide.
+4. **Torn and corrupt records.** An invalid frame at the end of the newest segment was never acknowledged. Loads ignore it, and the next writer truncates it under the exclusive lock before appending. An invalid frame anywhere else, a sequence gap, or a record that fails validation fails closed.
+5. **Checkpoints.** When the tail exceeds a record or byte threshold, the writer publishes a new `live.json` through the existing temporary-file, synchronize, rename, and directory-synchronize discipline. No background worker is required. A crash before rename leaves the previous checkpoint and a longer tail.
+6. **Segments and the terminal index.** Roll a segment at a size threshold. Sealing writes its sorted index of terminal transaction IDs, request digests and record offsets as a synchronized, create-if-absent file. Replay and conflict lookups use live state, then the in-memory active-segment tail, then sealed indexes newest-first. Indexes are derived and rebuildable from their segment; a missing or invalid index fails closed until rebuilt. Segments are retained indefinitely so terminal IDs remain reserved. Index merging is deferred.
+7. **Full scans.** `list` commands and an explicit audit replay all segments sequentially, validating checksums, sequences, transitions and checkpointed balances against full replay. Only these operations pay history-proportional cost.
+8. **Migration.** An explicit step converts a schema-1 `state.json` into a checkpoint plus a log containing its terminal transactions, preserving replay identities and capacity facts. Ordinary commands fail closed on an unmigrated store rather than upgrading it silently.
+9. **Removals.** Remove whole-ledger publication and the snapshot settlement-space policy. Commit and abort shrink live state and append one bounded record, so a per-record size cap replaces reserved settlement headroom. Disk-full remains outside the contract.
+10. **Memory store.** The deterministic memory implementation implements the same port, with conflict, pre-append and lost-response injection.
+
+## Qualification
+
+- Unchanged acceptance gates: generated histories against the independent model and the 16 concurrent CLI workloads.
+- Process kills and injected failures before append, after write but before synchronization, after synchronization but before response, during checkpoint publication, and during index sealing.
+- A torn final record, corruption mid-log and in an index, a sequence gap, and failed synchronization.
+- Migration round trips for every schema-1 fixture, including legacy capacity rejections.
+- A regression bound showing that one mutation's written bytes and a point read's work do not grow with retained terminal history.
+
+Update DESIGN.md section 6.4's local-disk paragraph and README's local persistence section with the layout, costs, limits, and migration. State that this remains one serialized local authority per store, qualified for process restart rather than power or device loss.
