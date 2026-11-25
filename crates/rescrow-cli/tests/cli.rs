@@ -64,6 +64,18 @@ impl Case {
             .spawn()
             .unwrap()
     }
+    /// Waits for a spawned command. Bounded lock contention (exit 5) means "retry
+    /// the same request", so this does, as a client following the contract would.
+    fn settle(&self, child: Child, args: &[&str]) -> ProcessOutput {
+        let mut output = child.wait_with_output().unwrap();
+        for _ in 0..10 {
+            if output.status.code() != Some(5) {
+                break;
+            }
+            output = self.run(args);
+        }
+        output
+    }
     fn file(&self, name: &str, contents: &str) -> String {
         let path = self.root.join(name);
         fs::write(&path, contents).unwrap();
@@ -171,19 +183,15 @@ fn independent_processes_cannot_over_reserve_scarce_capacity() {
         "ops.json",
         r#"[{"operation_id":"o","resource_id":"r","delta":"-1"}]"#,
     );
-    let mut children = Vec::new();
-    for n in 0..20 {
-        children.push(c.spawn(&[
-            "transaction",
-            "prepare",
-            &tx(&format!("t{n}")),
-            "--operations",
-            &ops,
-        ]));
-    }
+    let ids: Vec<_> = (0..20).map(|n| tx(&format!("t{n}"))).collect();
+    let requests: Vec<_> = ids
+        .iter()
+        .map(|id| ["transaction", "prepare", id, "--operations", &ops])
+        .collect();
+    let children: Vec<_> = requests.iter().map(|args| c.spawn(args)).collect();
     let mut successes = 0;
-    for child in children {
-        let result = child.wait_with_output().unwrap();
+    for (child, args) in children.into_iter().zip(&requests) {
+        let result = c.settle(child, args);
         match result.status.code() {
             Some(0) => successes += 1,
             Some(3) => {}
@@ -214,7 +222,7 @@ fn identical_prepare_and_commit_replays_publish_once() {
         let before = c.snapshot().revision;
         let children: Vec<_> = (0..12).map(|_| c.spawn(&args)).collect();
         for child in children {
-            let out = child.wait_with_output().unwrap();
+            let out = c.settle(child, &args);
             assert!(
                 out.status.success(),
                 "{}",
@@ -237,10 +245,14 @@ fn commit_abort_race_has_exactly_one_terminal_decision() {
     for n in 0..12 {
         let id = tx(&format!("t{n}"));
         c.ok(&["transaction", "prepare", &id, "--operations", &ops]);
-        let commit = c.spawn(&["transaction", "commit", &id]);
-        let abort = c.spawn(&["transaction", "abort", &id]);
-        let committed = commit.wait_with_output().unwrap();
-        let aborted = abort.wait_with_output().unwrap();
+        let (commit_args, abort_args) = (
+            ["transaction", "commit", id.as_str()],
+            ["transaction", "abort", id.as_str()],
+        );
+        let commit = c.spawn(&commit_args);
+        let abort = c.spawn(&abort_args);
+        let committed = c.settle(commit, &commit_args);
+        let aborted = c.settle(abort, &abort_args);
         assert_ne!(committed.status.success(), aborted.status.success());
         if committed.status.success() {
             commits += 1;
