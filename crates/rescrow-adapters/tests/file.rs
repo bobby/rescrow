@@ -790,3 +790,52 @@ fn interrupted_migration_is_redone_or_completed() {
         assert_migrated(&temp, &source);
     }
 }
+/// Regression bounds, not a benchmark: one mutation's written bytes and a point
+/// read's replayed records do not grow with retained terminal history.
+#[test]
+fn writes_and_point_reads_do_not_grow_with_history() {
+    let temp = Temp::new();
+    ready(&temp);
+    let app = temp.app();
+    let settle = |range: std::ops::Range<usize>| {
+        for index in range {
+            let id = format!("h{index:04}");
+            app.execute(prepare_as(&id)).unwrap();
+            app.execute(commit_as(&id, "0")).unwrap();
+        }
+    };
+    let live = || fs::metadata(temp.store().join("live.json")).unwrap().len();
+    let log = || fs::metadata(temp.store().join(SEGMENT)).unwrap().len();
+    settle(0..40);
+    let (live_small, log_small) = (live(), log());
+    let before = log();
+    app.execute(prepare_as("small")).unwrap();
+    let write_small = log() - before;
+    app.execute(Command::Abort {
+        transaction_id: "small".into(),
+    })
+    .unwrap();
+    settle(40..400);
+    let before = log();
+    app.execute(prepare_as("large")).unwrap();
+    let write_large = log() - before;
+    assert!(log() > 8 * log_small, "history should have grown");
+    // Live state holds one resource and one or two holds either way; only
+    // its log position and offset gain digits.
+    assert!(live() <= live_small + 300, "{} vs {live_small}", live());
+    assert!(
+        write_large <= write_small + 8,
+        "{write_large} vs {write_small}"
+    );
+    let loaded = FileStore::new(temp.store()).unwrap().load().unwrap();
+    assert!(loaded.tail.len() < 64, "{}", loaded.tail.len());
+    assert_eq!(
+        FileStore::new(temp.store())
+            .unwrap()
+            .find("h0000")
+            .unwrap()
+            .unwrap()
+            .sequence,
+        2
+    );
+}
