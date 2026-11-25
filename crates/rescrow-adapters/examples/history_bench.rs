@@ -52,7 +52,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let replay = Command::CreateResource(spec);
         let live_bytes = fs::metadata(path.join("live.json"))?.len();
-        let log_bytes = fs::metadata(path.join("log"))?.len();
+        let log_bytes = fs::read_dir(path.join("log"))?
+            .map(|entry| Ok(entry?.metadata()?.len()))
+            .sum::<std::io::Result<u64>>()?;
         let mut inspect = vec![];
         let mut replays = vec![];
         let mut mutations = vec![];
