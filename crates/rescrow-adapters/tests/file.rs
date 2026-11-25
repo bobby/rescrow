@@ -12,6 +12,8 @@ use std::{
     time::{Duration, Instant},
 };
 static SEQ: AtomicU64 = AtomicU64::new(0);
+/// The first log segment, active until it is sealed.
+const SEGMENT: &str = "log/00000000000000000000.seg";
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
@@ -38,7 +40,7 @@ impl Temp {
     fn append_bytes(&self, bytes: &[u8]) {
         File::options()
             .append(true)
-            .open(self.store().join("log"))
+            .open(self.store().join(SEGMENT))
             .unwrap()
             .write_all(bytes)
             .unwrap();
@@ -96,7 +98,15 @@ fn initialize_permissions_missing_files_and_stable_lock_inode() {
         fs::metadata(temp.store()).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    for name in ["live.json", "log", "state.lock"] {
+    assert_eq!(
+        fs::metadata(temp.store().join("log"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    for name in ["live.json", SEGMENT, "state.lock"] {
         assert_eq!(
             fs::metadata(temp.store().join(name))
                 .unwrap()
@@ -193,7 +203,7 @@ fn torn_appends_are_ignored_and_truncated_but_earlier_corruption_fails_closed() 
     assert_eq!(committed.resources[0].quantity, "2");
     assert_eq!(committed.revision, 3);
     // Corruption inside an acknowledged record followed by later records is not a torn append.
-    let path = temp.store().join("log");
+    let path = temp.store().join(SEGMENT);
     let mut bytes = fs::read(&path).unwrap();
     bytes[12] ^= 0x20;
     fs::write(&path, &bytes).unwrap();
@@ -255,7 +265,7 @@ fn contention_has_a_deadline_and_permission_errors_preserve_state() {
     assert_eq!(store.append(&entry).unwrap_err(), StoreError::Contention);
     drop(lock);
     let good = temp.snapshot();
-    for name in ["live.json", "log"] {
+    for name in ["live.json", SEGMENT] {
         let path = temp.store().join(name);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(store.load(), Err(StoreError::Io(_))));
@@ -263,7 +273,7 @@ fn contention_has_a_deadline_and_permission_errors_preserve_state() {
     }
     // A read-only log causes an actual pre-append I/O failure for ordinary users.
     // Root bypasses DAC, so the attempt may then succeed.
-    let log = temp.store().join("log");
+    let log = temp.store().join(SEGMENT);
     fs::set_permissions(&log, fs::Permissions::from_mode(0o400)).unwrap();
     let attempt = temp.app().execute(prepare());
     fs::set_permissions(&log, fs::Permissions::from_mode(0o600)).unwrap();
@@ -295,7 +305,11 @@ fn child_worker() {
     let Ok(path) = std::env::var("RESCROW_TEST_STORE") else {
         return;
     };
-    let mut app = Application::new(FileStore::new(path).unwrap().with_fault_hook(hook));
+    let mut store = FileStore::new(path).unwrap().with_fault_hook(hook);
+    if let Ok(bytes) = std::env::var("RESCROW_TEST_SEGMENT") {
+        store = store.with_segment_size(bytes.parse().unwrap());
+    }
+    let mut app = Application::new(store);
     if std::env::var("RESCROW_TEST_CHECKPOINT").is_ok() {
         app = app.with_checkpoint_interval(1);
     }
@@ -334,7 +348,9 @@ fn child(temp: &Temp, stage: Stage, mode: &str, expect: &str) -> std::process::C
     process.spawn().unwrap()
 }
 fn kill_at(temp: &Temp, stage: Stage, expect: &str) {
-    let mut child = child(temp, stage, "kill", expect);
+    kill_with(temp, stage, expect, child(temp, stage, "kill", expect));
+}
+fn kill_with(temp: &Temp, stage: Stage, _expect: &str, mut child: std::process::Child) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !temp.0.join("reached").exists() {
         if let Some(status) = child.try_wait().unwrap() {
@@ -505,4 +521,154 @@ fn readers_share_the_lock_and_exclude_writers() {
     assert_eq!(store.append(&entry).unwrap_err(), StoreError::Contention);
     drop(lock);
     assert_eq!(store.load().unwrap(), current);
+}
+
+/// A tiny segment size seals after every record.
+fn segmented(temp: &Temp) -> Application<FileStore> {
+    Application::new(FileStore::new(temp.store()).unwrap().with_segment_size(1))
+        .with_checkpoint_interval(2)
+}
+fn indexes(temp: &Temp) -> Vec<PathBuf> {
+    let mut paths: Vec<_> = fs::read_dir(temp.store().join("log"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "idx"))
+        .collect();
+    paths.sort();
+    paths
+}
+#[test]
+fn sealed_segments_keep_old_decisions_findable_through_indexes() {
+    let temp = Temp::new();
+    ready(&temp);
+    let app = segmented(&temp);
+    for index in 0..4 {
+        let id = format!("t{index}");
+        app.execute(prepare_as(&id)).unwrap();
+        app.execute(commit_as(&id, "0")).unwrap();
+    }
+    let snapshot = temp.snapshot();
+    assert_eq!(snapshot.revision, 9);
+    assert_eq!(snapshot.resources[0].quantity, "5");
+    // Every segment except the active one is sealed.
+    let segments = fs::read_dir(temp.store().join("log"))
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|e| e == "seg")
+        })
+        .count();
+    assert_eq!(indexes(&temp).len(), segments - 1);
+    // A decision far behind the checkpoint is found through a sealed index.
+    let store = FileStore::new(temp.store()).unwrap();
+    let found = store.find("t0").unwrap().unwrap();
+    assert_eq!(found.sequence, 2);
+    assert!(store.find("missing").unwrap().is_none());
+    assert_eq!(
+        app.execute(commit_as("t0", "0")).unwrap(),
+        Output::Transaction(snapshot.transactions[0].clone())
+    );
+    assert_eq!(
+        app.execute(commit_as("t0", "-1")).unwrap_err().code,
+        Code::Conflict
+    );
+    // Reopening with the default size continues the active segment.
+    finish_as(&temp, "u");
+}
+#[test]
+fn missing_or_corrupt_indexes_and_changed_sealed_segments_fail_closed() {
+    for damage in ["remove", "flip", "extend"] {
+        let temp = Temp::new();
+        ready(&temp);
+        let app = segmented(&temp);
+        for index in 0..3 {
+            let id = format!("t{index}");
+            app.execute(prepare_as(&id)).unwrap();
+            app.execute(commit_as(&id, "-1")).unwrap();
+        }
+        // One record per segment: create, prepare t0, commit t0, ...
+        let index = indexes(&temp)[2].clone();
+        match damage {
+            "remove" => fs::remove_file(&index).unwrap(),
+            "flip" => {
+                let mut bytes = fs::read(&index).unwrap();
+                bytes[10] ^= 0x01;
+                fs::write(&index, bytes).unwrap();
+            }
+            _ => {
+                let segment = index.with_extension("seg");
+                File::options()
+                    .append(true)
+                    .open(segment)
+                    .unwrap()
+                    .write_all(&[0; 8])
+                    .unwrap();
+            }
+        }
+        assert_eq!(
+            app.execute(Command::ListTransactions).unwrap_err().code,
+            Code::CorruptState,
+            "{damage}"
+        );
+        if damage != "extend" {
+            assert_eq!(
+                app.execute(commit_as("t0", "-1")).unwrap_err().code,
+                Code::CorruptState,
+                "{damage}"
+            );
+        }
+    }
+}
+#[test]
+fn interrupted_sealing_resumes_without_losing_or_repeating_records() {
+    for mode in ["error", "kill"] {
+        let temp = Temp::new();
+        ready(&temp);
+        let old = temp.snapshot();
+        let expect = if mode == "kill" { "kill" } else { "io" };
+        let mut process = Process::new(std::env::current_exe().unwrap());
+        process
+            .args(["--exact", "child_worker", "--nocapture"])
+            .env("RESCROW_TEST_STORE", temp.store())
+            .env("RESCROW_TEST_STAGE", format!("{:?}", Stage::Sealed))
+            .env("RESCROW_TEST_MODE", mode)
+            .env("RESCROW_TEST_MARKER", temp.0.join("reached"))
+            .env(
+                "RESCROW_TEST_EXPECT",
+                if mode == "kill" { "io" } else { expect },
+            )
+            .env("RESCROW_TEST_SEGMENT", "1")
+            .stdout(std::process::Stdio::null());
+        if mode == "kill" {
+            kill_with(&temp, Stage::Sealed, expect, process.spawn().unwrap());
+        } else {
+            assert!(process.status().unwrap().success());
+        }
+        // The segment is sealed but its successor does not exist yet.
+        assert_eq!(indexes(&temp).len(), 1);
+        assert_eq!(temp.snapshot(), old);
+        finish(&temp);
+    }
+}
+fn commit_as(id: &str, delta: &str) -> Command {
+    Command::Commit(Commit {
+        transaction_id: id.into(),
+        actuals: Some(vec![Actual {
+            operation_id: "o".into(),
+            delta: delta.into(),
+        }]),
+    })
+}
+fn finish_as(temp: &Temp, id: &str) {
+    let app = temp.app();
+    let before = temp.snapshot();
+    app.execute(prepare_as(id)).unwrap();
+    app.execute(commit_as(id, "-1")).unwrap();
+    let after = temp.snapshot();
+    assert_eq!(after.revision, before.revision + 2);
+    app.execute(commit_as(id, "-1")).unwrap();
+    assert_eq!(temp.snapshot(), after);
 }

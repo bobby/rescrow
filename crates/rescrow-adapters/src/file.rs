@@ -1,7 +1,10 @@
 //! Cooperative same-user Linux authority: a checkpoint of live state in
-//! `live.json` and an append-only `log` of checksummed records. A synchronized
-//! append is the commit point. Path manipulation and network filesystems are
-//! outside this adapter's contract. The lock inode is never replaced or removed.
+//! `live.json` and an append-only log of checksummed records, split into
+//! segments. A synchronized append is the commit point. A full segment is
+//! sealed by writing an immutable index of its finished transactions, so
+//! lookups of old decisions read indexes rather than the whole log. Path
+//! manipulation and network filesystems are outside this adapter's contract.
+//! The lock inode is never replaced or removed.
 use rescrow_application::{
     Loaded, LogStore, Publication, StoreError,
     dto::{Checkpoint, Entry, Record, State as TxState},
@@ -20,6 +23,8 @@ use std::{
 
 /// Ceiling for `live.json` and for each encoded log record.
 pub const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
+/// Default size after which the active segment is sealed and a new one started.
+pub const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 const LIVE: &str = "live.json";
 const LOG: &str = "log";
 /// The schema-1 snapshot file. Its presence means the store needs migration.
@@ -46,6 +51,9 @@ pub enum Stage {
     DirectorySync,
     /// After any durable change, before reporting success.
     BeforeResponse,
+    /// Sealing a full segment, after its index is written but before the
+    /// next segment exists.
+    Sealed,
     /// Synchronizing what a read observed, before returning it.
     ReadSync,
 }
@@ -54,22 +62,52 @@ fn no_fault(_: Stage) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Adapter-owned envelope: the checkpoint and the byte offset of the first
-/// log record it does not include.
+/// Adapter-owned envelope: the checkpoint and the position in the log of the
+/// first record it does not include.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LiveFile {
-    log_offset: u64,
+    /// First sequence number of the segment holding that position.
+    segment: u64,
+    /// Byte offset within that segment.
+    offset: u64,
     checkpoint: Checkpoint,
 }
 
-/// Records decoded from one region of the log.
+/// Immutable index of a sealed segment's finished transactions, sorted by ID.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Index {
+    segment: u64,
+    /// The segment's length when sealed; it never changes afterwards.
+    length: u64,
+    entries: Vec<IndexEntry>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IndexEntry {
+    transaction_id: String,
+    sequence: u64,
+    offset: u64,
+}
+
+/// Records decoded from one segment.
 struct Scan {
-    /// Each entry with the offset just past its record.
-    entries: Vec<(Entry, u64)>,
+    /// Each entry with its start and end offsets.
+    entries: Vec<(Entry, u64, u64)>,
     /// End of the last valid record; anything after it is an unacknowledged torn append.
     valid_end: u64,
     file_len: u64,
+}
+/// Records after a checkpoint, across segments, plus the state of the active segment.
+struct Tail {
+    /// Each entry with its segment and end offset.
+    entries: Vec<(Entry, u64, u64)>,
+    active: u64,
+    sealed: bool,
+    valid_end: u64,
+    file_len: u64,
+    files: Vec<File>,
 }
 
 pub struct FileStore {
@@ -77,6 +115,7 @@ pub struct FileStore {
     timeout: Duration,
     hook: Hook,
     max_bytes: u64,
+    segment_bytes: u64,
 }
 impl FileStore {
     /// A missing store may be selected, but only initialize will create it.
@@ -102,16 +141,23 @@ impl FileStore {
             timeout: Duration::from_secs(2),
             hook: no_fault,
             max_bytes: MAX_RECORD_BYTES,
+            segment_bytes: SEGMENT_BYTES,
         })
     }
-    /// A smaller explicit ceiling for `live.json` and each log record. Cooperating
-    /// callers should select the same limit for a store.
+    /// A smaller explicit ceiling for `live.json`, each log record and each
+    /// index. Cooperating callers should select the same limit for a store.
     pub fn with_size_limit(mut self, bytes: u64) -> Result<Self, StoreError> {
         if bytes == 0 || bytes > MAX_RECORD_BYTES {
             return Err(StoreError::Io("record limit must be 1..=16 MiB".into()));
         }
         self.max_bytes = bytes;
         Ok(self)
+    }
+    /// Seal the active segment once it reaches this size. Mainly for tests;
+    /// a store may be reopened with a different value.
+    pub fn with_segment_size(mut self, bytes: u64) -> Self {
+        self.segment_bytes = bytes.max(1);
+        self
     }
     pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
@@ -125,17 +171,7 @@ impl FileStore {
         &self.directory
     }
     fn directory_file(&self) -> Result<File, StoreError> {
-        let dir = File::open(&self.directory).map_err(missing)?;
-        if !dir.metadata().map_err(io)?.is_dir() {
-            return Err(StoreError::Io("store is not a directory".into()));
-        }
-        #[cfg(unix)]
-        if dir.metadata().map_err(io)?.permissions().mode() & 0o077 != 0 {
-            return Err(StoreError::Io(
-                "store directory must have owner-only permissions (chmod 700)".into(),
-            ));
-        }
-        Ok(dir)
+        open_directory(&self.directory)
     }
     fn lock(&self, exclusive: bool, initialize: bool) -> Result<(File, bool), StoreError> {
         let mut options = OpenOptions::new();
@@ -204,33 +240,95 @@ impl FileStore {
         }
         Ok(bytes)
     }
-    fn open_log(&self, write: bool) -> Result<File, StoreError> {
+    fn log(&self) -> PathBuf {
+        self.directory.join(LOG)
+    }
+    fn segment_path(&self, first: u64) -> PathBuf {
+        self.log().join(format!("{first:020}.seg"))
+    }
+    fn index_path(&self, first: u64) -> PathBuf {
+        self.log().join(format!("{first:020}.idx"))
+    }
+    /// First sequence numbers of every segment, in order.
+    fn segments(&self) -> Result<Vec<u64>, StoreError> {
+        let log = self.log();
+        open_directory(&log).map_err(|e| match e {
+            StoreError::Missing => StoreError::Corrupt("log is missing beside live.json".into()),
+            other => other,
+        })?;
+        let mut segments = Vec::new();
+        for item in fs::read_dir(&log).map_err(io)? {
+            let name = item.map_err(io)?.file_name();
+            let name = name.to_string_lossy();
+            if let Some(first) = name.strip_suffix(".seg") {
+                segments.push(
+                    first
+                        .parse()
+                        .map_err(|_| StoreError::Corrupt(format!("unexpected log file {name}")))?,
+                );
+            }
+        }
+        segments.sort_unstable();
+        if segments.is_empty() {
+            return Err(StoreError::Corrupt("log has no segments".into()));
+        }
+        Ok(segments)
+    }
+    fn open_segment(&self, first: u64, write: bool) -> Result<File, StoreError> {
         let file = OpenOptions::new()
             .read(true)
             .write(write)
-            .open(self.directory.join(LOG))
+            .open(self.segment_path(first))
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::NotFound => {
-                    StoreError::Corrupt("log is missing beside live.json".into())
+                    StoreError::Corrupt(format!("log segment {first} is missing"))
                 }
                 _ => io(e),
             })?;
         check_file(&file)?;
         Ok(file)
     }
-    /// Decode records from `offset` to the end of the log. An invalid final
-    /// record, or an all-zero remainder, is an unacknowledged torn append.
-    /// Anything else invalid fails closed.
-    fn scan(&self, log: &mut File, offset: u64, sequence: u64) -> Result<Scan, StoreError> {
-        let file_len = log.metadata().map_err(io)?.len();
+    /// The sealed segment's index, or `None` while the segment is active.
+    fn read_index(&self, first: u64) -> Result<Option<Index>, StoreError> {
+        let mut file = match File::open(self.index_path(first)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io(e)),
+        };
+        check_file(&file)?;
+        let bytes = self.read_bounded(&mut file)?;
+        let index: Index = decode_frame(&bytes, self.max_bytes)
+            .ok_or_else(|| StoreError::Corrupt(format!("invalid index for segment {first}")))?;
+        let sorted = index
+            .entries
+            .windows(2)
+            .all(|w| w[0].transaction_id < w[1].transaction_id);
+        if index.segment != first || !sorted {
+            return Err(StoreError::Corrupt(format!(
+                "invalid index for segment {first}"
+            )));
+        }
+        Ok(Some(index))
+    }
+    /// Decode records from `offset` to the end of a segment. In the active
+    /// segment, an invalid final record or an all-zero remainder is an
+    /// unacknowledged torn append. Anything else invalid fails closed.
+    fn scan(
+        &self,
+        segment: &mut File,
+        offset: u64,
+        sequence: u64,
+        active: bool,
+    ) -> Result<Scan, StoreError> {
+        let file_len = segment.metadata().map_err(io)?.len();
         if offset > file_len {
             return Err(StoreError::Corrupt(
                 "checkpoint refers past the end of the log".into(),
             ));
         }
-        log.seek(SeekFrom::Start(offset)).map_err(io)?;
+        segment.seek(SeekFrom::Start(offset)).map_err(io)?;
         let mut bytes = Vec::new();
-        log.read_to_end(&mut bytes).map_err(io)?;
+        segment.read_to_end(&mut bytes).map_err(io)?;
         let mut scan = Scan {
             entries: Vec::new(),
             valid_end: offset,
@@ -239,35 +337,25 @@ impl FileStore {
         let mut at = 0;
         while at < bytes.len() {
             let rest = &bytes[at..];
-            let torn = || rest.iter().all(|b| *b == 0);
-            let Some(header) = rest.get(..HEADER) else {
-                break; // incomplete header: torn
-            };
-            let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
-            let crc = u32::from_le_bytes(header[4..].try_into().unwrap());
-            if len == 0 || len as u64 > self.max_bytes {
-                if torn() {
-                    break;
-                }
-                return Err(StoreError::Corrupt(format!(
-                    "invalid log record length at byte {}",
-                    offset + at as u64
-                )));
-            }
-            let Some(payload) = rest.get(HEADER..HEADER + len) else {
-                break; // record extends past the end of the file: torn
-            };
-            let last = HEADER + len == rest.len();
-            let decoded = (crc32(payload) == crc)
-                .then(|| serde_json::from_slice::<Entry>(payload).ok())
-                .flatten();
+            let start = offset + at as u64;
+            let len = rest
+                .get(..4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+            let complete = len.is_some_and(|len| rest.len() >= HEADER + len);
+            let decoded = len
+                .filter(|len| complete && *len > 0 && *len as u64 <= self.max_bytes)
+                .and_then(|len| decode_frame::<Entry>(&rest[..HEADER + len], self.max_bytes));
             let Some(entry) = decoded else {
-                if last || torn() {
+                // Only the final record of the active segment can be a torn append,
+                // and only if its length is one a writer could have produced.
+                let plausible = len.is_none_or(|len| len > 0 && len as u64 <= self.max_bytes);
+                let last =
+                    plausible && (!complete || len.is_some_and(|len| HEADER + len == rest.len()));
+                if active && (last || rest.iter().all(|b| *b == 0)) {
                     break;
                 }
                 return Err(StoreError::Corrupt(format!(
-                    "invalid log record at byte {}",
-                    offset + at as u64
+                    "invalid log record at byte {start}"
                 )));
             };
             let expected = sequence + scan.entries.len() as u64;
@@ -277,11 +365,66 @@ impl FileStore {
                     entry.sequence
                 )));
             }
-            at += HEADER + len;
+            at += HEADER + len.unwrap_or_default();
             scan.valid_end = offset + at as u64;
-            scan.entries.push((entry, scan.valid_end));
+            scan.entries.push((entry, start, scan.valid_end));
         }
         Ok(scan)
+    }
+    /// Every record from a position to the end of the log, under a lock the caller holds.
+    fn tail(&self, segment: u64, offset: u64, sequence: u64) -> Result<Tail, StoreError> {
+        let segments = self.segments()?;
+        let start = segments
+            .iter()
+            .position(|first| *first == segment)
+            .ok_or_else(|| StoreError::Corrupt(format!("log segment {segment} is missing")))?;
+        let mut tail = Tail {
+            entries: Vec::new(),
+            active: segment,
+            sealed: false,
+            valid_end: 0,
+            file_len: 0,
+            files: Vec::new(),
+        };
+        let mut next = sequence;
+        for (position, first) in segments.iter().enumerate().skip(start) {
+            let active = position + 1 == segments.len();
+            let index = self.read_index(*first)?;
+            if !active && index.is_none() {
+                return Err(StoreError::Corrupt(format!(
+                    "segment {first} is followed by another but was never sealed"
+                )));
+            }
+            let from = if position == start { offset } else { 0 };
+            if position != start && *first != next {
+                return Err(StoreError::Corrupt(format!(
+                    "segment {first} found where {next} was expected"
+                )));
+            }
+            let mut file = self.open_segment(*first, false)?;
+            let scan = self.scan(&mut file, from, next, active && index.is_none())?;
+            if let Some(index) = &index
+                && index.length != scan.file_len
+            {
+                return Err(StoreError::Corrupt(format!(
+                    "sealed segment {first} changed length"
+                )));
+            }
+            next += scan.entries.len() as u64;
+            tail.entries.extend(
+                scan.entries
+                    .into_iter()
+                    .map(|(entry, _, end)| (entry, *first, end)),
+            );
+            if active {
+                tail.active = *first;
+                tail.sealed = index.is_some();
+                tail.valid_end = scan.valid_end;
+                tail.file_len = scan.file_len;
+            }
+            tail.files.push(file);
+        }
+        Ok(tail)
     }
     /// Complete a previous writer's potentially uncertain append or checkpoint
     /// before confirming even a read or idempotent retry. Shared locks exclude
@@ -294,37 +437,37 @@ impl FileStore {
         Ok(())
     }
     /// Read the checkpoint and the entries after it under a lock the caller holds.
-    fn read(&self, directory: &File) -> Result<(LiveFile, File, Scan), StoreError> {
+    fn read(&self, directory: &File) -> Result<(LiveFile, Tail), StoreError> {
         let (live, live_file) = self.read_live()?;
-        let mut log = self.open_log(false)?;
-        let scan = self.scan(&mut log, live.log_offset, live.checkpoint.position)?;
-        self.sync_read(&[&log, &live_file, directory])?;
-        Ok((live, log, scan))
+        let tail = self.tail(live.segment, live.offset, live.checkpoint.position)?;
+        let log = open_directory(&self.log())?;
+        let mut files: Vec<&File> = tail.files.iter().collect();
+        files.extend([&live_file, &log, directory]);
+        self.sync_read(&files)?;
+        Ok((live, tail))
     }
-    /// Replace `live.json` atomically: write, synchronize, rename, synchronize the directory.
-    fn publish(&self, live: &LiveFile, directory: &File) -> Result<(), StoreError> {
-        let bytes = serde_json::to_vec(live).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    /// Write a new file atomically: write, synchronize, rename, synchronize the directory.
+    fn publish(&self, path: &Path, bytes: &[u8], directory: &File) -> Result<(), StoreError> {
         if bytes.len() as u64 > self.max_bytes {
             return Err(StoreError::TooLarge);
         }
-        let (path, mut file) = loop {
+        let parent = path.parent().unwrap_or(&self.directory);
+        let (temp, mut file) = loop {
             let seq = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
-            let path = self
-                .directory
-                .join(format!(".live-{}-{seq}.tmp", std::process::id()));
+            let temp = parent.join(format!(".publish-{}-{seq}.tmp", std::process::id()));
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
             options.mode(0o600);
-            match options.open(&path) {
-                Ok(file) => break (path, file),
+            match options.open(&temp) {
+                Ok(file) => break (temp, file),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(io(e)),
             }
         };
         // Drop removes our candidate on ordinary pre-rename errors. A killed writer
         // may leave an orphan; no reader ever considers candidates authoritative.
-        let candidate = Candidate(path);
+        let candidate = Candidate(temp);
         (self.hook)(Stage::BeforeWrite).map_err(io)?;
         let mid = bytes.len() / 2;
         file.write_all(&bytes[..mid]).map_err(io)?;
@@ -333,12 +476,79 @@ impl FileStore {
         file.flush().map_err(io)?;
         file.sync_all().map_err(io)?;
         (self.hook)(Stage::FileSynced).map_err(io)?;
-        fs::rename(&candidate.0, self.directory.join(LIVE)).map_err(io)?;
+        fs::rename(&candidate.0, path).map_err(io)?;
         (self.hook)(Stage::Renamed).map_err(unknown)?;
         (self.hook)(Stage::DirectorySync).map_err(unknown)?;
         directory.sync_all().map_err(unknown)?;
         (self.hook)(Stage::BeforeResponse).map_err(unknown)?;
         Ok(())
+    }
+    fn publish_live(&self, live: &LiveFile, directory: &File) -> Result<(), StoreError> {
+        let bytes = serde_json::to_vec(live).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        self.publish(&self.directory.join(LIVE), &bytes, directory)
+    }
+    /// Seal the active segment with an index of its finished transactions and
+    /// start the next one. Nothing is appended, so failures here are plain I/O
+    /// errors: the log's contents are unchanged.
+    fn roll(&self, tail: &Tail, next: u64) -> Result<(), StoreError> {
+        let log = open_directory(&self.log())?;
+        if !tail.sealed {
+            let mut file = self.open_segment(tail.active, false)?;
+            let scan = self.scan(&mut file, 0, tail.active, true)?;
+            let mut entries: Vec<IndexEntry> = scan
+                .entries
+                .into_iter()
+                .filter_map(|(entry, start, _)| match entry.record {
+                    Record::Transaction(tx) if !matches!(tx.state, TxState::Prepared {}) => {
+                        Some(IndexEntry {
+                            transaction_id: tx.request.transaction_id,
+                            sequence: entry.sequence,
+                            offset: start,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            entries.sort_by(|a, b| a.transaction_id.cmp(&b.transaction_id));
+            let index = Index {
+                segment: tail.active,
+                length: scan.valid_end,
+                entries,
+            };
+            self.publish(&self.index_path(tail.active), &encode_frame(&index)?, &log)
+                .map_err(|e| match e {
+                    StoreError::Unknown(detail) => StoreError::Io(detail),
+                    other => other,
+                })?;
+        }
+        (self.hook)(Stage::Sealed).map_err(io)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        options
+            .open(self.segment_path(next))
+            .map_err(io)?
+            .sync_all()
+            .map_err(io)?;
+        log.sync_all().map_err(io)
+    }
+    fn read_record(&self, first: u64, offset: u64) -> Result<Entry, StoreError> {
+        let mut file = self.open_segment(first, false)?;
+        file.seek(SeekFrom::Start(offset)).map_err(io)?;
+        let mut header = [0; HEADER];
+        file.read_exact(&mut header).map_err(io)?;
+        let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as u64;
+        if len == 0 || len > self.max_bytes {
+            return Err(StoreError::Corrupt(format!(
+                "indexed record in segment {first} is invalid"
+            )));
+        }
+        let mut frame = header.to_vec();
+        file.take(len).read_to_end(&mut frame).map_err(io)?;
+        decode_frame(&frame, self.max_bytes).ok_or_else(|| {
+            StoreError::Corrupt(format!("indexed record in segment {first} is invalid"))
+        })
     }
 }
 impl LogStore for FileStore {
@@ -373,23 +583,33 @@ impl LogStore for FileStore {
             Err(StoreError::Missing) => {}
             Err(e) => return Err(e),
         }
-        // An existing coordination file with no live state could represent lost
-        // authority, not an empty budget. Even explicit init must fail closed.
+        // An existing coordination file or log with no live state could represent
+        // lost authority, not an empty budget. Even explicit init must fail closed.
         if !created_lock {
             return Err(StoreError::Missing);
         }
+        match builder.create(self.log()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(StoreError::Missing);
+            }
+            Err(e) => return Err(io(e)),
+        }
         let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         options.mode(0o600);
         options
-            .open(self.directory.join(LOG))
+            .open(self.segment_path(0))
             .map_err(io)?
             .sync_all()
             .map_err(io)?;
-        self.publish(
+        self.directory_file()?.sync_all().map_err(io)?;
+        open_directory(&self.log())?.sync_all().map_err(io)?;
+        self.publish_live(
             &LiveFile {
-                log_offset: 0,
+                segment: 0,
+                offset: 0,
                 checkpoint: empty.clone(),
             },
             &directory,
@@ -398,41 +618,41 @@ impl LogStore for FileStore {
     fn load(&self) -> Result<Loaded, StoreError> {
         let directory = self.directory_file()?;
         let (_lock, _) = self.lock(false, false)?;
-        let (live, _, scan) = self.read(&directory)?;
+        let (live, tail) = self.read(&directory)?;
         Ok(Loaded {
             checkpoint: live.checkpoint,
-            tail: scan.entries.into_iter().map(|(entry, _)| entry).collect(),
+            tail: tail.entries.into_iter().map(|(entry, ..)| entry).collect(),
         })
     }
     fn append(&self, entry: &Entry) -> Result<Publication, StoreError> {
         let directory = self.directory_file()?;
         let (_lock, _) = self.lock(true, false)?;
-        let (live, _, scan) = self.read(&directory)?;
-        if entry.sequence != live.checkpoint.position + scan.entries.len() as u64 {
+        let (live, tail) = self.read(&directory)?;
+        if entry.sequence != live.checkpoint.position + tail.entries.len() as u64 {
             return Ok(Publication::Conflict);
         }
-        let payload = serde_json::to_vec(entry).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-        if payload.len() as u64 > self.max_bytes {
-            return Err(StoreError::TooLarge);
-        }
-        let mut frame = Vec::with_capacity(HEADER + payload.len());
-        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        frame.extend_from_slice(&crc32(&payload).to_le_bytes());
-        frame.extend_from_slice(&payload);
-        let mut log = self.open_log(true)?;
+        let frame = encode_frame(entry)?;
         // Remove an earlier writer's unacknowledged torn append before writing after it.
-        if scan.file_len > scan.valid_end {
-            log.set_len(scan.valid_end).map_err(io)?;
-            log.sync_all().map_err(io)?;
+        if !tail.sealed && tail.file_len > tail.valid_end {
+            let segment = self.open_segment(tail.active, true)?;
+            segment.set_len(tail.valid_end).map_err(io)?;
+            segment.sync_all().map_err(io)?;
         }
+        let (active, offset) = if tail.sealed || tail.valid_end >= self.segment_bytes {
+            self.roll(&tail, entry.sequence)?;
+            (entry.sequence, 0)
+        } else {
+            (tail.active, tail.valid_end)
+        };
+        let mut segment = self.open_segment(active, true)?;
         (self.hook)(Stage::BeforeAppend).map_err(io)?;
-        log.seek(SeekFrom::Start(scan.valid_end)).map_err(io)?;
+        segment.seek(SeekFrom::Start(offset)).map_err(io)?;
         let mid = frame.len() / 2;
-        log.write_all(&frame[..mid]).map_err(io)?;
+        segment.write_all(&frame[..mid]).map_err(io)?;
         (self.hook)(Stage::DuringAppend).map_err(io)?;
-        log.write_all(&frame[mid..]).map_err(io)?;
+        segment.write_all(&frame[mid..]).map_err(io)?;
         // Once every byte is written, a failed synchronization may still have persisted it.
-        log.sync_all().map_err(unknown)?;
+        segment.sync_all().map_err(unknown)?;
         (self.hook)(Stage::AppendSynced).map_err(unknown)?;
         (self.hook)(Stage::BeforeResponse).map_err(unknown)?;
         Ok(Publication::Applied)
@@ -440,46 +660,129 @@ impl LogStore for FileStore {
     fn checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), StoreError> {
         let directory = self.directory_file()?;
         let (_lock, _) = self.lock(true, false)?;
-        let (live, _, scan) = self.read(&directory)?;
+        let (live, tail) = self.read(&directory)?;
         let Some(covered) = checkpoint.position.checked_sub(live.checkpoint.position) else {
             return Ok(());
         };
         if covered == 0 {
             return Ok(());
         }
-        let (_, log_offset) = *scan
+        let (_, segment, offset) = *tail
             .entries
             .get(covered as usize - 1)
             .ok_or_else(|| StoreError::Corrupt("checkpoint is past the end of the log".into()))?;
-        self.publish(
+        self.publish_live(
             &LiveFile {
-                log_offset,
+                segment,
+                offset,
                 checkpoint: checkpoint.clone(),
             },
             &directory,
         )
     }
+    /// Search the active segment, then sealed indexes from newest to oldest.
     fn find(&self, transaction_id: &str) -> Result<Option<Entry>, StoreError> {
-        Ok(self.history()?.into_iter().rev().find(|entry| {
-            matches!(&entry.record, Record::Transaction(tx)
-                if tx.request.transaction_id == transaction_id
-                    && !matches!(tx.state, TxState::Prepared {}))
-        }))
+        let directory = self.directory_file()?;
+        let (_lock, _) = self.lock(false, false)?;
+        self.read_live()?;
+        let segments = self.segments()?;
+        for (position, first) in segments.iter().enumerate().rev() {
+            let Some(index) = self.read_index(*first)? else {
+                if position + 1 != segments.len() {
+                    return Err(StoreError::Corrupt(format!(
+                        "segment {first} is followed by another but was never sealed"
+                    )));
+                }
+                let mut file = self.open_segment(*first, false)?;
+                let scan = self.scan(&mut file, 0, *first, true)?;
+                self.sync_read(&[&file, &open_directory(&self.log())?, &directory])?;
+                let found = scan.entries.into_iter().rev().find(|(entry, ..)| {
+                    matches!(&entry.record, Record::Transaction(tx)
+                        if tx.request.transaction_id == transaction_id
+                            && !matches!(tx.state, TxState::Prepared {}))
+                });
+                if let Some((entry, ..)) = found {
+                    return Ok(Some(entry));
+                }
+                continue;
+            };
+            let Ok(at) = index
+                .entries
+                .binary_search_by(|e| e.transaction_id.as_str().cmp(transaction_id))
+            else {
+                continue;
+            };
+            let indexed = &index.entries[at];
+            let entry = self.read_record(*first, indexed.offset)?;
+            let matches = entry.sequence == indexed.sequence
+                && matches!(&entry.record, Record::Transaction(tx)
+                    if tx.request.transaction_id == transaction_id
+                        && !matches!(tx.state, TxState::Prepared {}));
+            if !matches {
+                return Err(StoreError::Corrupt(format!(
+                    "index for segment {first} disagrees with its records"
+                )));
+            }
+            return Ok(Some(entry));
+        }
+        Ok(None)
     }
     fn history(&self) -> Result<Vec<Entry>, StoreError> {
         let directory = self.directory_file()?;
         let (_lock, _) = self.lock(false, false)?;
         let (live, live_file) = self.read_live()?;
-        let mut log = self.open_log(false)?;
-        let scan = self.scan(&mut log, 0, 0)?;
-        if scan.valid_end < live.log_offset {
+        let tail = self.tail(0, 0, 0)?;
+        let reaches = (live.segment, live.offset) == (0, 0)
+            || tail
+                .entries
+                .iter()
+                .any(|(_, segment, end)| (*segment, *end) == (live.segment, live.offset));
+        if !reaches {
             return Err(StoreError::Corrupt(
                 "checkpoint refers past the end of the log".into(),
             ));
         }
-        self.sync_read(&[&log, &live_file, &directory])?;
-        Ok(scan.entries.into_iter().map(|(entry, _)| entry).collect())
+        let log = open_directory(&self.log())?;
+        let mut files: Vec<&File> = tail.files.iter().collect();
+        files.extend([&live_file, &log, &directory]);
+        self.sync_read(&files)?;
+        Ok(tail.entries.into_iter().map(|(entry, ..)| entry).collect())
     }
+}
+fn encode_frame(value: &impl Serialize) -> Result<Vec<u8>, StoreError> {
+    let payload = serde_json::to_vec(value).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+    let len = u32::try_from(payload.len()).map_err(|_| StoreError::TooLarge)?;
+    let mut frame = Vec::with_capacity(HEADER + payload.len());
+    frame.extend_from_slice(&len.to_le_bytes());
+    frame.extend_from_slice(&crc32(&payload).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+/// Decode exactly one length- and checksum-framed value.
+fn decode_frame<T: serde::de::DeserializeOwned>(frame: &[u8], max_bytes: u64) -> Option<T> {
+    let header = frame.get(..HEADER)?;
+    let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+    let crc = u32::from_le_bytes(header[4..].try_into().unwrap());
+    let payload = frame.get(HEADER..)?;
+    (len > 0 && len as u64 <= max_bytes && payload.len() == len && crc32(payload) == crc)
+        .then(|| serde_json::from_slice(payload).ok())
+        .flatten()
+}
+fn open_directory(path: &Path) -> Result<File, StoreError> {
+    let dir = File::open(path).map_err(missing)?;
+    if !dir.metadata().map_err(io)?.is_dir() {
+        return Err(StoreError::Io(format!(
+            "{} is not a directory",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    if dir.metadata().map_err(io)?.permissions().mode() & 0o077 != 0 {
+        return Err(StoreError::Io(
+            "store directories must have owner-only permissions (chmod 700)".into(),
+        ));
+    }
+    Ok(dir)
 }
 struct Candidate(PathBuf);
 impl Drop for Candidate {
