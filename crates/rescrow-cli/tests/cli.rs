@@ -70,8 +70,13 @@ impl Case {
             "u",
         ]);
     }
+    /// The whole validated ledger, read through the same file store the CLI uses.
     fn snapshot(&self) -> Snapshot {
-        serde_json::from_slice(&fs::read(self.root.join("store/state.json")).unwrap()).unwrap()
+        rescrow_application::Application::new(
+            rescrow_adapters::file::FileStore::new(self.root.join("store")).unwrap(),
+        )
+        .snapshot()
+        .unwrap()
     }
 }
 impl Drop for Case {

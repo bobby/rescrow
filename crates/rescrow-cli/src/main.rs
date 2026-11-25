@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use rescrow_adapters::file::{FileStore, MAX_SNAPSHOT_BYTES};
+use rescrow_adapters::file::{FileStore, MAX_RECORD_BYTES};
 use rescrow_application::{Application, Category, Code, Error, dto::*};
 use std::{
     fs::File,
@@ -159,10 +159,10 @@ fn run(cli: &Cli) -> Result<Output, Error> {
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Error> {
     let file = File::open(path).map_err(|e| Error::input(format!("{}: {e}", path.display())))?;
     let mut bytes = Vec::new();
-    file.take(MAX_SNAPSHOT_BYTES + 1)
+    file.take(MAX_RECORD_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| Error::input(e.to_string()))?;
-    if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
         return Err(Error::input("input JSON exceeds 16 MiB"));
     }
     serde_json::from_slice(&bytes).map_err(|e| Error::input(format!("{}: {e}", path.display())))

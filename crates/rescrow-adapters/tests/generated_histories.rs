@@ -9,7 +9,7 @@ use proptest::{
     test_runner::{FileFailurePersistence, TestCaseError},
 };
 use rescrow_adapters::memory::{Fault, MemoryStore};
-use rescrow_application::{Application, Category, Code, Error, SnapshotStore, dto};
+use rescrow_application::{Application, Category, Code, Error, dto};
 
 type TestResult = Result<(), TestCaseError>;
 #[derive(Clone, Debug)]
@@ -243,10 +243,13 @@ impl Harness {
             revision: 0,
         }
     }
+    /// A frequent checkpoint interval exercises replay from many positions.
+    fn app(&self) -> Application<MemoryStore> {
+        Application::new(self.store.clone()).with_checkpoint_interval(3)
+    }
     fn snapshot(&self) -> Result<dto::Snapshot, TestCaseError> {
-        self.store
-            .load()
-            .map(|s| s.to_dto())
+        self.app()
+            .snapshot()
             .map_err(|e| TestCaseError::fail(format!("unexpected load error: {e}")))
     }
     fn apply(&mut self, command: Command, effect: Effect, reload: bool) -> TestResult {
@@ -267,7 +270,7 @@ impl Harness {
                 Effect::LostResponse => self.store.inject(Fault::LostResponse),
             }
         }
-        let mut actual = Application::new(self.store.clone()).execute(command.dto());
+        let mut actual = self.app().execute(command.dto());
         if changed && matches!(effect, Effect::BeforePublication | Effect::LostResponse) {
             let error = actual
                 .as_ref()
@@ -293,7 +296,7 @@ impl Harness {
                 prop_assert_eq!(self.snapshot()?, next.snapshot(self.revision + 1));
             }
             // A new host retries the identical command, including rejected admissions.
-            actual = Application::new(self.store.clone()).execute(command.dto());
+            actual = self.app().execute(command.dto());
         }
         let revision = self.revision + u64::from(changed);
         match expected {
@@ -336,9 +339,10 @@ impl Harness {
         if reload {
             // Real typed JSON round trip and inbound validation, without claiming
             // that resetting a memory adapter tests disk/process durability.
-            let encoded = serde_json::to_vec(&observed).unwrap();
-            let decoded: dto::Snapshot = serde_json::from_slice(&encoded).unwrap();
-            self.store.set_raw(decoded);
+            let (checkpoint, entries) = self.store.raw();
+            let encoded = serde_json::to_vec(&(checkpoint.unwrap(), entries)).unwrap();
+            let (checkpoint, entries) = serde_json::from_slice(&encoded).unwrap();
+            self.store.set_raw(checkpoint, entries);
             prop_assert_eq!(self.snapshot()?, expected_snapshot);
         }
         self.model = next;

@@ -1,20 +1,30 @@
-//! Cooperative same-user Linux authority. Path manipulation and network filesystems
-//! are outside this adapter's contract. The lock inode is never replaced or removed.
+//! Cooperative same-user Linux authority: a checkpoint of live state in
+//! `live.json` and an append-only `log` of checksummed records. A synchronized
+//! append is the commit point. Path manipulation and network filesystems are
+//! outside this adapter's contract. The lock inode is never replaced or removed.
 use rescrow_application::{
-    Publication, SnapshotStore, StoreError, ValidatedSnapshot, dto::Snapshot,
+    Loaded, LogStore, Publication, StoreError,
+    dto::{Checkpoint, Entry, Record, State as TxState},
 };
+use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     thread,
     time::{Duration, Instant},
 };
 
-pub const MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
+/// Ceiling for `live.json` and for each encoded log record.
+pub const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
+const LIVE: &str = "live.json";
+const LOG: &str = "log";
+/// The schema-1 snapshot file. Its presence means the store needs migration.
+const LEGACY: &str = "state.json";
+const HEADER: usize = 8;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
 /// Publication checkpoints are exposed only with a caller-supplied hook, for fault
@@ -22,17 +32,44 @@ static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 /// variable can enable a crash in ordinary CLI builds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
+    /// Appending a log record, before any byte is written.
+    BeforeAppend,
+    /// Appending a log record, after half of it is written.
+    DuringAppend,
+    /// Appending a log record, after it is written and synchronized.
+    AppendSynced,
+    /// Replacing `live.json`, before the candidate is written.
     BeforeWrite,
     DuringWrite,
     FileSynced,
     Renamed,
     DirectorySync,
+    /// After any durable change, before reporting success.
     BeforeResponse,
+    /// Synchronizing what a read observed, before returning it.
     ReadSync,
 }
 type Hook = fn(Stage) -> std::io::Result<()>;
 fn no_fault(_: Stage) -> std::io::Result<()> {
     Ok(())
+}
+
+/// Adapter-owned envelope: the checkpoint and the byte offset of the first
+/// log record it does not include.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveFile {
+    log_offset: u64,
+    checkpoint: Checkpoint,
+}
+
+/// Records decoded from one region of the log.
+struct Scan {
+    /// Each entry with the offset just past its record.
+    entries: Vec<(Entry, u64)>,
+    /// End of the last valid record; anything after it is an unacknowledged torn append.
+    valid_end: u64,
+    file_len: u64,
 }
 
 pub struct FileStore {
@@ -64,14 +101,14 @@ impl FileStore {
             directory,
             timeout: Duration::from_secs(2),
             hook: no_fault,
-            max_bytes: MAX_SNAPSHOT_BYTES,
+            max_bytes: MAX_RECORD_BYTES,
         })
     }
-    /// A smaller explicit ceiling is useful for embedded budgets and qualification.
-    /// It applies to reads and to publication including reserved settlement space.
+    /// A smaller explicit ceiling for `live.json` and each log record. Cooperating
+    /// callers should select the same limit for a store.
     pub fn with_size_limit(mut self, bytes: u64) -> Result<Self, StoreError> {
-        if bytes == 0 || bytes > MAX_SNAPSHOT_BYTES {
-            return Err(StoreError::Io("snapshot limit must be 1..=16 MiB".into()));
+        if bytes == 0 || bytes > MAX_RECORD_BYTES {
+            return Err(StoreError::Io("record limit must be 1..=16 MiB".into()));
         }
         self.max_bytes = bytes;
         Ok(self)
@@ -136,54 +173,145 @@ impl FileStore {
             }
         }
     }
-    fn read(&self, directory: &File) -> Result<ValidatedSnapshot, StoreError> {
-        let mut file = File::open(self.directory.join("state.json")).map_err(missing)?;
+    fn read_live(&self) -> Result<(LiveFile, File), StoreError> {
+        let mut file = match File::open(self.directory.join(LIVE)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(if self.directory.join(LEGACY).exists() {
+                    StoreError::Unsupported(1)
+                } else {
+                    StoreError::Missing
+                });
+            }
+            Err(e) => return Err(io(e)),
+        };
         check_file(&file)?;
+        let bytes = self.read_bounded(&mut file)?;
+        let live: LiveFile =
+            serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        Ok((live, file))
+    }
+    fn read_bounded(&self, file: &mut File) -> Result<Vec<u8>, StoreError> {
         if file.metadata().map_err(io)?.len() > self.max_bytes {
             return Err(StoreError::TooLarge);
         }
         let mut bytes = Vec::new();
-        (&mut file)
-            .take(self.max_bytes + 1)
+        file.take(self.max_bytes + 1)
             .read_to_end(&mut bytes)
             .map_err(io)?;
         if bytes.len() as u64 > self.max_bytes {
             return Err(StoreError::TooLarge);
         }
-        // Decode only the version first so unsupported schemas have a distinct error.
-        #[derive(serde::Deserialize)]
-        struct Version {
-            schema_version: u32,
-        }
-        let version: Version =
-            serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-        if version.schema_version != 1 {
-            return Err(StoreError::Unsupported(version.schema_version));
-        }
-        let snapshot: Snapshot =
-            serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
-        let snapshot = ValidatedSnapshot::try_from(snapshot)?;
-        // Complete a previous writer's potentially uncertain rename before confirming
-        // even a read or idempotent retry. Shared locks exclude every publisher.
-        (self.hook)(Stage::ReadSync).map_err(unknown)?;
-        file.sync_all()
-            .map_err(|e| StoreError::Unknown(e.to_string()))?;
-        directory
-            .sync_all()
-            .map_err(|e| StoreError::Unknown(e.to_string()))?;
-        Ok(snapshot)
+        Ok(bytes)
     }
-    fn publish(&self, snapshot: &ValidatedSnapshot, directory: &File) -> Result<(), StoreError> {
-        let encoded = crate::encoding::encode(snapshot)?;
-        if encoded.settlement_bytes > self.max_bytes {
+    fn open_log(&self, write: bool) -> Result<File, StoreError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(write)
+            .open(self.directory.join(LOG))
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    StoreError::Corrupt("log is missing beside live.json".into())
+                }
+                _ => io(e),
+            })?;
+        check_file(&file)?;
+        Ok(file)
+    }
+    /// Decode records from `offset` to the end of the log. An invalid final
+    /// record, or an all-zero remainder, is an unacknowledged torn append.
+    /// Anything else invalid fails closed.
+    fn scan(&self, log: &mut File, offset: u64, sequence: u64) -> Result<Scan, StoreError> {
+        let file_len = log.metadata().map_err(io)?.len();
+        if offset > file_len {
+            return Err(StoreError::Corrupt(
+                "checkpoint refers past the end of the log".into(),
+            ));
+        }
+        log.seek(SeekFrom::Start(offset)).map_err(io)?;
+        let mut bytes = Vec::new();
+        log.read_to_end(&mut bytes).map_err(io)?;
+        let mut scan = Scan {
+            entries: Vec::new(),
+            valid_end: offset,
+            file_len,
+        };
+        let mut at = 0;
+        while at < bytes.len() {
+            let rest = &bytes[at..];
+            let torn = || rest.iter().all(|b| *b == 0);
+            let Some(header) = rest.get(..HEADER) else {
+                break; // incomplete header: torn
+            };
+            let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+            let crc = u32::from_le_bytes(header[4..].try_into().unwrap());
+            if len == 0 || len as u64 > self.max_bytes {
+                if torn() {
+                    break;
+                }
+                return Err(StoreError::Corrupt(format!(
+                    "invalid log record length at byte {}",
+                    offset + at as u64
+                )));
+            }
+            let Some(payload) = rest.get(HEADER..HEADER + len) else {
+                break; // record extends past the end of the file: torn
+            };
+            let last = HEADER + len == rest.len();
+            let decoded = (crc32(payload) == crc)
+                .then(|| serde_json::from_slice::<Entry>(payload).ok())
+                .flatten();
+            let Some(entry) = decoded else {
+                if last || torn() {
+                    break;
+                }
+                return Err(StoreError::Corrupt(format!(
+                    "invalid log record at byte {}",
+                    offset + at as u64
+                )));
+            };
+            let expected = sequence + scan.entries.len() as u64;
+            if entry.sequence != expected {
+                return Err(StoreError::Corrupt(format!(
+                    "log record {} found where {expected} was expected",
+                    entry.sequence
+                )));
+            }
+            at += HEADER + len;
+            scan.valid_end = offset + at as u64;
+            scan.entries.push((entry, scan.valid_end));
+        }
+        Ok(scan)
+    }
+    /// Complete a previous writer's potentially uncertain append or checkpoint
+    /// before confirming even a read or idempotent retry. Shared locks exclude
+    /// every writer.
+    fn sync_read(&self, files: &[&File]) -> Result<(), StoreError> {
+        (self.hook)(Stage::ReadSync).map_err(unknown)?;
+        for file in files {
+            file.sync_all().map_err(unknown)?;
+        }
+        Ok(())
+    }
+    /// Read the checkpoint and the entries after it under a lock the caller holds.
+    fn read(&self, directory: &File) -> Result<(LiveFile, File, Scan), StoreError> {
+        let (live, live_file) = self.read_live()?;
+        let mut log = self.open_log(false)?;
+        let scan = self.scan(&mut log, live.log_offset, live.checkpoint.position)?;
+        self.sync_read(&[&log, &live_file, directory])?;
+        Ok((live, log, scan))
+    }
+    /// Replace `live.json` atomically: write, synchronize, rename, synchronize the directory.
+    fn publish(&self, live: &LiveFile, directory: &File) -> Result<(), StoreError> {
+        let bytes = serde_json::to_vec(live).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        if bytes.len() as u64 > self.max_bytes {
             return Err(StoreError::TooLarge);
         }
-        let bytes = encoded.bytes;
         let (path, mut file) = loop {
             let seq = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
             let path = self
                 .directory
-                .join(format!(".state-{}-{seq}.tmp", std::process::id()));
+                .join(format!(".live-{}-{seq}.tmp", std::process::id()));
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -205,7 +333,7 @@ impl FileStore {
         file.flush().map_err(io)?;
         file.sync_all().map_err(io)?;
         (self.hook)(Stage::FileSynced).map_err(io)?;
-        fs::rename(&candidate.0, self.directory.join("state.json")).map_err(io)?;
+        fs::rename(&candidate.0, self.directory.join(LIVE)).map_err(io)?;
         (self.hook)(Stage::Renamed).map_err(unknown)?;
         (self.hook)(Stage::DirectorySync).map_err(unknown)?;
         directory.sync_all().map_err(unknown)?;
@@ -213,14 +341,11 @@ impl FileStore {
         Ok(())
     }
 }
-impl SnapshotStore for FileStore {
-    fn initialize(&self, empty: &ValidatedSnapshot) -> Result<(), StoreError> {
-        if empty.revision() != 0
-            || !empty.ledger().resources().is_empty()
-            || !empty.ledger().transactions().is_empty()
-        {
+impl LogStore for FileStore {
+    fn initialize(&self, empty: &Checkpoint) -> Result<(), StoreError> {
+        if empty.position != 0 || !empty.resources.is_empty() || !empty.prepared.is_empty() {
             return Err(StoreError::Corrupt(
-                "initial snapshot must be empty at revision zero".into(),
+                "initial checkpoint must be empty at position zero".into(),
             ));
         }
         let mut builder = DirBuilder::new();
@@ -243,44 +368,117 @@ impl SnapshotStore for FileStore {
         .map_err(io)?
         .sync_all()
         .map_err(io)?;
-        match fs::symlink_metadata(self.directory.join("state.json")) {
-            Ok(_) => {
-                self.read(&directory)?;
-                return Err(StoreError::Exists);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io(e)),
+        match self.read(&directory) {
+            Ok(_) => return Err(StoreError::Exists),
+            Err(StoreError::Missing) => {}
+            Err(e) => return Err(e),
         }
         // An existing coordination file with no live state could represent lost
         // authority, not an empty budget. Even explicit init must fail closed.
         if !created_lock {
             return Err(StoreError::Missing);
         }
-        self.publish(empty, &directory)
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        options
+            .open(self.directory.join(LOG))
+            .map_err(io)?
+            .sync_all()
+            .map_err(io)?;
+        self.publish(
+            &LiveFile {
+                log_offset: 0,
+                checkpoint: empty.clone(),
+            },
+            &directory,
+        )
     }
-    fn load(&self) -> Result<ValidatedSnapshot, StoreError> {
+    fn load(&self) -> Result<Loaded, StoreError> {
         let directory = self.directory_file()?;
         let (_lock, _) = self.lock(false, false)?;
-        self.read(&directory)
+        let (live, _, scan) = self.read(&directory)?;
+        Ok(Loaded {
+            checkpoint: live.checkpoint,
+            tail: scan.entries.into_iter().map(|(entry, _)| entry).collect(),
+        })
     }
-    fn replace(
-        &self,
-        expected: u64,
-        candidate: &ValidatedSnapshot,
-    ) -> Result<Publication, StoreError> {
+    fn append(&self, entry: &Entry) -> Result<Publication, StoreError> {
         let directory = self.directory_file()?;
         let (_lock, _) = self.lock(true, false)?;
-        let current = self.read(&directory)?;
-        if current.revision() != expected {
+        let (live, _, scan) = self.read(&directory)?;
+        if entry.sequence != live.checkpoint.position + scan.entries.len() as u64 {
             return Ok(Publication::Conflict);
         }
-        if expected.checked_add(1) != Some(candidate.revision()) {
+        let payload = serde_json::to_vec(entry).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        if payload.len() as u64 > self.max_bytes {
+            return Err(StoreError::TooLarge);
+        }
+        let mut frame = Vec::with_capacity(HEADER + payload.len());
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        frame.extend_from_slice(&crc32(&payload).to_le_bytes());
+        frame.extend_from_slice(&payload);
+        let mut log = self.open_log(true)?;
+        // Remove an earlier writer's unacknowledged torn append before writing after it.
+        if scan.file_len > scan.valid_end {
+            log.set_len(scan.valid_end).map_err(io)?;
+            log.sync_all().map_err(io)?;
+        }
+        (self.hook)(Stage::BeforeAppend).map_err(io)?;
+        log.seek(SeekFrom::Start(scan.valid_end)).map_err(io)?;
+        let mid = frame.len() / 2;
+        log.write_all(&frame[..mid]).map_err(io)?;
+        (self.hook)(Stage::DuringAppend).map_err(io)?;
+        log.write_all(&frame[mid..]).map_err(io)?;
+        // Once every byte is written, a failed synchronization may still have persisted it.
+        log.sync_all().map_err(unknown)?;
+        (self.hook)(Stage::AppendSynced).map_err(unknown)?;
+        (self.hook)(Stage::BeforeResponse).map_err(unknown)?;
+        Ok(Publication::Applied)
+    }
+    fn checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), StoreError> {
+        let directory = self.directory_file()?;
+        let (_lock, _) = self.lock(true, false)?;
+        let (live, _, scan) = self.read(&directory)?;
+        let Some(covered) = checkpoint.position.checked_sub(live.checkpoint.position) else {
+            return Ok(());
+        };
+        if covered == 0 {
+            return Ok(());
+        }
+        let (_, log_offset) = *scan
+            .entries
+            .get(covered as usize - 1)
+            .ok_or_else(|| StoreError::Corrupt("checkpoint is past the end of the log".into()))?;
+        self.publish(
+            &LiveFile {
+                log_offset,
+                checkpoint: checkpoint.clone(),
+            },
+            &directory,
+        )
+    }
+    fn find(&self, transaction_id: &str) -> Result<Option<Entry>, StoreError> {
+        Ok(self.history()?.into_iter().rev().find(|entry| {
+            matches!(&entry.record, Record::Transaction(tx)
+                if tx.request.transaction_id == transaction_id
+                    && !matches!(tx.state, TxState::Prepared {}))
+        }))
+    }
+    fn history(&self) -> Result<Vec<Entry>, StoreError> {
+        let directory = self.directory_file()?;
+        let (_lock, _) = self.lock(false, false)?;
+        let (live, live_file) = self.read_live()?;
+        let mut log = self.open_log(false)?;
+        let scan = self.scan(&mut log, 0, 0)?;
+        if scan.valid_end < live.log_offset {
             return Err(StoreError::Corrupt(
-                "candidate revision must advance exactly once".into(),
+                "checkpoint refers past the end of the log".into(),
             ));
         }
-        self.publish(candidate, &directory)?;
-        Ok(Publication::Applied)
+        self.sync_read(&[&log, &live_file, &directory])?;
+        Ok(scan.entries.into_iter().map(|(entry, _)| entry).collect())
     }
 }
 struct Candidate(PathBuf);
@@ -288,6 +486,18 @@ impl Drop for Candidate {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
     }
+}
+/// CRC-32 (IEEE 802.3), bitwise. Detects torn and corrupted records; it is not
+/// a cryptographic integrity check.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    !crc
 }
 fn check_file(file: &File) -> Result<(), StoreError> {
     let metadata = file.metadata().map_err(io)?;

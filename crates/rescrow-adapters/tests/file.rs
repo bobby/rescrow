@@ -1,9 +1,9 @@
 #![cfg(target_os = "linux")]
-use rescrow_adapters::file::{FileStore, MAX_SNAPSHOT_BYTES, Stage};
-use rescrow_application::{Application, Category, Publication, SnapshotStore, StoreError, dto::*};
+use rescrow_adapters::file::{FileStore, MAX_RECORD_BYTES, Stage};
+use rescrow_application::{Application, Category, Code, LogStore, Publication, StoreError, dto::*};
 use std::{
     fs::{self, File},
-    io,
+    io::{self, Write},
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::PathBuf,
     process::Command as Process,
@@ -29,14 +29,28 @@ impl Temp {
     fn store(&self) -> PathBuf {
         self.0.join("store")
     }
+    fn app(&self) -> Application<FileStore> {
+        Application::new(FileStore::new(self.store()).unwrap())
+    }
+    fn snapshot(&self) -> Snapshot {
+        self.app().snapshot().unwrap()
+    }
+    fn append_bytes(&self, bytes: &[u8]) {
+        File::options()
+            .append(true)
+            .open(self.store().join("log"))
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
 }
 impl Drop for Temp {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-fn create() -> rescrow_application::dto::Command {
-    rescrow_application::dto::Command::CreateResource(ResourceSpec {
+fn create() -> Command {
+    Command::CreateResource(ResourceSpec {
         resource_id: "r".into(),
         lower: "0".into(),
         upper: Some("10".into()),
@@ -45,9 +59,9 @@ fn create() -> rescrow_application::dto::Command {
         scale: 0,
     })
 }
-fn prepare() -> rescrow_application::dto::Command {
-    rescrow_application::dto::Command::Prepare(Prepare {
-        transaction_id: "t".into(),
+fn prepare_as(id: &str) -> Command {
+    Command::Prepare(Prepare {
+        transaction_id: id.into(),
         operations: vec![Operation {
             operation_id: "o".into(),
             resource_id: "r".into(),
@@ -55,26 +69,34 @@ fn prepare() -> rescrow_application::dto::Command {
         }],
     })
 }
+fn prepare() -> Command {
+    prepare_as("t")
+}
+fn commit() -> Command {
+    Command::Commit(Commit {
+        transaction_id: "t".into(),
+        actuals: None,
+    })
+}
 fn ready(temp: &Temp) -> FileStore {
-    let store = FileStore::new(temp.store()).unwrap();
-    let app = Application::new(FileStore::new(temp.store()).unwrap());
+    let app = temp.app();
     app.initialize().unwrap();
     app.execute(create()).unwrap();
-    store
+    FileStore::new(temp.store()).unwrap()
 }
 #[test]
 fn initialize_permissions_missing_files_and_stable_lock_inode() {
     let temp = Temp::new();
     let store = FileStore::new(temp.store()).unwrap();
     assert_eq!(store.load().unwrap_err(), StoreError::Missing);
-    let app = Application::new(FileStore::new(temp.store()).unwrap());
+    let app = temp.app();
     app.initialize().unwrap();
     let lock = fs::metadata(temp.store().join("state.lock")).unwrap().ino();
     assert_eq!(
         fs::metadata(temp.store()).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    for name in ["state.json", "state.lock"] {
+    for name in ["live.json", "log", "state.lock"] {
         assert_eq!(
             fs::metadata(temp.store().join(name))
                 .unwrap()
@@ -84,81 +106,127 @@ fn initialize_permissions_missing_files_and_stable_lock_inode() {
             0o600
         );
     }
-    assert_eq!(
-        app.initialize().unwrap_err().code,
-        rescrow_application::Code::AlreadyInitialized
-    );
+    assert_eq!(app.initialize().unwrap_err().code, Code::AlreadyInitialized);
     app.execute(create()).unwrap();
     app.execute(prepare()).unwrap();
     assert_eq!(
         fs::metadata(temp.store().join("state.lock")).unwrap().ino(),
         lock
     );
-    fs::remove_file(temp.store().join("state.json")).unwrap();
-    fs::write(temp.store().join(".state-orphan.tmp"), b"not a snapshot").unwrap();
+    fs::remove_file(temp.store().join("live.json")).unwrap();
+    fs::write(temp.store().join(".live-orphan.tmp"), b"not a checkpoint").unwrap();
     assert_eq!(store.load().unwrap_err(), StoreError::Missing);
-    assert!(temp.store().join(".state-orphan.tmp").exists());
-    assert_eq!(
-        app.initialize().unwrap_err().code,
-        rescrow_application::Code::MissingStore
-    );
-    assert!(!temp.store().join("state.json").exists());
+    assert!(temp.store().join(".live-orphan.tmp").exists());
+    assert_eq!(app.initialize().unwrap_err().code, Code::MissingStore);
+    assert!(!temp.store().join("live.json").exists());
 }
 #[test]
-fn stale_revision_corrupt_unsupported_truncated_and_oversized_fail_closed() {
+fn stale_position_conflicts_and_invalid_live_state_fails_closed() {
     let temp = Temp::new();
     let store = ready(&temp);
-    let old = store.load().unwrap().to_dto();
-    Application::new(FileStore::new(temp.store()).unwrap())
-        .execute(prepare())
-        .unwrap();
-    assert_eq!(
-        store
-            .replace(
-                old.revision,
-                &Snapshot {
-                    revision: old.revision + 1,
-                    ..old.clone()
-                }
-                .try_into()
-                .unwrap()
-            )
-            .unwrap(),
-        Publication::Conflict
-    );
-    let good = store.load().unwrap().to_dto();
-    for bytes in [b"{".to_vec(), b"{\"schema_version\":99}".to_vec(), {
-        let mut bad = good.clone();
-        bad.resources[0].quantity = "6".into();
-        serde_json::to_vec(&bad).unwrap()
-    }] {
-        fs::write(temp.store().join("state.json"), &bytes).unwrap();
-        assert!(matches!(
-            store.load(),
-            Err(StoreError::Corrupt(_) | StoreError::Unsupported(99))
-        ));
-        assert_eq!(fs::read(temp.store().join("state.json")).unwrap(), bytes);
+    let old = store.load().unwrap();
+    temp.app().execute(prepare()).unwrap();
+    let stale = Entry {
+        sequence: old.checkpoint.position + old.tail.len() as u64,
+        record: Record::ResourceCreated(ResourceSpec {
+            resource_id: "other".into(),
+            lower: "0".into(),
+            upper: None,
+            initial: "0".into(),
+            unit: "u".into(),
+            scale: 0,
+        }),
+    };
+    assert_eq!(store.append(&stale).unwrap(), Publication::Conflict);
+    let good = temp.snapshot();
+    let live = fs::read(temp.store().join("live.json")).unwrap();
+    for bytes in [b"{".to_vec(), b"{\"log_offset\":999999,\"checkpoint\":{\"schema_version\":2,\"position\":0,\"resources\":[],\"prepared\":[]}}".to_vec()] {
+        fs::write(temp.store().join("live.json"), &bytes).unwrap();
+        assert!(matches!(store.load(), Err(StoreError::Corrupt(_))));
+        assert_eq!(fs::read(temp.store().join("live.json")).unwrap(), bytes);
     }
-    let file = File::options()
+    let unsupported = String::from_utf8(live.clone())
+        .unwrap()
+        .replace("\"schema_version\":2", "\"schema_version\":99");
+    fs::write(temp.store().join("live.json"), unsupported).unwrap();
+    assert_eq!(
+        temp.app().execute(Command::ListResources).unwrap_err().code,
+        Code::UnsupportedSchema
+    );
+    File::options()
         .write(true)
-        .open(temp.store().join("state.json"))
+        .open(temp.store().join("live.json"))
+        .unwrap()
+        .set_len(MAX_RECORD_BYTES + 1)
         .unwrap();
-    file.set_len(MAX_SNAPSHOT_BYTES + 1).unwrap();
     assert_eq!(store.load().unwrap_err(), StoreError::TooLarge);
-    fs::write(
+    fs::write(temp.store().join("live.json"), &live).unwrap();
+    assert_eq!(temp.snapshot(), good);
+    // A schema-1 store is recognized rather than treated as missing.
+    fs::rename(
+        temp.store().join("live.json"),
         temp.store().join("state.json"),
-        serde_json::to_vec(&good).unwrap(),
     )
     .unwrap();
-    assert_eq!(store.load().unwrap().to_dto(), good);
-    let bad_revision = Snapshot {
-        revision: good.revision,
-        ..good.clone()
-    };
-    assert!(matches!(
-        store.replace(good.revision, &bad_revision.try_into().unwrap()),
-        Err(StoreError::Corrupt(_))
-    ));
+    assert_eq!(store.load().unwrap_err(), StoreError::Unsupported(1));
+    assert_eq!(
+        temp.app().initialize().unwrap_err().code,
+        Code::UnsupportedSchema
+    );
+}
+#[test]
+fn torn_appends_are_ignored_and_truncated_but_earlier_corruption_fails_closed() {
+    let temp = Temp::new();
+    ready(&temp);
+    let before = temp.snapshot();
+    // A partial record: header claims more bytes than were written.
+    let mut torn = 100u32.to_le_bytes().to_vec();
+    torn.extend_from_slice(&[0, 0, 0, 0, b'{', b'"']);
+    temp.append_bytes(&torn);
+    assert_eq!(temp.snapshot(), before);
+    temp.app().execute(prepare()).unwrap();
+    // A zero-filled extension, as after a crash before data reached the device.
+    temp.append_bytes(&[0; 32]);
+    assert_eq!(temp.snapshot().resources[0].reserved_down, "3");
+    temp.app().execute(commit()).unwrap();
+    let committed = temp.snapshot();
+    assert_eq!(committed.resources[0].quantity, "2");
+    assert_eq!(committed.revision, 3);
+    // Corruption inside an acknowledged record followed by later records is not a torn append.
+    let path = temp.store().join("log");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[12] ^= 0x20;
+    fs::write(&path, &bytes).unwrap();
+    assert_eq!(
+        temp.app().execute(Command::ListResources).unwrap_err().code,
+        Code::CorruptState
+    );
+}
+#[test]
+fn checkpoints_bound_replay_and_agree_with_history() {
+    let temp = Temp::new();
+    ready(&temp);
+    let app = Application::new(FileStore::new(temp.store()).unwrap()).with_checkpoint_interval(2);
+    for index in 0..5 {
+        let id = format!("t{index}");
+        app.execute(prepare_as(&id)).unwrap();
+        app.execute(Command::Abort { transaction_id: id }).unwrap();
+    }
+    let loaded = FileStore::new(temp.store()).unwrap().load().unwrap();
+    assert!(loaded.checkpoint.position >= 9);
+    assert!(loaded.tail.len() < 2);
+    let snapshot = temp.snapshot();
+    assert_eq!(snapshot.revision, 11);
+    assert_eq!(snapshot.transactions.len(), 5);
+    // Replays of transactions older than the checkpoint still find their decision.
+    assert_eq!(
+        app.execute(Command::Abort {
+            transaction_id: "t0".into()
+        })
+        .unwrap(),
+        Output::Transaction(snapshot.transactions[0].clone())
+    );
+    assert_eq!(temp.snapshot(), snapshot);
 }
 #[test]
 fn contention_has_a_deadline_and_permission_errors_preserve_state() {
@@ -173,42 +241,40 @@ fn contention_has_a_deadline_and_permission_errors_preserve_state() {
     let now = Instant::now();
     assert_eq!(store.load().unwrap_err(), StoreError::Contention);
     assert!(now.elapsed() < Duration::from_secs(1));
-    assert_eq!(
-        store
-            .replace(
-                1,
-                &Snapshot {
-                    revision: 2,
-                    ..Snapshot::from_ledger(&Default::default(), 1)
-                }
-                .try_into()
-                .unwrap()
-            )
-            .unwrap_err(),
-        StoreError::Contention
-    );
+    let entry = Entry {
+        sequence: 1,
+        record: Record::ResourceCreated(ResourceSpec {
+            resource_id: "other".into(),
+            lower: "0".into(),
+            upper: None,
+            initial: "0".into(),
+            unit: "u".into(),
+            scale: 0,
+        }),
+    };
+    assert_eq!(store.append(&entry).unwrap_err(), StoreError::Contention);
     drop(lock);
-    let good = store.load().unwrap().to_dto();
-    fs::set_permissions(
-        temp.store().join("state.json"),
-        fs::Permissions::from_mode(0o644),
-    )
-    .unwrap();
-    assert!(matches!(store.load(), Err(StoreError::Io(_))));
-    fs::set_permissions(
-        temp.store().join("state.json"),
-        fs::Permissions::from_mode(0o600),
-    )
-    .unwrap();
-    // No write permission on the directory causes an actual pre-publication I/O
-    // failure for ordinary users. Root bypasses DAC and is tested separately below.
-    fs::set_permissions(temp.store(), fs::Permissions::from_mode(0o500)).unwrap();
-    let attempt = Application::new(FileStore::new(temp.store()).unwrap()).execute(prepare());
-    fs::set_permissions(temp.store(), fs::Permissions::from_mode(0o700)).unwrap();
+    let good = temp.snapshot();
+    for name in ["live.json", "log"] {
+        let path = temp.store().join(name);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(store.load(), Err(StoreError::Io(_))));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    // A read-only log causes an actual pre-append I/O failure for ordinary users.
+    // Root bypasses DAC, so the attempt may then succeed.
+    let log = temp.store().join("log");
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o400)).unwrap();
+    let attempt = temp.app().execute(prepare());
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o600)).unwrap();
     if attempt.is_err() {
-        assert_eq!(store.load().unwrap().to_dto(), good);
+        assert_eq!(temp.snapshot(), good);
     } else {
-        assert_eq!(std::env::var("USER").as_deref(), Ok("root"));
+        let status = fs::read_to_string("/proc/self/status").unwrap();
+        assert!(
+            status.lines().any(|l| l.starts_with("Uid:\t0\t")),
+            "only root may bypass a read-only log"
+        );
     }
 }
 fn hook(stage: Stage) -> io::Result<()> {
@@ -229,7 +295,10 @@ fn child_worker() {
     let Ok(path) = std::env::var("RESCROW_TEST_STORE") else {
         return;
     };
-    let app = Application::new(FileStore::new(path).unwrap().with_fault_hook(hook));
+    let mut app = Application::new(FileStore::new(path).unwrap().with_fault_hook(hook));
+    if std::env::var("RESCROW_TEST_CHECKPOINT").is_ok() {
+        app = app.with_checkpoint_interval(1);
+    }
     let result = if std::env::var("RESCROW_TEST_ACTION").as_deref() == Ok("init") {
         app.initialize().map(|()| Output::Initialized)
     } else {
@@ -238,111 +307,140 @@ fn child_worker() {
     let expected = std::env::var("RESCROW_TEST_EXPECT").unwrap();
     match expected.as_str() {
         "unknown" => assert_eq!(result.unwrap_err().category, Category::UnknownOutcome),
-        "io" => assert_eq!(result.unwrap_err().code, rescrow_application::Code::Io),
+        "io" => assert_eq!(result.unwrap_err().code, Code::Io),
+        "ok" => {
+            result.unwrap();
+        }
         _ => panic!("invalid expectation"),
     }
 }
-fn child(temp: &Temp, stage: Stage, mode: &str) -> std::process::Child {
-    let post = matches!(
-        stage,
-        Stage::Renamed | Stage::DirectorySync | Stage::BeforeResponse | Stage::ReadSync
-    );
-    Process::new(std::env::current_exe().unwrap())
+/// Stages after which an append may have taken effect.
+fn appended(stage: Stage) -> bool {
+    matches!(stage, Stage::AppendSynced | Stage::BeforeResponse)
+}
+fn child(temp: &Temp, stage: Stage, mode: &str, expect: &str) -> std::process::Child {
+    let mut process = Process::new(std::env::current_exe().unwrap());
+    process
         .args(["--exact", "child_worker", "--nocapture"])
         .env("RESCROW_TEST_STORE", temp.store())
         .env("RESCROW_TEST_STAGE", format!("{stage:?}"))
         .env("RESCROW_TEST_MODE", mode)
         .env("RESCROW_TEST_MARKER", temp.0.join("reached"))
-        .env("RESCROW_TEST_EXPECT", if post { "unknown" } else { "io" })
-        .stdout(std::process::Stdio::null())
-        .spawn()
-        .unwrap()
+        .env("RESCROW_TEST_EXPECT", expect)
+        .stdout(std::process::Stdio::null());
+    if expect == "ok" {
+        process.env("RESCROW_TEST_CHECKPOINT", "1");
+    }
+    process.spawn().unwrap()
+}
+fn kill_at(temp: &Temp, stage: Stage, expect: &str) {
+    let mut child = child(temp, stage, "kill", expect);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !temp.0.join("reached").exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("child exited early: {status}");
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("stage timeout at {stage:?}");
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+/// After a failure, the same and later commands complete exactly once.
+fn finish(temp: &Temp) {
+    let app = temp.app();
+    app.execute(prepare()).unwrap();
+    app.execute(commit()).unwrap();
+    let committed = temp.snapshot();
+    app.execute(commit()).unwrap();
+    assert_eq!(temp.snapshot(), committed);
+    assert_eq!(committed.resources[0].quantity, "2");
+    assert_eq!(committed.revision, 3);
 }
 #[test]
-fn kill_at_publication_boundaries_exposes_complete_old_or_new_state() {
+fn kill_at_append_boundaries_exposes_old_or_new_log() {
     for stage in [
-        Stage::BeforeWrite,
-        Stage::DuringWrite,
-        Stage::FileSynced,
-        Stage::Renamed,
+        Stage::BeforeAppend,
+        Stage::DuringAppend,
+        Stage::AppendSynced,
         Stage::BeforeResponse,
     ] {
         let temp = Temp::new();
-        let store = ready(&temp);
-        let old = store.load().unwrap().to_dto();
-        let mut child = child(&temp, stage, "kill");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !temp.0.join("reached").exists() {
-            if let Some(status) = child.try_wait().unwrap() {
-                panic!("child exited early: {status}");
-            }
-            if Instant::now() > deadline {
-                child.kill().unwrap();
-                child.wait().unwrap();
-                panic!("checkpoint timeout at {stage:?}");
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        child.kill().unwrap();
-        child.wait().unwrap();
-        let next = store.load().unwrap().to_dto(); // also proves the OS released the killed owner's lock
-        if matches!(stage, Stage::Renamed | Stage::BeforeResponse) {
+        ready(&temp);
+        let old = temp.snapshot();
+        let expect = if appended(stage) { "unknown" } else { "io" };
+        kill_at(&temp, stage, expect);
+        // Loading also proves the OS released the killed owner's lock.
+        let next = temp.snapshot();
+        if appended(stage) {
             assert_eq!(next.transactions.len(), 1);
             assert_eq!(next.resources[0].reserved_down, "3");
         } else {
             assert_eq!(next, old);
         }
-        let app = Application::new(FileStore::new(temp.store()).unwrap());
-        app.execute(prepare()).unwrap();
-        app.execute(rescrow_application::dto::Command::Commit(Commit {
-            transaction_id: "t".into(),
-            actuals: None,
-        }))
-        .unwrap();
-        let committed = store.load().unwrap().to_dto();
-        app.execute(rescrow_application::dto::Command::Commit(Commit {
-            transaction_id: "t".into(),
-            actuals: None,
-        }))
-        .unwrap();
-        assert_eq!(store.load().unwrap().to_dto(), committed);
-        assert_eq!(committed.resources[0].quantity, "2");
+        finish(&temp);
     }
 }
 #[test]
-fn injected_io_and_directory_sync_failures_preserve_replay_identity() {
+fn injected_append_and_read_failures_preserve_replay_identity() {
+    for stage in [
+        Stage::BeforeAppend,
+        Stage::DuringAppend,
+        Stage::AppendSynced,
+        Stage::BeforeResponse,
+        Stage::ReadSync,
+    ] {
+        let temp = Temp::new();
+        ready(&temp);
+        let old = temp.snapshot();
+        let expect = if appended(stage) || stage == Stage::ReadSync {
+            "unknown"
+        } else {
+            "io"
+        };
+        assert!(
+            child(&temp, stage, "error", expect)
+                .wait()
+                .unwrap()
+                .success()
+        );
+        let next = temp.snapshot();
+        if appended(stage) {
+            assert_eq!(next.transactions.len(), 1);
+        } else {
+            assert_eq!(next, old);
+        }
+        finish(&temp);
+    }
+}
+#[test]
+fn checkpoint_failures_never_lose_or_repeat_appended_records() {
     for stage in [
         Stage::BeforeWrite,
         Stage::DuringWrite,
         Stage::FileSynced,
         Stage::Renamed,
         Stage::DirectorySync,
-        Stage::BeforeResponse,
-        Stage::ReadSync,
     ] {
-        let temp = Temp::new();
-        let store = ready(&temp);
-        let old = store.load().unwrap().to_dto();
-        assert!(child(&temp, stage, "error").wait().unwrap().success());
-        let next = store.load().unwrap().to_dto();
-        if matches!(
-            stage,
-            Stage::Renamed | Stage::DirectorySync | Stage::BeforeResponse
-        ) {
-            assert_eq!(next.transactions.len(), 1);
-        } else {
-            assert_eq!(next, old);
+        for mode in ["error", "kill"] {
+            let temp = Temp::new();
+            ready(&temp);
+            if mode == "kill" {
+                kill_at(&temp, stage, "ok");
+            } else {
+                assert!(child(&temp, stage, mode, "ok").wait().unwrap().success());
+            }
+            let next = temp.snapshot();
+            assert_eq!(next.transactions.len(), 1, "{stage:?} {mode}");
+            assert_eq!(next.revision, 2);
+            finish(&temp);
         }
-        Application::new(FileStore::new(temp.store()).unwrap())
-            .execute(prepare())
-            .unwrap();
-        assert_eq!(
-            store.load().unwrap().to_dto().resources[0].reserved_down,
-            "3"
-        );
     }
 }
-
 #[test]
 fn initialization_failures_never_reset_a_missing_or_published_authority() {
     for stage in [
@@ -353,12 +451,11 @@ fn initialization_failures_never_reset_a_missing_or_published_authority() {
         Stage::BeforeResponse,
     ] {
         let temp = Temp::new();
-        let mut process = Process::new(std::env::current_exe().unwrap());
         let post = matches!(
             stage,
             Stage::Renamed | Stage::DirectorySync | Stage::BeforeResponse
         );
-        let status = process
+        let status = Process::new(std::env::current_exe().unwrap())
             .args(["--exact", "child_worker", "--nocapture"])
             .env("RESCROW_TEST_STORE", temp.store())
             .env("RESCROW_TEST_ACTION", "init")
@@ -370,28 +467,21 @@ fn initialization_failures_never_reset_a_missing_or_published_authority() {
             .unwrap();
         assert!(status.success());
         let store = FileStore::new(temp.store()).unwrap();
-        let app = Application::new(FileStore::new(temp.store()).unwrap());
+        let app = temp.app();
         if post {
-            let snapshot = store.load().unwrap().to_dto();
+            let snapshot = temp.snapshot();
             assert_eq!(snapshot.revision, 0);
             assert!(snapshot.resources.is_empty() && snapshot.transactions.is_empty());
-            assert_eq!(
-                app.initialize().unwrap_err().code,
-                rescrow_application::Code::AlreadyInitialized
-            );
-            assert_eq!(store.load().unwrap().to_dto(), snapshot);
+            assert_eq!(app.initialize().unwrap_err().code, Code::AlreadyInitialized);
+            assert_eq!(temp.snapshot(), snapshot);
         } else {
             assert_eq!(store.load().unwrap_err(), StoreError::Missing);
-            assert_eq!(
-                app.initialize().unwrap_err().code,
-                rescrow_application::Code::MissingStore
-            );
+            assert_eq!(app.initialize().unwrap_err().code, Code::MissingStore);
         }
     }
 }
-
 #[test]
-fn readers_share_the_lock_and_exclude_publishers() {
+fn readers_share_the_lock_and_exclude_writers() {
     let temp = Temp::new();
     let store = ready(&temp).with_lock_timeout(Duration::from_millis(30));
     let lock = File::options()
@@ -400,21 +490,19 @@ fn readers_share_the_lock_and_exclude_publishers() {
         .open(temp.store().join("state.lock"))
         .unwrap();
     lock.lock_shared().unwrap();
-    let current = store.load().unwrap().to_dto();
-    assert_eq!(
-        store
-            .replace(
-                current.revision,
-                &Snapshot {
-                    revision: current.revision + 1,
-                    ..current.clone()
-                }
-                .try_into()
-                .unwrap()
-            )
-            .unwrap_err(),
-        StoreError::Contention
-    );
+    let current = store.load().unwrap();
+    let entry = Entry {
+        sequence: current.checkpoint.position + current.tail.len() as u64,
+        record: Record::ResourceCreated(ResourceSpec {
+            resource_id: "other".into(),
+            lower: "0".into(),
+            upper: None,
+            initial: "0".into(),
+            unit: "u".into(),
+            scale: 0,
+        }),
+    };
+    assert_eq!(store.append(&entry).unwrap_err(), StoreError::Contention);
     drop(lock);
-    assert_eq!(store.load().unwrap().to_dto(), current);
+    assert_eq!(store.load().unwrap(), current);
 }
