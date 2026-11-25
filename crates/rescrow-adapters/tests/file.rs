@@ -51,6 +51,16 @@ impl Drop for Temp {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
+/// Every request in this process is created at its start, or at its parent's
+/// for a child worker, so retries match.
+fn created() -> u64 {
+    static CREATED: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+        std::env::var("RESCROW_TEST_CREATED")
+            .map(|v| v.parse().unwrap())
+            .unwrap_or_else(|_| rescrow_application::system_clock())
+    });
+    *CREATED
+}
 fn create() -> Command {
     Command::CreateResource(ResourceSpec {
         resource_id: "r".into(),
@@ -61,7 +71,31 @@ fn create() -> Command {
         scale: 0,
     })
 }
-fn prepare_as(id: &str) -> Command {
+/// The UUIDv7 a test names `name`, created at `millis`.
+fn tx_at(name: &str, millis: u64) -> String {
+    let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    rescrow_application::uuid_v7(millis, hash.into())
+}
+/// The UUIDv7 a test names `name`, created when the test process started.
+fn tx(name: &str) -> String {
+    tx_at(name, created())
+}
+/// The transaction a test named `name`.
+fn named(snapshot: &Snapshot, name: &str) -> Transaction {
+    let id = tx(name);
+    snapshot
+        .transactions
+        .iter()
+        .find(|t| t.request.transaction_id == id)
+        .unwrap()
+        .clone()
+}
+fn prepare_as(name: &str) -> Command {
+    prepare_raw(&tx(name))
+}
+fn prepare_raw(id: &str) -> Command {
     Command::Prepare(Prepare {
         transaction_id: id.into(),
         operations: vec![Operation {
@@ -76,7 +110,7 @@ fn prepare() -> Command {
 }
 fn commit() -> Command {
     Command::Commit(Commit {
-        transaction_id: "t".into(),
+        transaction_id: tx("t"),
         actuals: None,
     })
 }
@@ -138,6 +172,7 @@ fn stale_position_conflicts_and_invalid_live_state_fails_closed() {
     temp.app().execute(prepare()).unwrap();
     let stale = Entry {
         sequence: old.checkpoint.position + old.tail.len() as u64,
+        recorded_at_ms: rescrow_application::system_clock(),
         record: Record::ResourceCreated(ResourceSpec {
             resource_id: "other".into(),
             lower: "0".into(),
@@ -220,7 +255,10 @@ fn checkpoints_bound_replay_and_agree_with_history() {
     for index in 0..5 {
         let id = format!("t{index}");
         app.execute(prepare_as(&id)).unwrap();
-        app.execute(Command::Abort { transaction_id: id }).unwrap();
+        app.execute(Command::Abort {
+            transaction_id: tx(&id),
+        })
+        .unwrap();
     }
     let loaded = FileStore::new(temp.store()).unwrap().load().unwrap();
     assert!(loaded.checkpoint.position >= 9);
@@ -231,10 +269,10 @@ fn checkpoints_bound_replay_and_agree_with_history() {
     // Replays of transactions older than the checkpoint still find their decision.
     assert_eq!(
         app.execute(Command::Abort {
-            transaction_id: "t0".into()
+            transaction_id: tx("t0")
         })
         .unwrap(),
-        Output::Transaction(snapshot.transactions[0].clone())
+        Output::Transaction(named(&snapshot, "t0"))
     );
     assert_eq!(temp.snapshot(), snapshot);
 }
@@ -253,6 +291,7 @@ fn contention_has_a_deadline_and_permission_errors_preserve_state() {
     assert!(now.elapsed() < Duration::from_secs(1));
     let entry = Entry {
         sequence: 1,
+        recorded_at_ms: rescrow_application::system_clock(),
         record: Record::ResourceCreated(ResourceSpec {
             resource_id: "other".into(),
             lower: "0".into(),
@@ -347,6 +386,7 @@ fn child(temp: &Temp, stage: Stage, mode: &str, expect: &str) -> std::process::C
         .env("RESCROW_TEST_MODE", mode)
         .env("RESCROW_TEST_MARKER", temp.0.join("reached"))
         .env("RESCROW_TEST_EXPECT", expect)
+        .env("RESCROW_TEST_CREATED", created().to_string())
         .stdout(std::process::Stdio::null());
     if expect == "ok" {
         process.env("RESCROW_TEST_CHECKPOINT", "1");
@@ -515,6 +555,7 @@ fn readers_share_the_lock_and_exclude_writers() {
     let current = store.load().unwrap();
     let entry = Entry {
         sequence: current.checkpoint.position + current.tail.len() as u64,
+        recorded_at_ms: rescrow_application::system_clock(),
         record: Record::ResourceCreated(ResourceSpec {
             resource_id: "other".into(),
             lower: "0".into(),
@@ -570,12 +611,12 @@ fn sealed_segments_keep_old_decisions_findable_through_indexes() {
     assert_eq!(indexes(&temp).len(), segments - 1);
     // A decision far behind the checkpoint is found through a sealed index.
     let store = FileStore::new(temp.store()).unwrap();
-    let found = store.find("t0").unwrap().unwrap();
+    let found = store.find(&tx("t0"), 0).unwrap().unwrap();
     assert_eq!(found.sequence, 2);
-    assert!(store.find("missing").unwrap().is_none());
+    assert!(store.find(&tx("missing"), 0).unwrap().is_none());
     assert_eq!(
         app.execute(commit_as("t0", "0")).unwrap(),
-        Output::Transaction(snapshot.transactions[0].clone())
+        Output::Transaction(named(&snapshot, "t0"))
     );
     assert_eq!(
         app.execute(commit_as("t0", "-1")).unwrap_err().code,
@@ -659,7 +700,10 @@ fn interrupted_sealing_resumes_without_losing_or_repeating_records() {
         finish(&temp);
     }
 }
-fn commit_as(id: &str, delta: &str) -> Command {
+fn commit_as(name: &str, delta: &str) -> Command {
+    commit_raw(&tx(name), delta)
+}
+fn commit_raw(id: &str, delta: &str) -> Command {
     Command::Commit(Commit {
         transaction_id: id.into(),
         actuals: Some(vec![Actual {
@@ -812,7 +856,7 @@ fn writes_and_point_reads_do_not_grow_with_history() {
     app.execute(prepare_as("small")).unwrap();
     let write_small = log() - before;
     app.execute(Command::Abort {
-        transaction_id: "small".into(),
+        transaction_id: tx("small"),
     })
     .unwrap();
     settle(40..400);
@@ -832,10 +876,49 @@ fn writes_and_point_reads_do_not_grow_with_history() {
     assert_eq!(
         FileStore::new(temp.store())
             .unwrap()
-            .find("h0000")
+            .find(&tx("h0000"), 0)
             .unwrap()
             .unwrap()
             .sequence,
         2
+    );
+}
+/// A fresh prepare searches only records within its clock-skew bound, so a
+/// damaged index of old history goes unread; a retry of an old request, and
+/// inspection of all history, still read it and fail closed.
+#[test]
+fn new_prepares_skip_segments_older_than_their_skew_bound() {
+    let temp = Temp::new();
+    let old = created() - 2 * 60 * 60 * 1000;
+    let past = Application::new(FileStore::new(temp.store()).unwrap().with_segment_size(1))
+        .with_checkpoint_interval(2)
+        .with_clock(move || old);
+    past.initialize().unwrap();
+    past.execute(create()).unwrap();
+    for index in 0..3 {
+        let id = tx_at(&format!("t{index}"), old);
+        past.execute(prepare_raw(&id)).unwrap();
+        past.execute(commit_raw(&id, "0")).unwrap();
+    }
+    let index = indexes(&temp)[2].clone();
+    let mut bytes = fs::read(&index).unwrap();
+    bytes[10] ^= 0x01;
+    fs::write(&index, bytes).unwrap();
+    let app = segmented(&temp);
+    app.execute(prepare_as("fresh")).unwrap();
+    app.execute(commit_as("fresh", "0")).unwrap();
+    assert_eq!(
+        app.execute(prepare_raw(&tx_at("t0", old)))
+            .unwrap_err()
+            .code,
+        Code::CorruptState
+    );
+    assert_eq!(
+        app.execute(Command::ShowTransaction {
+            transaction_id: tx_at("t0", old)
+        })
+        .unwrap_err()
+        .code,
+        Code::CorruptState
     );
 }

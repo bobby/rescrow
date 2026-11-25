@@ -4,7 +4,10 @@ pub mod dto;
 use dto::{Command, Output, Snapshot};
 use rescrow_domain::{self as d, transition};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,6 +34,9 @@ pub enum Code {
     Io,
     TooLarge,
     RevisionExhausted,
+    /// A prepare older than the retry window. It may or may not have been
+    /// admitted earlier; that outcome can no longer be replayed.
+    Expired,
     UnknownOutcome,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,8 +205,9 @@ pub trait LogStore {
     fn append(&self, entry: &dto::Entry) -> Result<Publication, StoreError>;
     /// Replace the checkpoint when this one is at a later position; otherwise do nothing.
     fn checkpoint(&self, checkpoint: &dto::Checkpoint) -> Result<(), StoreError>;
-    /// The most recent terminal entry for a transaction, anywhere in the log.
-    fn find(&self, transaction_id: &str) -> Result<Option<dto::Entry>, StoreError>;
+    /// The most recent terminal entry for a transaction among those recorded
+    /// at or after `since_ms`. Older entries need not be read.
+    fn find(&self, transaction_id: &str, since_ms: u64) -> Result<Option<dto::Entry>, StoreError>;
     /// Every entry from position zero, in order.
     fn history(&self) -> Result<Vec<dto::Entry>, StoreError>;
 }
@@ -214,12 +221,41 @@ pub fn validated_snapshot(snapshot: Snapshot) -> Result<d::Ledger, Error> {
 }
 
 /// Validated live state at a log position, plus terminal transactions found
-/// in the tail after the checkpoint.
+/// in the tail after the checkpoint, each with its recording time.
 struct View {
     position: u64,
+    /// When the last entry was recorded.
+    recorded_at_ms: u64,
     live: d::Live,
-    terminal: BTreeMap<d::Id, d::Transaction>,
+    terminal: BTreeMap<d::Id, (u64, d::Transaction)>,
     tail: usize,
+    /// The time a new entry would be recorded: the clock, but never earlier
+    /// than the last entry.
+    now_ms: u64,
+}
+
+/// How long a prepare can be retried and replayed, and how far a client's
+/// clock may lead or lag the Application's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryWindow {
+    pub max_age: Duration,
+    pub skew: Duration,
+}
+impl Default for RetryWindow {
+    fn default() -> Self {
+        Self {
+            max_age: Duration::from_secs(24 * 60 * 60),
+            skew: Duration::from_secs(5 * 60),
+        }
+    }
+}
+
+type Clock = Box<dyn Fn() -> u64 + Send + Sync>;
+/// Milliseconds since the Unix epoch, from the system clock.
+pub fn system_clock() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Synchronous typed use cases shared by CLI and embedded Rust callers.
@@ -227,6 +263,8 @@ pub struct Application<S> {
     store: S,
     attempts: usize,
     checkpoint_interval: usize,
+    window: RetryWindow,
+    clock: Clock,
 }
 impl<S: LogStore> Application<S> {
     pub fn new(store: S) -> Self {
@@ -234,6 +272,8 @@ impl<S: LogStore> Application<S> {
             store,
             attempts: 32,
             checkpoint_interval: 64,
+            window: RetryWindow::default(),
+            clock: Box::new(system_clock),
         }
     }
     /// Write a checkpoint once at least this many entries follow the current one.
@@ -241,9 +281,18 @@ impl<S: LogStore> Application<S> {
         self.checkpoint_interval = entries.max(1);
         self
     }
+    pub fn with_retry_window(mut self, window: RetryWindow) -> Self {
+        self.window = window;
+        self
+    }
+    /// Replace the source of milliseconds since the Unix epoch.
+    pub fn with_clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.clock = Box::new(clock);
+        self
+    }
     pub fn initialize(&self) -> Result<(), Error> {
         self.store
-            .initialize(&checkpoint_dto(&d::Live::default(), 0))?;
+            .initialize(&checkpoint_dto(&d::Live::default(), 0, 0))?;
         Ok(())
     }
     /// Create a log-structured authority from a schema-1 snapshot. The snapshot
@@ -251,7 +300,7 @@ impl<S: LogStore> Application<S> {
     /// with it. Transaction history keeps its decisions but not the old revision.
     pub fn import(&self, snapshot: Snapshot) -> Result<(), Error> {
         let ledger = validated_snapshot(snapshot)?;
-        let (checkpoint, entries) = imported(&ledger);
+        let (checkpoint, entries) = imported(&ledger, (self.clock)());
         self.store.import(&checkpoint, &entries)?;
         if self.snapshot()? != Snapshot::from_ledger(&ledger, checkpoint.position) {
             return Err(corrupt("imported log does not reproduce its snapshot"));
@@ -292,7 +341,10 @@ impl<S: LogStore> Application<S> {
         let result = (|| {
             let request: d::Request = request.try_into().map_err(input)?;
             self.mutate(|view| {
-                let existing = self.lookup(view, request.id())?;
+                let existing = match view.live.prepared().get(request.id()) {
+                    Some(prepared) => Some(prepared.clone()),
+                    None => self.lookup(view, request.id(), self.admit(view, &request)?)?,
+                };
                 let changes =
                     transition::prepare(request.clone(), existing.as_ref(), view.live.resources())
                         .map_err(Error::domain)?;
@@ -326,7 +378,7 @@ impl<S: LogStore> Application<S> {
                 .map_err(input)?;
             self.mutate(|view| {
                 let tx = self
-                    .lookup(view, &transaction)?
+                    .lookup(view, &transaction, self.decided_since(view))?
                     .ok_or(Error::domain(d::Error::NotFound))?;
                 let changes = transition::commit(&tx, actuals.clone(), view.live.resources())
                     .map_err(Error::domain)?;
@@ -342,7 +394,7 @@ impl<S: LogStore> Application<S> {
             let transaction = d::Id::new(id.into()).map_err(input)?;
             self.mutate(|view| {
                 let tx = self
-                    .lookup(view, &transaction)?
+                    .lookup(view, &transaction, self.decided_since(view))?
                     .ok_or(Error::domain(d::Error::NotFound))?;
                 let changes =
                     transition::abort(&tx, view.live.resources()).map_err(Error::domain)?;
@@ -368,7 +420,7 @@ impl<S: LogStore> Application<S> {
         let result = (|| {
             let transaction = d::Id::new(id.into()).map_err(input)?;
             let view = self.view()?;
-            self.lookup(&view, &transaction)?
+            self.lookup(&view, &transaction, 0)?
                 .as_ref()
                 .map(Into::into)
                 .ok_or_else(|| Error::domain(d::Error::NotFound))
@@ -389,10 +441,15 @@ impl<S: LogStore> Application<S> {
         history.truncate(view.position as usize);
         let mut specs = BTreeMap::new();
         let mut transactions: BTreeMap<d::Id, d::Transaction> = BTreeMap::new();
+        let mut recorded_at_ms = 0;
         for (position, entry) in history.into_iter().enumerate() {
             if entry.sequence != position as u64 {
                 return Err(corrupt("log sequence gap"));
             }
+            if entry.recorded_at_ms < recorded_at_ms {
+                return Err(corrupt("log entry recorded before its predecessor"));
+            }
+            recorded_at_ms = entry.recorded_at_ms;
             match entry.record {
                 dto::Record::ResourceCreated(spec) => {
                     let spec = d::ResourceSpec::try_from(spec).map_err(corrupt)?;
@@ -430,7 +487,7 @@ impl<S: LogStore> Application<S> {
             .iter()
             .filter(|(_, tx)| *tx.state() == d::State::Prepared)
             .eq(live.prepared().iter());
-        if !created_match || !prepared_match {
+        if !created_match || !prepared_match || recorded_at_ms != view.recorded_at_ms {
             return Err(corrupt("checkpoint disagrees with history"));
         }
         let ledger = d::Ledger::restore(
@@ -442,37 +499,93 @@ impl<S: LogStore> Application<S> {
     }
     fn view(&self) -> Result<View, Error> {
         let loaded = self.store.load()?;
-        let (position, live) = live_from(loaded.checkpoint)?;
+        let (position, recorded_at_ms, live) = live_from(loaded.checkpoint)?;
         let mut view = View {
             position,
+            recorded_at_ms,
             live,
             terminal: BTreeMap::new(),
             tail: loaded.tail.len(),
+            now_ms: 0,
         };
         for entry in loaded.tail {
             if entry.sequence != view.position {
                 return Err(corrupt("log sequence gap"));
             }
+            if entry.recorded_at_ms < view.recorded_at_ms {
+                return Err(corrupt("log entry recorded before its predecessor"));
+            }
+            view.recorded_at_ms = entry.recorded_at_ms;
             replay(&mut view, entry.record)?;
             view.position = view
                 .position
                 .checked_add(1)
                 .ok_or_else(|| corrupt("log position overflow"))?;
         }
+        view.now_ms = (self.clock)().max(view.recorded_at_ms);
         Ok(view)
     }
-    fn lookup(&self, view: &View, id: &d::Id) -> Result<Option<d::Transaction>, Error> {
-        if let Some(tx) = view.live.prepared().get(id).or(view.terminal.get(id)) {
+    /// Admit a prepare not found in live state: its ID must be a UUIDv7 whose
+    /// time is in the retry window. Every record of a request created at `c`
+    /// is recorded no earlier than `c - skew`, so that bounds the search for it.
+    fn admit(&self, view: &View, request: &d::Request) -> Result<u64, Error> {
+        let created = uuid_v7_millis(request.id().as_str()).ok_or_else(|| {
+            Error::input("a new transaction ID must be a UUIDv7 in canonical lowercase form")
+        })?;
+        let skew = millis(self.window.skew);
+        if created < view.now_ms.saturating_sub(millis(self.window.max_age)) {
+            return Err(Error {
+                category: Category::Input,
+                code: Code::Expired,
+                message: format!(
+                    "transaction ID was created at {created} ms, older than the {:?} retry \
+                     window; an earlier attempt may have been admitted, but it can no longer \
+                     be replayed",
+                    self.window.max_age
+                ),
+                transaction_id: None,
+                capacity: None,
+            });
+        }
+        if created > view.now_ms.saturating_add(skew) {
+            return Err(Error::input(format!(
+                "transaction ID was created at {created} ms, more than {:?} ahead of the \
+                 store's clock",
+                self.window.skew
+            )));
+        }
+        Ok(created.saturating_sub(skew))
+    }
+    /// The earliest recording time a retried decision is searched from.
+    fn decided_since(&self, view: &View) -> u64 {
+        view.now_ms
+            .saturating_sub(millis(self.window.max_age))
+            .saturating_sub(millis(self.window.skew))
+    }
+    /// A prepared transaction, or the latest terminal one recorded at or after `since_ms`.
+    fn lookup(
+        &self,
+        view: &View,
+        id: &d::Id,
+        since_ms: u64,
+    ) -> Result<Option<d::Transaction>, Error> {
+        if let Some(tx) = view.live.prepared().get(id) {
             return Ok(Some(tx.clone()));
         }
-        let Some(entry) = self.store.find(id.as_str())? else {
+        if let Some((recorded, tx)) = view.terminal.get(id) {
+            return Ok((*recorded >= since_ms).then(|| tx.clone()));
+        }
+        let Some(entry) = self.store.find(id.as_str(), since_ms)? else {
             return Ok(None);
         };
         let dto::Record::Transaction(tx) = entry.record else {
             return Err(corrupt("terminal lookup returned a resource record"));
         };
         let tx = d::Transaction::try_from(tx).map_err(corrupt)?;
-        if tx.request().id() != id || *tx.state() == d::State::Prepared {
+        if tx.request().id() != id
+            || *tx.state() == d::State::Prepared
+            || entry.recorded_at_ms < since_ms
+        {
             return Err(corrupt("terminal lookup returned the wrong transaction"));
         }
         Ok(Some(tx))
@@ -496,6 +609,7 @@ impl<S: LogStore> Application<S> {
             })?;
             let entry = dto::Entry {
                 sequence: view.position,
+                recorded_at_ms: view.now_ms,
                 record: record(&changes),
             };
             match self.store.append(&entry)? {
@@ -503,9 +617,11 @@ impl<S: LogStore> Application<S> {
                     if view.tail + 1 >= self.checkpoint_interval {
                         // Checkpoints only shorten later replay. A failure leaves a
                         // longer tail for the next writer, never a wrong answer.
-                        let _ = self
-                            .store
-                            .checkpoint(&checkpoint_dto(&view.live.apply(&changes), next));
+                        let _ = self.store.checkpoint(&checkpoint_dto(
+                            &view.live.apply(&changes),
+                            next,
+                            view.now_ms,
+                        ));
                     }
                     return output;
                 }
@@ -561,7 +677,8 @@ fn replay(view: &mut View, record: dto::Record) -> Result<(), Error> {
                 return Err(corrupt("record does not match its transition"));
             }
             if *tx.state() != d::State::Prepared {
-                view.terminal.insert(id.clone(), tx.clone());
+                view.terminal
+                    .insert(id.clone(), (view.recorded_at_ms, tx.clone()));
             }
             changes
         }
@@ -572,7 +689,7 @@ fn replay(view: &mut View, record: dto::Record) -> Result<(), Error> {
 /// Entries that rebuild a validated ledger: each resource's creation, then each
 /// transaction's preparation and decision. They precede the checkpoint, so they
 /// are validated as whole history rather than replayed in order.
-fn imported(ledger: &d::Ledger) -> (dto::Checkpoint, Vec<dto::Entry>) {
+fn imported(ledger: &d::Ledger, now_ms: u64) -> (dto::Checkpoint, Vec<dto::Entry>) {
     let mut records: Vec<dto::Record> = ledger
         .resources()
         .values()
@@ -592,9 +709,13 @@ fn imported(ledger: &d::Ledger) -> (dto::Checkpoint, Vec<dto::Entry>) {
     let entries: Vec<_> = records
         .into_iter()
         .zip(0..)
-        .map(|(record, sequence)| dto::Entry { sequence, record })
+        .map(|(record, sequence)| dto::Entry {
+            sequence,
+            recorded_at_ms: now_ms,
+            record,
+        })
         .collect();
-    let checkpoint = checkpoint_dto(&ledger.live(), entries.len() as u64);
+    let checkpoint = checkpoint_dto(&ledger.live(), entries.len() as u64, now_ms);
     (checkpoint, entries)
 }
 fn record(changes: &transition::Changes) -> dto::Record {
@@ -603,7 +724,7 @@ fn record(changes: &transition::Changes) -> dto::Record {
         None => dto::Record::ResourceCreated(changes.resources()[0].spec().into()),
     }
 }
-fn live_from(checkpoint: dto::Checkpoint) -> Result<(u64, d::Live), Error> {
+fn live_from(checkpoint: dto::Checkpoint) -> Result<(u64, u64, d::Live), Error> {
     if checkpoint.schema_version != SCHEMA_VERSION {
         return Err(StoreError::Unsupported(checkpoint.schema_version).into());
     }
@@ -622,18 +743,55 @@ fn live_from(checkpoint: dto::Checkpoint) -> Result<(u64, d::Live), Error> {
             .map_err(corrupt)?,
     )
     .map_err(corrupt)?;
-    Ok((checkpoint.position, live))
+    Ok((checkpoint.position, checkpoint.recorded_at_ms, live))
 }
-fn checkpoint_dto(live: &d::Live, position: u64) -> dto::Checkpoint {
+fn checkpoint_dto(live: &d::Live, position: u64, recorded_at_ms: u64) -> dto::Checkpoint {
     dto::Checkpoint {
         schema_version: SCHEMA_VERSION,
         position,
+        recorded_at_ms,
         resources: live.resources().values().map(Into::into).collect(),
         prepared: live.prepared().values().map(Into::into).collect(),
     }
 }
 fn corrupt(detail: impl std::fmt::Display) -> Error {
     StoreError::Corrupt(detail.to_string()).into()
+}
+/// The millisecond timestamp of a UUIDv7 in canonical lowercase form
+/// (`xxxxxxxx-xxxx-7xxx-[89ab]xxx-xxxxxxxxxxxx`), or `None` for anything else.
+pub fn uuid_v7_millis(id: &str) -> Option<u64> {
+    let bytes = id.as_bytes();
+    let canonical = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_digit() || (b'a'..=b'f').contains(b),
+        });
+    if !canonical || bytes[14] != b'7' || !b"89ab".contains(&bytes[19]) {
+        return None;
+    }
+    u64::from_str_radix(&format!("{}{}", &id[..8], &id[9..13]), 16).ok()
+}
+/// A UUIDv7 in canonical lowercase form whose timestamp is `millis` (its low
+/// 48 bits) and whose 74 remaining bits are the low bits of `random`. The
+/// caller supplies the randomness, so two IDs created in the same millisecond
+/// differ only if their `random` values do.
+pub fn uuid_v7(millis: u64, random: u128) -> String {
+    let millis = u128::from(millis) & ((1 << 48) - 1);
+    let a = (random >> 62) & 0xfff;
+    let b = random & ((1 << 62) - 1);
+    let v = millis << 80 | 0x7 << 76 | a << 64 | 0b10 << 62 | b;
+    let h = format!("{v:032x}");
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
+}
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 fn input(error: d::Error) -> Error {
     Error::input(error.to_string())

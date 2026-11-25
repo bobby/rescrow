@@ -21,27 +21,36 @@ target/debug/rescrow --store .rescrow init
 target/debug/rescrow --store .rescrow resource create credits --initial 60 --upper 100 --unit credits
 target/debug/rescrow --store .rescrow resource create tokens --initial 8 --unit tokens
 
-target/debug/rescrow --store .rescrow transaction prepare work --operations examples/operations.json
-target/debug/rescrow --store .rescrow transaction prepare replenishment --operations examples/credit.json
+# Create each transaction's ID once, when the request is first made:
+work=$(target/debug/rescrow new-id)
+replenishment=$(target/debug/rescrow new-id)
+target/debug/rescrow --store .rescrow transaction prepare "$work" --operations examples/operations.json
+target/debug/rescrow --store .rescrow transaction prepare "$replenishment" --operations examples/credit.json
 target/debug/rescrow --store .rescrow resource show credits
 # quantity=60, reserved down=40 up=30, available down=20 up=10
 
-target/debug/rescrow --store .rescrow transaction commit work --actuals examples/actuals.json
-target/debug/rescrow --store .rescrow transaction abort replenishment
+target/debug/rescrow --store .rescrow transaction commit "$work" --actuals examples/actuals.json
+target/debug/rescrow --store .rescrow transaction abort "$replenishment"
 target/debug/rescrow --store .rescrow --json resource list
 # credits=35, tokens=8; both resources have no holds
 
 # Identical retries return the existing outcome and do not consume again:
-target/debug/rescrow --store .rescrow transaction prepare work --operations examples/operations.json
-target/debug/rescrow --store .rescrow transaction commit work --actuals examples/actuals.json
-target/debug/rescrow --store .rescrow transaction show work
+target/debug/rescrow --store .rescrow transaction prepare "$work" --operations examples/operations.json
+target/debug/rescrow --store .rescrow transaction commit "$work" --actuals examples/actuals.json
+target/debug/rescrow --store .rescrow transaction show "$work"
 ```
 
 `resource list`, `transaction list`, and `transaction show <id>` inspect one consistent ledger. `transaction commit <id>` without `--actuals` commits the full reservation. `resource create` accepts `--lower` (default `0`), optional `--upper` (otherwise unbounded), required `--initial` and `--unit`, and `--scale` (default `0`, maximum `38`). Scale describes the integer's decimal places; no conversion or floating-point arithmetic occurs. Bounds and metadata are immutable.
 
 Operation files contain a nonempty array of `{ "operation_id", "resource_id", "delta" }` records, with distinct operation IDs and at most one operation per resource. Actual files contain `{ "operation_id", "delta" }` records for **every** original operation. Deltas and quantities are canonical signed decimal strings (`"0"`, `"-25"`, `"100"`): no leading zeros, plus sign, whitespace, exponent, or negative zero. Reservations must be nonzero; actual zero releases unused capacity. Actuals must have the reserved direction and no greater magnitude. The signed minimum is a valid quantity/bound when its offsets fit, but cannot be a reservation because its absolute magnitude is unrepresentable.
 
-Transaction IDs are caller-supplied permanent replay identities. Valid IDs use 1–128 ASCII letters, digits, dots, underscores, or hyphens. Operation order is normalized by ID; changing parameters under an existing transaction ID conflicts. Identical resource creation is a no-op even after its quantity changes. Pending credits cannot fund debits, and pending debits cannot supply upward room. A capacity, total-overflow, or missing-resource rejection is durably recorded as an aborted transaction before its business error is returned. It cannot later reserve under that ID. Malformed requests fail before admission. A missing-resource prepare retains its rejected original request even if that resource is later created. Terminal identities are retained indefinitely. Repeated terminal commands must agree with the existing decision and actuals.
+Transaction IDs are caller-supplied replay identities. A new prepare's ID must be a [UUIDv7](https://www.rfc-editor.org/rfc/rfc9562#name-uuid-version-7) in canonical lowercase form, created when the client first makes the request and repeated unchanged on every retry; `rescrow new-id` prints one, and any RFC 9562 generator works. Its timestamp bounds the retry window:
+
+- A retry within 24 hours of the ID's timestamp returns the original outcome. A prepared transaction keeps replaying, and can be committed or aborted, at any age.
+- A new prepare whose ID is older than 24 hours fails with `expired`. One more than 5 minutes ahead of the store's clock is invalid input. Neither is recorded.
+- A commit or abort of a transaction decided more than 24 hours ago reports `not_found`; `transaction show` and `transaction list` still read all history.
+
+An ID therefore never names two transactions: inside the window the original is found, and after it the ID has expired. Other IDs (1–128 ASCII letters, digits, dots, underscores, or hyphens), such as those of migrated schema-1 transactions, remain valid for existing transactions but cannot start new ones. Operation order is normalized by ID; changing parameters under an existing transaction ID conflicts. Identical resource creation is a no-op even after its quantity changes. Pending credits cannot fund debits, and pending debits cannot supply upward room. A capacity, total-overflow, or missing-resource rejection is durably recorded as an aborted transaction before its business error is returned. It cannot later reserve under that ID. Malformed requests fail before admission. A missing-resource prepare retains its rejected original request even if that resource is later created. Repeated terminal commands must agree with the existing decision and actuals.
 
 Use `--json` for typed Application results on stdout and structured errors on stderr. Quantities remain strings, including values beyond JavaScript's exact integer range. Success has a `result` tag and a `value` payload where applicable. Errors have stable `category` and `code` fields plus a diagnostic `message`. Transaction operations also include `transaction_id`. New capacity rejections include `capacity.resource_id`, `capacity.requested_delta`, and `capacity.available`, with quantities encoded as strings. These are frozen admission facts: replay returns the original diagnostic even after available capacity changes. Clap usage/help errors are textual. No prompts or hidden process state are involved.
 
@@ -50,12 +59,12 @@ Use `--json` for typed Application results on stdout and structured errors on st
 | 0 | Success. |
 | 2 | Invalid input or CLI usage. |
 | 3 | Domain capacity/overflow rejection (an admitted prepare rejection is retained). |
-| 4 | Identity/terminal conflict, missing referenced object (an admitted prepare rejection is retained), or already initialized. |
+| 4 | Identity/terminal conflict, missing referenced object (an admitted prepare rejection is retained), expired transaction ID, or already initialized. |
 | 5 | Bounded lock contention or exhausted CAS retries; retry the same request. |
 | 6 | Storage failure, missing/corrupt/unsupported/oversized state, or revision exhaustion. |
 | 7 | Unknown publication outcome or failure delivering output; inspect/retry the same identity and request. |
 
-An unknown outcome is never a known rollback. A new transaction ID can reserve again, so preserve the original ID and actuals across retries. After uncertain initialization, inspect the store; retrying `init` validates and synchronizes existing state before reporting `already_initialized`. A directory with an existing lock file but no live snapshot fails closed even for `init`; choose a fresh directory for a new store. A failed initialization before publication may leave such a directory.
+An unknown outcome is never a known rollback. A new transaction ID can reserve again, so preserve the original ID and actuals across retries, and finish retrying within the 24-hour window. After uncertain initialization, inspect the store; retrying `init` validates and synchronizes existing state before reporting `already_initialized`. A directory with an existing lock file but no live snapshot fails closed even for `init`; choose a fresh directory for a new store. A failed initialization before publication may leave such a directory.
 
 ## Rust callers and boundaries
 
@@ -66,30 +75,39 @@ rescrow-cli -> rescrow-adapters -> rescrow-application -> rescrow-domain
            -> rescrow-application
 ```
 
-The Domain has no dependencies or serialization. The Application owns `dto::Command`, `dto::Output`, structured errors, versioned snapshots, conversions, and the `SnapshotStore` port. Rust callers can use `create_resource`, `resource`, `resources`, `prepare`, `commit`, `abort`, `transaction`, and `transactions`, each returning its specific DTO type. `initialize` returns `Result<(), Error>`. `execute` dispatches the CLI command enum through those same methods. Domain availability is a named `Availability` value with `available_down`, `available_up`, `reserved_down`, and `reserved_up` getters.
+The Domain has no dependencies or serialization. The Application owns `dto::Command`, `dto::Output`, structured errors, checkpoint and log-entry records, conversions, and the `LogStore` port. Rust callers can use `create_resource`, `resource`, `resources`, `prepare`, `commit`, `abort`, `transaction`, and `transactions`, each returning its specific DTO type. `initialize` returns `Result<(), Error>`. `execute` dispatches the CLI command enum through those same methods. Domain availability is a named `Availability` value with `available_down`, `available_up`, `reserved_down`, and `reserved_up` getters.
 
-The snapshot port now exchanges `ValidatedSnapshot` values. Adapters convert each decoded `dto::Snapshot` through `TryFrom` once; the result contains a private, shared immutable ledger plus its revision. Candidates built from domain transitions already have their construction proof, so publication needs no domain → DTO → domain validation round trip. `to_dto` provides the storage representation. Custom adapter implementations must update their port signatures to this type. Outbound conversions remain total; reads and CAS checks still validate every newly loaded image and perform the required synchronization. An adapter supplies revisioned load and conditional publication; the Application reevaluates from fresh state on conflicts, up to 32 attempts. Reads and identical replays do not advance the revision.
+A `LogStore` keeps a checkpoint of live state (resources and prepared transactions) and an append-only log of entries, each one record of a resource creation or transaction state change at a sequence number and the time it was recorded. An adapter supplies:
+
+- `load`: the checkpoint plus the entries after it.
+- `append`: a conditional append at the next sequence number, which is the commit point; a lost race reports a conflict.
+- `checkpoint`: an advisory replacement of the checkpoint, written every 64 entries by default (`with_checkpoint_interval`).
+- `find`: the latest entry for a transaction recorded at or after a given time.
+- `history`: every entry, for inspection and full validation.
+
+The Application validates every record through the transfer-type boundary, checks each entry against the transition it records, and reevaluates from fresh state on conflicts, up to 32 attempts. Point commands replay only the entries after the checkpoint; listing commands and `snapshot` rebuild and check the whole ledger from history. Reads and identical replays append nothing. Retry lookups are bounded by the window above (`with_retry_window`), and the Application's clock is replaceable for tests (`with_clock`). `uuid_v7` builds an ID from a timestamp and caller-supplied random bits.
 
 [The runnable embedded example](crates/rescrow-adapters/examples/embedded.rs) creates a resource, reserves, partially commits, and inspects it through the Rust API. It can share a store with independent CLI invocations:
 
 ```sh
 cargo run -p rescrow-adapters --example embedded -- .rescrow
-# Running it again returns the same balance (35 example credits).
+# Each run is a new request with a new ID: a second run asks for 40 of the 35
+# remaining credits and is rejected for capacity.
 ```
 
-Schema-1 snapshots remain readable. Capacity details are optional only to represent legacy rejected records that did not retain those facts; new admissions always retain them. The conversion validates any supplied detail against the original operation and rejects details attached to other abort causes. Older binaries with strict DTO decoding may reject new records containing this added field.
+`rescrow migrate` converts a schema-1 store (`state.json`) to the log format once, recording every imported entry at the migration time, and keeps the old file as `state.json.migrated`. Other commands refuse an unmigrated store. Capacity details are optional only to represent legacy rejected records that did not retain those facts; new admissions always retain them. The conversion validates any supplied detail against the original operation and rejects details attached to other abort causes. Older binaries with strict DTO decoding may reject new records containing this added field.
 
 `rescrow-adapters::memory::MemoryStore` supplies deterministic tests with conflict, pre-publication, and lost-response injection; it makes no durability promise. File-store fault hooks are explicit Rust constructor options used by qualification tests, never activated by CLI environment variables.
 
 ## Local persistence and limits
 
-The selected canonical store directory contains `state.json`, a stable `state.lock`, and possibly orphan `.state-*.tmp` candidates. Every load takes an OS shared lock. Publication takes an exclusive lock, reloads and compares the revision, writes a uniquely created temporary file in the same directory, synchronizes it, renames it over `state.json`, and synchronizes the directory before success. The parent directory is also synchronized at initialization. Reads and replays synchronize the live file and directory to complete a previous uncertain publication. Files use mode `600`, directories `700`; existing broader permissions are rejected. Lock acquisition times out after two seconds, independently of the bounded Application CAS retry policy.
+The selected canonical store directory contains `live.json`, a `log/` directory of numbered segments, a stable `state.lock`, and possibly orphan temporary candidates. Every load takes an OS shared lock; writes take it exclusively and reload before appending. Each log record is length- and checksum-framed; an append writes one record at the end of the active segment and synchronizes it before success. Bytes after the last valid record are an unacknowledged torn append, removed by the next writer. When the active segment passes 4 MiB (`with_segment_size`), it is sealed by writing an immutable index of its finished transactions, sorted by ID, and a new segment starts. `live.json` holds the checkpoint and the log position it covers. It is replaced by writing a uniquely created temporary file in the same directory, synchronizing it, renaming it over the old one, and synchronizing the directory; a lost checkpoint only means a longer replay. Files use mode `600`, directories `700`; existing broader permissions are rejected. Lock acquisition times out after two seconds, independently of the bounded Application retry policy.
 
-The [Rust rename contract](https://doc.rust-lang.org/std/fs/fn.rename.html) supplies same-filesystem replacement; Linux requires [directory synchronization](https://man7.org/linux/man-pages/man2/fsync.2.html) to persist the directory entry. The adapter never truncates the live state or promotes an orphan candidate. Missing, invalid, oversized (over 16 MiB), or unsupported live snapshots fail closed. There is no automatic backup selection, reset, or rollback after uncertain publication. Every publication also reserves settlement space: the encoded snapshot must fit with every outstanding transaction's largest committed/aborted state, all mutable resource numbers at their maximum decimal widths, and a 20-digit revision. Holds disappearing during settlement only reduce the bound. This check applies to resource creation and admitted rejection records as well as preparations, so later commands cannot spend earlier holds' settlement space. A write can return `too_large` before the live file reaches 16 MiB. Embedded callers may select a smaller limit with `FileStore::with_size_limit`; cooperating callers should select the same limit for a store. The CLI uses 16 MiB. The guarantee covers size growth for snapshots published under this policy, not disk-full errors or revision exhaustion. Older snapshots remain readable, but an existing image that already lacks headroom cannot acquire this guarantee retroactively; writes still fail closed if the bound does not fit. CLI JSON input files also have a 16 MiB ceiling. Even an unbounded resource has finite representable upward room because quantities, offsets, and totals must fit `i128`.
+The [Rust rename contract](https://doc.rust-lang.org/std/fs/fn.rename.html) supplies same-filesystem replacement; Linux requires [directory synchronization](https://man7.org/linux/man-pages/man2/fsync.2.html) to persist the directory entry. Missing, invalid, oversized, or unsupported state fails closed, as does a sealed segment that changed after sealing or an index that disagrees with it. There is no automatic backup selection, reset, or rollback after uncertain publication. `live.json` and each record are limited to 16 MiB (`FileStore::with_size_limit`); a write beyond it returns `too_large`. CLI JSON input files have the same ceiling. Even an unbounded resource has finite representable upward room because quantities, offsets, and totals must fit `i128`.
 
-All participants, holds, replay records, and final effects are published in one ledger snapshot. There are no partially published participants or separate materialization steps to recover. Whole-file validation/rewrites grow with resources and permanently retained transaction history; publications serialize through one lock. This is one logical shard per resource and one cooperating local user per store. It does not enforce budgets against anyone who can directly rewrite the authoritative store. Network filesystems, manual live editing, hard-link/path manipulation, and device loss are outside the local contract.
+A retry lookup walks segments newest-first and stops at the first segment recorded entirely before its time bound, reading only each sealed segment's index and first record along the way. A write appends one record and a point read replays at most one checkpoint interval, however long history grows; `live.json` grows with resources and prepared transactions, not with settled ones. Listing commands still read all history. Publications serialize through one lock. This is one logical shard per resource and one cooperating local user per store. It does not enforce budgets against anyone who can directly rewrite the authoritative store. Network filesystems, manual live editing, hard-link/path manipulation, and device loss are outside the local contract.
 
-Reservations never expire automatically. Claims, external execution, trusted metering/refunds, hierarchy, sharding, signed audit history, HTTP, SQLite, and cloud backends remain deferred. The distributed protocol and enterprise RPO/RTO targets in DESIGN.md remain proposed and unqualified.
+History is retained indefinitely for inspection, although no retry reads entries older than the window. Reservations never expire automatically. Claims, external execution, trusted metering/refunds, hierarchy, sharding, signed audit history, HTTP, SQLite, and cloud backends remain deferred. The distributed protocol and enterprise RPO/RTO targets in DESIGN.md remain proposed and unqualified.
 
 ## Verification
 
@@ -142,24 +160,22 @@ Failures preserve `history.json`, input files, and the live store under `target/
 
 ## Local benchmark
 
-`crates/rescrow-adapters/examples/snapshot_bench.rs` seeds 0, 1,000, and 10,000 retained zero-usage commits, then measures resource inspection, identical resource-create replay, and a prepare/abort pair. It uses the real file adapter, locks, and synchronization. The output reports seeded snapshot bytes and median microseconds over seven samples after two warm-up cycles; each mutation cycle retains another terminal transaction.
+`crates/rescrow-adapters/examples/history_bench.rs` seeds 0, 1,000, and 10,000 retained zero-usage commits through the Application, created ten minutes apart so the retained history lies outside a new request's skew bound, as it would in use. It then measures resource inspection, identical resource-create replay, and a prepare/abort pair with fresh IDs. It uses the real file adapter, locks, and synchronization. The output reports `live.json` and log bytes and median microseconds over seven samples after two warm-up cycles.
 
 ```sh
 mkdir -p target/bench
-cargo run --release --locked -p rescrow-adapters --example snapshot_bench -- target/bench
-# For isolating CPU/encoding overhead from persistent-device latency:
-cargo run --release --locked -p rescrow-adapters --example snapshot_bench -- /tmp
+cargo run --release --locked -p rescrow-adapters --example history_bench -- target/bench
 ```
 
-Development measurement on 2026-11-17, Rust 1.96.0 release builds, Linux tmpfs: alternating two runs of baseline `f20e048` and two of this implementation, using the same harness (adapted only for the snapshot port). Seeded sizes were 262, 191,261, and 1,910,261 bytes. The table gives the range of each run's median at 10,000 retained transactions:
+Development measurement on 2026-11-25, Rust 1.96.0 release build, one run in a Linux container (OrbStack on macOS) writing to the container's own filesystem:
 
-| Operation | Baseline | Updated |
-| --- | --- | --- |
-| Resource inspection | 124.7–138.5 ms | 56.7–72.0 ms |
-| Identical create replay | 120.7–258.5 ms | 79.0–88.4 ms |
-| Prepare + abort | 857.7–1,124.7 ms | 548.1–757.1 ms |
+| History | `live.json` | Log | Inspection | Create replay | Prepare + abort |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 119 B | 184 B | 22.1 ms | 0.20 ms | 105.8 ms |
+| 1,000 | 571 B | 575 KB | 2.3 ms | 0.20 ms | 14.7 ms |
+| 10,000 | 577 B | 6.4 MB | 2.1 ms | 0.16 ms | 20.0 ms |
 
-Whole-harness user+system CPU time, including fixture construction and all three sizes, was 5.40–5.51 seconds before and 4.03–4.05 seconds after. Scheduler contention and persistent-filesystem synchronization made wall-clock results noisy; these small samples are evidence of reduced repeated-conversion work on this host, not an SLO, throughput qualification, or a power-loss test. In particular, tmpfs does not measure persistent-device durability latency. Snapshot validation and rewrites still scale with retained history.
+The snapshot store this replaced measured 56.7–72.0 ms inspection and 548.1–757.1 ms prepare + abort at 10,000 transactions on a different host and filesystem (Linux tmpfs), so the two are not directly comparable; the comparison that matters is that the cost no longer grows with retained history. The 0-history row includes first-run costs. These small samples are not an SLO, throughput qualification, or a power-loss test.
 
 ## Guiding values
 

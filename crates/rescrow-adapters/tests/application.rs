@@ -2,6 +2,24 @@ use rescrow_adapters::memory::{Fault, MemoryStore};
 use rescrow_application::{
     Application, Category, Code, Loaded, LogStore, Publication, StoreError, dto::*,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
+/// Every request in this process is created at its start, so retries match.
+fn created() -> u64 {
+    static CREATED: std::sync::LazyLock<u64> =
+        std::sync::LazyLock::new(rescrow_application::system_clock);
+    *CREATED
+}
+/// The UUIDv7 a test names `name`, created at `millis`.
+fn id_at(name: &str, millis: u64) -> String {
+    let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    rescrow_application::uuid_v7(millis, hash.into())
+}
+/// The UUIDv7 a test names `name`, created when the test process started.
+fn id(name: &str) -> String {
+    id_at(name, created())
+}
 fn create() -> Command {
     Command::CreateResource(ResourceSpec {
         resource_id: "r".into(),
@@ -13,8 +31,11 @@ fn create() -> Command {
     })
 }
 fn prepare(name: &str, delta: &str) -> Command {
+    prepare_raw(&id(name), delta)
+}
+fn prepare_raw(transaction_id: &str, delta: &str) -> Command {
     Command::Prepare(Prepare {
-        transaction_id: name.into(),
+        transaction_id: transaction_id.into(),
         operations: vec![Operation {
             operation_id: "o".into(),
             resource_id: "r".into(),
@@ -48,7 +69,7 @@ fn direct_api_publishes_rejections_and_replays_do_not_advance_revision() {
     assert_eq!(rejected.resources, before.resources);
     assert_eq!(rejected.transactions.len(), 2);
     app.execute(Command::Abort {
-        transaction_id: "t".into(),
+        transaction_id: id("t"),
     })
     .unwrap();
     assert_eq!(
@@ -57,7 +78,7 @@ fn direct_api_publishes_rejections_and_replays_do_not_advance_revision() {
     );
     assert_eq!(
         app.execute(Command::Commit(Commit {
-            transaction_id: "rejected".into(),
+            transaction_id: id("rejected"),
             actuals: None
         }))
         .unwrap_err()
@@ -66,7 +87,7 @@ fn direct_api_publishes_rejections_and_replays_do_not_advance_revision() {
     );
     let revision = snapshot(&store).revision;
     app.execute(Command::Abort {
-        transaction_id: "t".into(),
+        transaction_id: id("t"),
     })
     .unwrap();
     assert_eq!(snapshot(&store).revision, revision);
@@ -85,7 +106,7 @@ fn bounded_retries_prepublication_failures_and_lost_response() {
     assert_eq!(store.evaluations() - evaluations, 3);
     store.inject(Fault::LostResponse);
     let commit = Command::Commit(Commit {
-        transaction_id: "t".into(),
+        transaction_id: id("t"),
         actuals: Some(vec![Actual {
             operation_id: "o".into(),
             delta: "-2".into(),
@@ -129,7 +150,7 @@ fn lost_prepare_rejection_and_abort_responses_keep_identity() {
             store.inject(Fault::LostResponse);
             assert_eq!(
                 app.execute(Command::Abort {
-                    transaction_id: "t".into()
+                    transaction_id: id("t")
                 })
                 .unwrap_err()
                 .category,
@@ -137,7 +158,7 @@ fn lost_prepare_rejection_and_abort_responses_keep_identity() {
             );
             let before = snapshot(&store);
             app.execute(Command::Abort {
-                transaction_id: "t".into(),
+                transaction_id: id("t"),
             })
             .unwrap();
             assert_eq!(snapshot(&store), before);
@@ -159,7 +180,9 @@ fn corrupt_storage_bad_input_and_revision_overflow_fail_closed() {
         Code::CorruptState
     );
     assert_eq!(
-        app.execute(prepare("bad id", "-1")).unwrap_err().category,
+        app.execute(prepare_raw("bad id", "-1"))
+            .unwrap_err()
+            .category,
         Category::Input
     );
     // A checkpoint whose holds disagree with its prepared transactions.
@@ -220,6 +243,7 @@ fn checkpoint_of(store: &MemoryStore) -> Checkpoint {
     Checkpoint {
         schema_version: rescrow_application::SCHEMA_VERSION,
         position: snapshot.revision,
+        recorded_at_ms: store.raw().1.last().map_or(0, |e| e.recorded_at_ms),
         resources: snapshot.resources,
         prepared: snapshot
             .transactions
@@ -257,8 +281,8 @@ impl LogStore for Competing {
     fn checkpoint(&self, c: &Checkpoint) -> Result<(), StoreError> {
         self.inner.checkpoint(c)
     }
-    fn find(&self, id: &str) -> Result<Option<Entry>, StoreError> {
-        self.inner.find(id)
+    fn find(&self, id: &str, since_ms: u64) -> Result<Option<Entry>, StoreError> {
+        self.inner.find(id, since_ms)
     }
     fn history(&self) -> Result<Vec<Entry>, StoreError> {
         self.inner.history()
@@ -302,7 +326,7 @@ fn missing_resource_rejection_remains_terminal_after_resource_creation() {
     assert_eq!(snapshot(&store), before);
     assert_eq!(
         app.execute(Command::Commit(Commit {
-            transaction_id: "missing".into(),
+            transaction_id: id("missing"),
             actuals: None
         }))
         .unwrap_err()
@@ -315,7 +339,7 @@ fn missing_resource_rejection_remains_terminal_after_resource_creation() {
 fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
     let (store, app) = ready();
     app.prepare(Prepare {
-        transaction_id: "held".into(),
+        transaction_id: id("held"),
         operations: vec![Operation {
             operation_id: "o".into(),
             resource_id: "r".into(),
@@ -324,7 +348,7 @@ fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
     })
     .unwrap();
     let request = Prepare {
-        transaction_id: "rejected".into(),
+        transaction_id: id("rejected"),
         operations: vec![Operation {
             operation_id: "a".into(),
             resource_id: "r".into(),
@@ -332,7 +356,10 @@ fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
         }],
     };
     let error = app.prepare(request.clone()).unwrap_err();
-    assert_eq!(error.transaction_id.as_deref(), Some("rejected"));
+    assert_eq!(
+        error.transaction_id.as_deref(),
+        Some(id("rejected").as_str())
+    );
     assert_eq!(
         error.capacity.as_deref(),
         Some(&CapacityFailure {
@@ -342,13 +369,13 @@ fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
         })
     );
     let serialized = serde_json::to_string(&error).unwrap();
-    app.abort("held").unwrap();
+    app.abort(&id("held")).unwrap();
     assert_eq!(
         serde_json::to_string(&app.prepare(request).unwrap_err()).unwrap(),
         serialized
     );
     assert!(matches!(
-        app.transaction("rejected").unwrap().state,
+        app.transaction(&id("rejected")).unwrap().state,
         State::Aborted {
             capacity: Some(_),
             ..
@@ -381,16 +408,16 @@ fn legacy_snapshot() -> Snapshot {
     app.execute(prepare("held", "-2")).unwrap();
     app.execute(prepare("used", "-1")).unwrap();
     app.execute(Command::Commit(Commit {
-        transaction_id: "used".into(),
+        transaction_id: id("used"),
         actuals: None,
     }))
     .unwrap();
     app.execute(prepare("released", "1")).unwrap();
-    app.abort("released").unwrap();
+    app.abort(&id("released")).unwrap();
     app.execute(prepare("refused", "-9")).unwrap_err();
     app.execute(prepare("legacy", "-9")).unwrap_err();
     app.execute(Command::Prepare(Prepare {
-        transaction_id: "nowhere".into(),
+        transaction_id: id("nowhere"),
         operations: vec![Operation {
             operation_id: "o".into(),
             resource_id: "missing".into(),
@@ -404,7 +431,7 @@ fn legacy_snapshot() -> Snapshot {
     let legacy = snapshot
         .transactions
         .iter_mut()
-        .find(|tx| tx.request.transaction_id == "legacy")
+        .find(|tx| tx.request.transaction_id == id("legacy"))
         .unwrap();
     let State::Aborted { capacity, .. } = &mut legacy.state else {
         panic!("expected a rejection");
@@ -433,15 +460,15 @@ fn import_rebuilds_a_schema_1_snapshot_and_continues_from_it() {
     assert_eq!(imported.revision, entries.len() as u64);
     // Old decisions replay, and live holds settle normally.
     assert_eq!(
-        app.abort("released").unwrap().request.transaction_id,
-        "released"
+        app.abort(&id("released")).unwrap().request.transaction_id,
+        id("released")
     );
     assert_eq!(
         app.execute(prepare("refused", "-9")).unwrap_err().code,
         Code::Capacity
     );
     app.execute(Command::Commit(Commit {
-        transaction_id: "held".into(),
+        transaction_id: id("held"),
         actuals: None,
     }))
     .unwrap();
@@ -467,4 +494,117 @@ fn import_validates_the_snapshot_before_creating_anything() {
         assert_eq!(app.import(snapshot).unwrap_err().code, code);
         assert_eq!(store.raw(), (None, vec![]));
     }
+}
+
+const HOUR: u64 = 60 * 60 * 1000;
+const MINUTE: u64 = 60 * 1000;
+/// An arbitrary start time, in milliseconds since the Unix epoch.
+const T: u64 = 1_800_000_000_000;
+/// A store and an Application whose clock the test sets.
+fn clocked() -> (
+    MemoryStore,
+    Application<MemoryStore>,
+    std::sync::Arc<AtomicU64>,
+) {
+    let clock = std::sync::Arc::new(AtomicU64::new(T));
+    let store = MemoryStore::default();
+    let reading = clock.clone();
+    let app = Application::new(store.clone()).with_clock(move || reading.load(Ordering::Relaxed));
+    app.initialize().unwrap();
+    app.execute(create()).unwrap();
+    (store, app, clock)
+}
+fn prepare_at(name: &str, created_at_ms: u64) -> Command {
+    prepare_raw(&id_at(name, created_at_ms), "-1")
+}
+fn commit_at(name: &str, created_at_ms: u64) -> Command {
+    Command::Commit(Commit {
+        transaction_id: id_at(name, created_at_ms),
+        actuals: None,
+    })
+}
+#[test]
+fn retries_replay_inside_the_window_and_expire_after_it() {
+    let (store, app, clock) = clocked();
+    app.execute(prepare_at("done", T)).unwrap();
+    let committed = app.execute(commit_at("done", T)).unwrap();
+    app.execute(prepare_at("held", T)).unwrap();
+    clock.store(T + 23 * HOUR, Ordering::Relaxed);
+    let revision = snapshot(&store).revision;
+    assert_eq!(app.execute(prepare_at("done", T)).unwrap(), committed);
+    assert_eq!(app.execute(commit_at("done", T)).unwrap(), committed);
+    assert_eq!(snapshot(&store).revision, revision);
+    clock.store(T + 25 * HOUR, Ordering::Relaxed);
+    let expired = app.execute(prepare_at("done", T)).unwrap_err();
+    assert_eq!(
+        (expired.category, expired.code),
+        (Category::Input, Code::Expired)
+    );
+    assert_eq!(
+        app.execute(commit_at("done", T)).unwrap_err().code,
+        Code::NotFound
+    );
+    // Inspection still reads all of history.
+    assert_eq!(
+        app.execute(Command::ShowTransaction {
+            transaction_id: id_at("done", T)
+        })
+        .unwrap(),
+        committed
+    );
+    // A transaction still holding capacity is live, so its retries never expire.
+    let Output::Transaction(held) = app.execute(prepare_at("held", T)).unwrap() else {
+        panic!()
+    };
+    assert_eq!(held.state, State::Prepared {});
+    assert_eq!(snapshot(&store).revision, revision);
+    app.execute(commit_at("held", T)).unwrap();
+}
+#[test]
+fn new_ids_must_be_uuid_v7_created_near_the_clock() {
+    let (store, app, _) = clocked();
+    let ahead = id_at("ahead", T + 5 * MINUTE + 1);
+    let error = app.execute(prepare_raw(&ahead, "-1")).unwrap_err();
+    assert_eq!(error.code, Code::InvalidInput);
+    assert_eq!(error.transaction_id.as_deref(), Some(ahead.as_str()));
+    let v4 = id_at("v4", T).replacen("-7", "-4", 1);
+    let upper = id_at("upper", T).to_uppercase();
+    let mut variant = id_at("variant", T);
+    variant.replace_range(19..20, "c");
+    for bad in ["plain", &v4, &upper, &variant] {
+        assert_eq!(
+            app.execute(prepare_raw(bad, "-1")).unwrap_err().code,
+            Code::InvalidInput,
+            "{bad}"
+        );
+    }
+    assert!(snapshot(&store).transactions.is_empty());
+    app.execute(prepare_at("ahead", T + 5 * MINUTE)).unwrap();
+}
+#[test]
+fn uuid_v7_round_trips_its_timestamp() {
+    for millis in [0, 1, T, (1 << 48) - 1] {
+        for random in [0, 1, u128::MAX] {
+            let id = rescrow_application::uuid_v7(millis, random);
+            assert_eq!(
+                rescrow_application::uuid_v7_millis(&id),
+                Some(millis),
+                "{id}"
+            );
+        }
+    }
+}
+#[test]
+fn recorded_times_never_go_backwards() {
+    let (store, app, clock) = clocked();
+    clock.store(T - HOUR, Ordering::Relaxed);
+    app.execute(prepare_at("late", T - HOUR)).unwrap();
+    let (checkpoint, mut entries) = store.raw();
+    assert!(entries.iter().all(|e| e.recorded_at_ms == T));
+    entries.last_mut().unwrap().recorded_at_ms = T - 1;
+    store.set_raw(checkpoint.unwrap(), entries);
+    assert_eq!(
+        app.execute(Command::ListResources).unwrap_err().code,
+        Code::CorruptState
+    );
 }

@@ -583,7 +583,11 @@ impl FileStore {
 }
 impl LogStore for FileStore {
     fn initialize(&self, empty: &Checkpoint) -> Result<(), StoreError> {
-        if empty.position != 0 || !empty.resources.is_empty() || !empty.prepared.is_empty() {
+        if empty.position != 0
+            || empty.recorded_at_ms != 0
+            || !empty.resources.is_empty()
+            || !empty.prepared.is_empty()
+        {
             return Err(StoreError::Corrupt(
                 "initial checkpoint must be empty at position zero".into(),
             ));
@@ -784,12 +788,23 @@ impl LogStore for FileStore {
         )
     }
     /// Search the active segment, then sealed indexes from newest to oldest.
-    fn find(&self, transaction_id: &str) -> Result<Option<Entry>, StoreError> {
+    /// Records are in time order, so a segment is skipped, with every older
+    /// one, once the segment after it starts before `since_ms`.
+    fn find(&self, transaction_id: &str, since_ms: u64) -> Result<Option<Entry>, StoreError> {
         let directory = self.directory_file()?;
         let (_lock, _) = self.lock(false, false)?;
         self.read_live()?;
         let segments = self.segments()?;
+        let terminal = |entry: &Entry| {
+            matches!(&entry.record, Record::Transaction(tx)
+                if tx.request.transaction_id == transaction_id
+                    && !matches!(tx.state, TxState::Prepared {}))
+        };
+        let mut newer_starts_ms = u64::MAX;
         for (position, first) in segments.iter().enumerate().rev() {
+            if newer_starts_ms < since_ms {
+                return Ok(None);
+            }
             let Some(index) = self.read_index(*first)? else {
                 if position + 1 != segments.len() {
                     return Err(StoreError::Corrupt(format!(
@@ -799,16 +814,24 @@ impl LogStore for FileStore {
                 let mut file = self.open_segment(*first, false)?;
                 let scan = self.scan(&mut file, 0, *first, true)?;
                 self.sync_read(&[&file, &open_directory(&self.log())?, &directory])?;
-                let found = scan.entries.into_iter().rev().find(|(entry, ..)| {
-                    matches!(&entry.record, Record::Transaction(tx)
-                        if tx.request.transaction_id == transaction_id
-                            && !matches!(tx.state, TxState::Prepared {}))
-                });
-                if let Some((entry, ..)) = found {
-                    return Ok(Some(entry));
+                if let Some((entry, ..)) = scan
+                    .entries
+                    .iter()
+                    .rev()
+                    .take_while(|(entry, ..)| entry.recorded_at_ms >= since_ms)
+                    .find(|(entry, ..)| terminal(entry))
+                {
+                    return Ok(Some(entry.clone()));
                 }
+                newer_starts_ms = scan
+                    .entries
+                    .first()
+                    .map_or(newer_starts_ms, |(entry, ..)| entry.recorded_at_ms);
                 continue;
             };
+            if index.length > 0 {
+                newer_starts_ms = self.read_record(*first, 0)?.recorded_at_ms;
+            }
             let Ok(at) = index
                 .entries
                 .binary_search_by(|e| e.transaction_id.as_str().cmp(transaction_id))
@@ -817,16 +840,12 @@ impl LogStore for FileStore {
             };
             let indexed = &index.entries[at];
             let entry = self.read_record(*first, indexed.offset)?;
-            let matches = entry.sequence == indexed.sequence
-                && matches!(&entry.record, Record::Transaction(tx)
-                    if tx.request.transaction_id == transaction_id
-                        && !matches!(tx.state, TxState::Prepared {}));
-            if !matches {
+            if entry.sequence != indexed.sequence || !terminal(&entry) {
                 return Err(StoreError::Corrupt(format!(
                     "index for segment {first} disagrees with its records"
                 )));
             }
-            return Ok(Some(entry));
+            return Ok((entry.recorded_at_ms >= since_ms).then_some(entry));
         }
         Ok(None)
     }

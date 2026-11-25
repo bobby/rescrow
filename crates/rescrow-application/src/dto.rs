@@ -23,6 +23,8 @@ pub struct Operation {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Prepare {
+    /// A UUIDv7, in canonical lowercase form, for a new prepare. Its timestamp
+    /// is when the client first created the request; every retry repeats it.
     pub transaction_id: String,
     pub operations: Vec<Operation>,
 }
@@ -168,6 +170,8 @@ pub struct Checkpoint {
     pub schema_version: u32,
     /// Number of log entries this checkpoint reflects.
     pub position: u64,
+    /// When the last of those entries was recorded, or zero if there are none.
+    pub recorded_at_ms: u64,
     pub resources: Vec<Resource>,
     pub prepared: Vec<Transaction>,
 }
@@ -188,6 +192,9 @@ pub enum Record {
 pub struct Entry {
     /// Zero-based log position; also the position a conditional append expects.
     pub sequence: u64,
+    /// When the Application recorded it, in milliseconds since the Unix epoch.
+    /// Never earlier than the entry before it.
+    pub recorded_at_ms: u64,
     pub record: Record,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

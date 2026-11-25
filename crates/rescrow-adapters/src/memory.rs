@@ -45,7 +45,11 @@ impl MemoryStore {
 }
 impl LogStore for MemoryStore {
     fn initialize(&self, empty: &Checkpoint) -> Result<(), StoreError> {
-        if empty.position != 0 || !empty.resources.is_empty() || !empty.prepared.is_empty() {
+        if empty.position != 0
+            || empty.recorded_at_ms != 0
+            || !empty.resources.is_empty()
+            || !empty.prepared.is_empty()
+        {
             return Err(StoreError::Corrupt(
                 "initial checkpoint must be empty at position zero".into(),
             ));
@@ -115,12 +119,13 @@ impl LogStore for MemoryStore {
         }
         Ok(())
     }
-    fn find(&self, transaction_id: &str) -> Result<Option<Entry>, StoreError> {
+    fn find(&self, transaction_id: &str, since_ms: u64) -> Result<Option<Entry>, StoreError> {
         let state = self.0.lock().unwrap();
         Ok(state
             .entries
             .iter()
             .rev()
+            .take_while(|entry| entry.recorded_at_ms >= since_ms)
             .find(|entry| match &entry.record {
                 Record::Transaction(tx) => {
                     tx.request.transaction_id == transaction_id
