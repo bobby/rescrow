@@ -199,6 +199,7 @@ pub struct Entry {
 )]
 pub enum Output {
     Initialized,
+    Migrated,
     Resource(Resource),
     Resources(Vec<Resource>),
     Transaction(Transaction),

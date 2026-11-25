@@ -57,6 +57,22 @@ impl LogStore for MemoryStore {
         state.checkpoint = Some(empty.clone());
         Ok(())
     }
+    fn import(&self, checkpoint: &Checkpoint, entries: &[Entry]) -> Result<(), StoreError> {
+        let ordered = entries.iter().zip(0..).all(|(e, n)| e.sequence == n);
+        if !ordered || checkpoint.position != entries.len() as u64 {
+            return Err(StoreError::Corrupt(
+                "imported entries must be numbered from zero, with the checkpoint at their end"
+                    .into(),
+            ));
+        }
+        let mut state = self.0.lock().unwrap();
+        if state.checkpoint.is_some() {
+            return Err(StoreError::Exists);
+        }
+        state.checkpoint = Some(checkpoint.clone());
+        state.entries = entries.to_vec();
+        Ok(())
+    }
     fn load(&self) -> Result<Loaded, StoreError> {
         let state = self.0.lock().unwrap();
         let checkpoint = state.checkpoint.clone().ok_or(StoreError::Missing)?;

@@ -22,6 +22,9 @@ struct Cli {
 enum Top {
     /// Initialize an empty store. Never overwrites an existing state.
     Init,
+    /// Convert a schema-1 store (state.json) to the log-structured format.
+    /// The old snapshot is kept as state.json.migrated and never read again.
+    Migrate,
     Resource {
         #[command(subcommand)]
         command: ResourceCommand,
@@ -110,7 +113,7 @@ fn main() -> ExitCode {
 fn run(cli: &Cli) -> Result<Output, Error> {
     // Convert files to transfer values before attempting any storage effects.
     let command = match &cli.command {
-        Top::Init => None,
+        Top::Init | Top::Migrate => None,
         Top::Resource { command } => Some(match command {
             ResourceCommand::Create {
                 id,
@@ -151,9 +154,13 @@ fn run(cli: &Cli) -> Result<Output, Error> {
         }),
     };
     let app = Application::new(FileStore::new(&cli.store)?);
-    match command {
-        Some(c) => app.execute(c),
-        None => app.initialize().map(|()| Output::Initialized),
+    match (command, &cli.command) {
+        (Some(c), _) => app.execute(c),
+        (None, Top::Migrate) => {
+            let snapshot = FileStore::new(&cli.store)?.legacy()?;
+            app.import(snapshot).map(|()| Output::Migrated)
+        }
+        (None, _) => app.initialize().map(|()| Output::Initialized),
     }
 }
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Error> {
@@ -170,6 +177,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Error> {
 fn human(output: &Output) -> String {
     match output {
         Output::Initialized => "Initialized empty local store.".into(),
+        Output::Migrated => "Migrated the store to the log-structured format.".into(),
         Output::Resource(r) => resource_text(r),
         Output::Resources(rs) => {
             if rs.is_empty() {

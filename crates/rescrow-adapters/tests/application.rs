@@ -238,6 +238,9 @@ impl LogStore for Competing {
     fn initialize(&self, c: &Checkpoint) -> Result<(), StoreError> {
         self.inner.initialize(c)
     }
+    fn import(&self, c: &Checkpoint, entries: &[Entry]) -> Result<(), StoreError> {
+        self.inner.import(c, entries)
+    }
     fn load(&self) -> Result<Loaded, StoreError> {
         self.inner.load()
     }
@@ -369,4 +372,99 @@ fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
     };
     store.set_raw(checkpoint.unwrap(), entries);
     assert_eq!(app.transactions().unwrap_err().code, Code::CorruptState);
+}
+
+/// A schema-1 snapshot covering every transaction state, including a legacy
+/// capacity rejection without details.
+fn legacy_snapshot() -> Snapshot {
+    let (store, app) = ready();
+    app.execute(prepare("held", "-2")).unwrap();
+    app.execute(prepare("used", "-1")).unwrap();
+    app.execute(Command::Commit(Commit {
+        transaction_id: "used".into(),
+        actuals: None,
+    }))
+    .unwrap();
+    app.execute(prepare("released", "1")).unwrap();
+    app.abort("released").unwrap();
+    app.execute(prepare("refused", "-9")).unwrap_err();
+    app.execute(prepare("legacy", "-9")).unwrap_err();
+    app.execute(Command::Prepare(Prepare {
+        transaction_id: "nowhere".into(),
+        operations: vec![Operation {
+            operation_id: "o".into(),
+            resource_id: "missing".into(),
+            delta: "-1".into(),
+        }],
+    }))
+    .unwrap_err();
+    let mut snapshot = snapshot(&store);
+    snapshot.schema_version = 1;
+    snapshot.revision = 42;
+    let legacy = snapshot
+        .transactions
+        .iter_mut()
+        .find(|tx| tx.request.transaction_id == "legacy")
+        .unwrap();
+    let State::Aborted { capacity, .. } = &mut legacy.state else {
+        panic!("expected a rejection");
+    };
+    *capacity = None;
+    snapshot
+}
+#[test]
+fn import_rebuilds_a_schema_1_snapshot_and_continues_from_it() {
+    let source = legacy_snapshot();
+    let store = MemoryStore::default();
+    let app = Application::new(store.clone());
+    app.import(source.clone()).unwrap();
+    let imported = app.snapshot().unwrap();
+    assert_eq!(
+        Snapshot {
+            revision: source.revision,
+            schema_version: source.schema_version,
+            ..imported.clone()
+        },
+        source
+    );
+    // The import is one checkpoint at the end of its entries.
+    let (checkpoint, entries) = store.raw();
+    assert_eq!(checkpoint.unwrap().position, entries.len() as u64);
+    assert_eq!(imported.revision, entries.len() as u64);
+    // Old decisions replay, and live holds settle normally.
+    assert_eq!(
+        app.abort("released").unwrap().request.transaction_id,
+        "released"
+    );
+    assert_eq!(
+        app.execute(prepare("refused", "-9")).unwrap_err().code,
+        Code::Capacity
+    );
+    app.execute(Command::Commit(Commit {
+        transaction_id: "held".into(),
+        actuals: None,
+    }))
+    .unwrap();
+    assert_eq!(app.resource("r").unwrap().quantity, "2");
+    assert_eq!(app.snapshot().unwrap().revision, imported.revision + 1);
+    assert_eq!(
+        app.import(source).unwrap_err().code,
+        Code::AlreadyInitialized
+    );
+}
+#[test]
+fn import_validates_the_snapshot_before_creating_anything() {
+    let mut corrupt = legacy_snapshot();
+    corrupt.resources[0].quantity = "3".into();
+    let mut unsupported = legacy_snapshot();
+    unsupported.schema_version = 3;
+    for (snapshot, code) in [
+        (corrupt, Code::CorruptState),
+        (unsupported, Code::UnsupportedSchema),
+    ] {
+        let store = MemoryStore::default();
+        let app = Application::new(store.clone());
+        assert_eq!(app.import(snapshot).unwrap_err().code, code);
+        assert_eq!(store.raw(), (None, vec![]));
+    }
 }

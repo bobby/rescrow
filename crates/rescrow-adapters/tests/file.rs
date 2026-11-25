@@ -313,10 +313,16 @@ fn child_worker() {
     if std::env::var("RESCROW_TEST_CHECKPOINT").is_ok() {
         app = app.with_checkpoint_interval(1);
     }
-    let result = if std::env::var("RESCROW_TEST_ACTION").as_deref() == Ok("init") {
-        app.initialize().map(|()| Output::Initialized)
-    } else {
-        app.execute(prepare())
+    let result = match std::env::var("RESCROW_TEST_ACTION").as_deref() {
+        Ok("init") => app.initialize().map(|()| Output::Initialized),
+        Ok("migrate") => {
+            let snapshot = FileStore::new(std::env::var("RESCROW_TEST_STORE").unwrap())
+                .unwrap()
+                .legacy()
+                .unwrap();
+            app.import(snapshot).map(|()| Output::Migrated)
+        }
+        _ => app.execute(prepare()),
     };
     let expected = std::env::var("RESCROW_TEST_EXPECT").unwrap();
     match expected.as_str() {
@@ -671,4 +677,116 @@ fn finish_as(temp: &Temp, id: &str) {
     assert_eq!(after.revision, before.revision + 2);
     app.execute(commit_as(id, "-1")).unwrap();
     assert_eq!(temp.snapshot(), after);
+}
+
+/// A schema-1 store: owner-only directory, lock file and `state.json`.
+fn legacy_store(temp: &Temp) -> Snapshot {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let memory = rescrow_adapters::memory::MemoryStore::default();
+    let app = Application::new(memory);
+    app.initialize().unwrap();
+    app.execute(create()).unwrap();
+    app.execute(prepare()).unwrap();
+    app.execute(prepare_as("refused")).unwrap_err();
+    let mut snapshot = app.snapshot().unwrap();
+    snapshot.schema_version = 1;
+    snapshot.revision = 7;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(temp.store())
+        .unwrap();
+    for (name, bytes) in [
+        ("state.lock", Vec::new()),
+        ("state.json", serde_json::to_vec(&snapshot).unwrap()),
+    ] {
+        File::options()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(temp.store().join(name))
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+    }
+    snapshot
+}
+fn migrate(temp: &Temp) -> Result<(), rescrow_application::Error> {
+    let snapshot = FileStore::new(temp.store())
+        .unwrap()
+        .legacy()
+        .map_err(rescrow_application::Error::from)?;
+    temp.app().import(snapshot)
+}
+/// The imported ledger matches its source apart from the log's own revision.
+fn assert_migrated(temp: &Temp, source: &Snapshot) {
+    let imported = temp.snapshot();
+    assert_eq!(
+        Snapshot {
+            schema_version: 1,
+            revision: source.revision,
+            ..imported
+        },
+        *source
+    );
+    assert!(!temp.store().join("state.json").exists());
+    assert!(temp.store().join("state.json.migrated").exists());
+}
+#[test]
+fn migration_converts_a_schema_1_store_and_retires_its_snapshot() {
+    let temp = Temp::new();
+    let source = legacy_store(&temp);
+    let store = FileStore::new(temp.store()).unwrap();
+    assert_eq!(store.load().unwrap_err(), StoreError::Unsupported(1));
+    assert_eq!(
+        temp.app().initialize().unwrap_err().code,
+        Code::UnsupportedSchema
+    );
+    migrate(&temp).unwrap();
+    assert_migrated(&temp, &source);
+    assert_eq!(migrate(&temp).unwrap_err().code, Code::AlreadyInitialized);
+    // Old decisions replay and live holds settle normally.
+    let app = temp.app();
+    assert_eq!(
+        app.execute(prepare_as("refused")).unwrap_err().code,
+        Code::Capacity
+    );
+    app.execute(commit()).unwrap();
+    assert_eq!(temp.snapshot().resources[0].quantity, "2");
+}
+#[test]
+fn interrupted_migration_is_redone_or_completed() {
+    for stage in [
+        Stage::BeforeWrite,
+        Stage::FileSynced,
+        Stage::Renamed,
+        Stage::BeforeResponse,
+    ] {
+        let temp = Temp::new();
+        let source = legacy_store(&temp);
+        let mut process = Process::new(std::env::current_exe().unwrap());
+        process
+            .args(["--exact", "child_worker", "--nocapture"])
+            .env("RESCROW_TEST_STORE", temp.store())
+            .env("RESCROW_TEST_ACTION", "migrate")
+            .env("RESCROW_TEST_STAGE", format!("{stage:?}"))
+            .env("RESCROW_TEST_MODE", "kill")
+            .env("RESCROW_TEST_MARKER", temp.0.join("reached"))
+            .env("RESCROW_TEST_EXPECT", "io")
+            .stdout(std::process::Stdio::null());
+        kill_with(&temp, stage, "kill", process.spawn().unwrap());
+        let published = matches!(stage, Stage::Renamed | Stage::BeforeResponse);
+        // Until live.json is published the snapshot stays authoritative;
+        // afterwards the log is, even before the snapshot is retired.
+        if published {
+            assert_eq!(temp.snapshot().resources, source.resources);
+            assert_eq!(migrate(&temp).unwrap_err().code, Code::AlreadyInitialized);
+        } else {
+            assert_eq!(
+                FileStore::new(temp.store()).unwrap().load().unwrap_err(),
+                StoreError::Unsupported(1)
+            );
+            migrate(&temp).unwrap();
+        }
+        assert_migrated(&temp, &source);
+    }
 }

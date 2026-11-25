@@ -187,6 +187,13 @@ pub struct Loaded {
 /// replaces state.
 pub trait LogStore {
     fn initialize(&self, empty: &dto::Checkpoint) -> Result<(), StoreError>;
+    /// Create an authority holding exactly these entries, with a checkpoint at
+    /// their end. Like initialization, never replaces existing live state.
+    fn import(
+        &self,
+        checkpoint: &dto::Checkpoint,
+        entries: &[dto::Entry],
+    ) -> Result<(), StoreError>;
     fn load(&self) -> Result<Loaded, StoreError>;
     /// Append at `entry.sequence` only if the log holds exactly that many entries.
     fn append(&self, entry: &dto::Entry) -> Result<Publication, StoreError>;
@@ -237,6 +244,18 @@ impl<S: LogStore> Application<S> {
     pub fn initialize(&self) -> Result<(), Error> {
         self.store
             .initialize(&checkpoint_dto(&d::Live::default(), 0))?;
+        Ok(())
+    }
+    /// Create a log-structured authority from a schema-1 snapshot. The snapshot
+    /// is fully validated first, and the new log is then rebuilt and compared
+    /// with it. Transaction history keeps its decisions but not the old revision.
+    pub fn import(&self, snapshot: Snapshot) -> Result<(), Error> {
+        let ledger = validated_snapshot(snapshot)?;
+        let (checkpoint, entries) = imported(&ledger);
+        self.store.import(&checkpoint, &entries)?;
+        if self.snapshot()? != Snapshot::from_ledger(&ledger, checkpoint.position) {
+            return Err(corrupt("imported log does not reproduce its snapshot"));
+        }
         Ok(())
     }
     /// Transport dispatcher; Rust callers may use the specific methods below.
@@ -549,6 +568,34 @@ fn replay(view: &mut View, record: dto::Record) -> Result<(), Error> {
     };
     view.live = view.live.apply(&changes);
     Ok(())
+}
+/// Entries that rebuild a validated ledger: each resource's creation, then each
+/// transaction's preparation and decision. They precede the checkpoint, so they
+/// are validated as whole history rather than replayed in order.
+fn imported(ledger: &d::Ledger) -> (dto::Checkpoint, Vec<dto::Entry>) {
+    let mut records: Vec<dto::Record> = ledger
+        .resources()
+        .values()
+        .map(|r| dto::Record::ResourceCreated(r.spec().into()))
+        .collect();
+    for tx in ledger.transactions().values() {
+        match tx.state() {
+            d::State::Prepared | d::State::Aborted(d::AbortReason::Rejected(_)) => {}
+            d::State::Committed(_) | d::State::Aborted(d::AbortReason::Requested) => {
+                let mut prepared = dto::Transaction::from(tx);
+                prepared.state = dto::State::Prepared {};
+                records.push(dto::Record::Transaction(prepared));
+            }
+        }
+        records.push(dto::Record::Transaction(tx.into()));
+    }
+    let entries: Vec<_> = records
+        .into_iter()
+        .zip(0..)
+        .map(|(record, sequence)| dto::Entry { sequence, record })
+        .collect();
+    let checkpoint = checkpoint_dto(&ledger.live(), entries.len() as u64);
+    (checkpoint, entries)
 }
 fn record(changes: &transition::Changes) -> dto::Record {
     match changes.transaction() {
