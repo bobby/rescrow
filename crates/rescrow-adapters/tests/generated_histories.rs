@@ -302,9 +302,25 @@ impl Harness {
             .with_checkpoint_interval(3)
             .with_clock(move || clock.load(Ordering::Relaxed))
     }
-    fn wait(&mut self, ms: u64) {
+    /// Advance the clock. A service lapses every hold this makes due, at a
+    /// time of its own choosing; lapsing them now keeps the history exact.
+    /// Its timer may get there first, which leaves the same state, and finds
+    /// nothing more afterwards, because the clock moves only here.
+    fn wait(&mut self, ms: u64) -> TestResult {
         self.model.now += ms;
         self.clock.store(self.model.now, Ordering::Relaxed);
+        let Some(service) = &self.service else {
+            return Ok(());
+        };
+        let lapsed = service
+            .lapse()
+            .map_err(|e| TestCaseError::fail(format!("unexpected lapse error: {e}")))?;
+        let expected: Vec<_> = self.model.lapse_all().into_iter().map(tx_id).collect();
+        for tx in lapsed {
+            prop_assert!(expected.contains(&tx.request.transaction_id), "{:?}", tx);
+        }
+        prop_assert_eq!(self.snapshot()?, self.model.snapshot(self.model.position));
+        Ok(())
     }
     fn snapshot(&self) -> Result<dto::Snapshot, TestCaseError> {
         self.app()
@@ -438,7 +454,7 @@ fn history(service: bool, initial: Vec<Spec>, steps: Vec<Step>) -> TestResult {
             Some(command) => h.apply(command, step.effect, step.reload)?,
             None => {
                 if let Action::Wait(ms) = step.action {
-                    h.wait(ms);
+                    h.wait(ms)?;
                 }
             }
         }

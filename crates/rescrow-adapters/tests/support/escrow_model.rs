@@ -153,6 +153,19 @@ impl Model {
             }
         }
     }
+    /// Lapse every overdue hold, as a long-lived service does at each deadline,
+    /// and return the lapsed transactions. The CLI histories, which include
+    /// this model too, have no service.
+    #[allow(dead_code)]
+    pub fn lapse_all(&mut self) -> Vec<u16> {
+        let before = self.transactions.clone();
+        self.lapse_due(&self.resources.keys().copied().collect::<Vec<_>>());
+        self.transactions
+            .iter()
+            .filter(|(id, tx)| before[*id].state != tx.state)
+            .map(|(id, _)| *id)
+            .collect()
+    }
     fn resources_of(&self, id: u16) -> Vec<u8> {
         self.transactions[&id]
             .operations
