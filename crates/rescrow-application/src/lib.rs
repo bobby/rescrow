@@ -273,6 +273,8 @@ pub(crate) enum Write {
         actuals: Option<Vec<(d::Id, i128)>>,
     },
     Abort(d::Id),
+    /// Lapse every overdue hold, on any resource.
+    Lapse,
 }
 impl Write {
     pub(crate) fn create(spec: dto::ResourceSpec) -> Result<Self, Error> {
@@ -623,14 +625,17 @@ impl<S: LogStore> Application<S> {
             let mut entries = Vec::new();
             let mut outputs = Vec::with_capacity(writes.len());
             for write in writes {
-                outputs.push(
-                    lapse_due(&mut view, write, &mut entries)
-                        .and_then(|()| self.evaluate(&view, write))
-                        .and_then(|(changes, output)| {
+                outputs.push(lapse_due(&mut view, write, &mut entries).and_then(
+                    |lapsed| match write {
+                        Write::Lapse => Ok(Output::Transactions(
+                            lapsed.iter().map(Into::into).collect(),
+                        )),
+                        _ => self.evaluate(&view, write).and_then(|(changes, output)| {
                             push(&mut view, &changes, &mut entries)?;
                             output
                         }),
-                );
+                    },
+                ));
             }
             if entries.is_empty() {
                 return (Some(view), outputs);
@@ -712,6 +717,11 @@ impl<S: LogStore> Application<S> {
                 let output = changes.transaction().unwrap_or(&tx).into();
                 Ok((changes, Ok(Output::Transaction(output))))
             }
+            // Its lapses are all it changes, and `lapse_due` records them.
+            Write::Lapse => Ok((
+                transition::Changes::default(),
+                Ok(Output::Transactions(vec![])),
+            )),
         }
     }
 }
@@ -735,35 +745,38 @@ fn push(
     Ok(())
 }
 /// Lapse the overdue holds on the resources a write could reserve or
-/// release, recording each lapse ahead of the write. Capacity returns only
-/// through these durable decisions, exactly when a write may need it.
-fn lapse_due(view: &mut View, write: &Write, entries: &mut Vec<dto::Entry>) -> Result<(), Error> {
-    let request = match write {
-        Write::Create(_) => return Ok(()),
-        Write::Prepare(request) => Some(request),
-        Write::Commit { id, .. } | Write::Abort(id) => {
-            view.live.prepared().get(id).map(d::Transaction::request)
-        }
+/// release, recording each lapse ahead of the write, and return the lapsed
+/// transactions. Capacity returns only through these durable decisions,
+/// exactly when a write may need it. A lapse write covers every resource.
+fn lapse_due(
+    view: &mut View,
+    write: &Write,
+    entries: &mut Vec<dto::Entry>,
+) -> Result<Vec<d::Transaction>, Error> {
+    let (live, now) = (&view.live, view.now_ms);
+    let on = |request: &d::Request| {
+        live.due(request.operations().iter().map(d::Operation::resource), now)
     };
-    let Some(request) = request else {
-        return Ok(());
-    };
-    let due: Vec<d::Id> = view
-        .live
-        .due(
-            request.operations().iter().map(d::Operation::resource),
-            view.now_ms,
-        )
-        .into_iter()
-        .map(|tx| tx.request().id().clone())
-        .collect();
-    for id in due {
-        let tx = view.live.prepared()[&id].clone();
-        let changes =
-            transition::lapse(&tx, view.live.resources(), view.now_ms).map_err(Error::domain)?;
-        push(view, &changes, entries)?;
+    let due: Vec<d::Transaction> = match write {
+        Write::Create(_) => vec![],
+        Write::Lapse => live.due(live.resources().keys(), now),
+        Write::Prepare(request) => on(request),
+        Write::Commit { id, .. } | Write::Abort(id) => live
+            .prepared()
+            .get(id)
+            .map(|tx| on(tx.request()))
+            .unwrap_or_default(),
     }
-    Ok(())
+    .into_iter()
+    .cloned()
+    .collect();
+    let mut lapsed = Vec::with_capacity(due.len());
+    for tx in due {
+        let changes = transition::lapse(&tx, view.live.resources(), now).map_err(Error::domain)?;
+        push(view, &changes, entries)?;
+        lapsed.extend(changes.transaction().cloned());
+    }
+    Ok(lapsed)
 }
 /// Re-run the recorded transition and require that it reproduces the record.
 fn replay(view: &mut View, record: dto::Record) -> Result<(), Error> {

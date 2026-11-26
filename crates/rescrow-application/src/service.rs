@@ -6,29 +6,40 @@
 //! appends all their records together with one synchronization (group
 //! commit). Each write's caller is answered once its record is durable.
 //!
+//! Holds also lapse without a write: the writer waits for the next write or
+//! the earliest deadline, whichever comes first, and at a deadline appends the
+//! lapse of every overdue hold as a write of its own. Whether a hold is due is
+//! decided by the Application's clock, so the timer only chooses when to look.
+//!
 //! The service's state includes only its own writes and those it reloaded
 //! after losing a race. If other processes also write the store, they stay
 //! safe, because appends are still conditional, but reads here can lag their
 //! writes until this service next writes.
 use crate::{
-    Application, Error, LogStore, StoreError, View, Write, dto::Command, dto::Output, resource_in,
+    Application, Error, LogStore, StoreError, View, Write,
+    dto::{self, Command, Output},
+    resource_in,
 };
 use arc_swap::ArcSwap;
 use std::{
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
-        mpsc,
+        mpsc::{self, RecvTimeoutError},
     },
     thread,
+    time::Duration,
 };
 
 /// The most writes committed together.
 const MAX_BATCH: usize = 256;
+/// How long the timer waits to try again after its lapse failed.
+const RETRY_MS: u64 = 1000;
 
 struct Job {
     write: Write,
-    reply: mpsc::SyncSender<Result<Output, Error>>,
+    /// Absent for the timer's own lapse, which no caller waits for.
+    reply: Option<mpsc::SyncSender<Result<Output, Error>>>,
 }
 
 /// Counts of appended batches and the writes they carried.
@@ -106,6 +117,14 @@ impl<S: LogStore + Send + Sync + 'static> Service<S> {
             Command::ListTransactions => self.app.transactions().map(Output::Transactions),
         }
     }
+    /// Lapse every overdue hold now, rather than at the writer's next timer,
+    /// and return the lapsed transactions.
+    pub fn lapse(&self) -> Result<Vec<dto::Transaction>, Error> {
+        match self.write(Ok(Write::Lapse))? {
+            Output::Transactions(lapsed) => Ok(lapsed),
+            _ => unreachable!("a lapse outputs the transactions it lapsed"),
+        }
+    }
     pub fn stats(&self) -> &Stats {
         &self.stats
     }
@@ -113,7 +132,7 @@ impl<S: LogStore + Send + Sync + 'static> Service<S> {
         let (reply, response) = mpsc::sync_channel(1);
         let job = Job {
             write: write?,
-            reply,
+            reply: Some(reply),
         };
         let stopped = || Error::from(StoreError::Io("the service's writer has stopped".into()));
         self.jobs
@@ -133,7 +152,8 @@ impl<S> Drop for Service<S> {
     }
 }
 /// The writer thread. It owns the latest durable state, or none after an
-/// unknown outcome, when the next batch reloads it.
+/// unknown outcome, when the next batch reloads it. Until then it keeps the
+/// last known deadline.
 fn run<S: LogStore>(
     app: &Application<S>,
     current: &ArcSwap<View>,
@@ -141,8 +161,22 @@ fn run<S: LogStore>(
     view: View,
     queue: &mpsc::Receiver<Job>,
 ) {
+    let mut deadline = view.live().next_deadline();
     let mut state = Some(view);
-    while let Ok(first) = queue.recv() {
+    loop {
+        let first = match deadline {
+            None => queue.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            Some(at) => queue.recv_timeout(Duration::from_millis(at.saturating_sub((app.clock)()))),
+        };
+        let timer = matches!(first, Err(RecvTimeoutError::Timeout));
+        let first = match first {
+            Ok(job) => job,
+            Err(RecvTimeoutError::Timeout) => Job {
+                write: Write::Lapse,
+                reply: None,
+            },
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
         let mut jobs = vec![first];
         jobs.extend(queue.try_iter().take(MAX_BATCH - 1));
         let writes: Vec<&Write> = jobs.iter().map(|job| &job.write).collect();
@@ -153,11 +187,20 @@ fn run<S: LogStore>(
         if let Some(next) = &next {
             current.store(Arc::new(next.clone()));
         }
+        if let Some(next) = &next {
+            deadline = next.live().next_deadline();
+        }
+        if timer && outputs[0].is_err() {
+            // Don't spin on a failing store; any write still runs at once.
+            deadline = deadline.map(|at| at.max((app.clock)().saturating_add(RETRY_MS)));
+        }
         state = next;
         stats.batches.fetch_add(1, Ordering::Relaxed);
         stats.writes.fetch_add(jobs.len() as u64, Ordering::Relaxed);
         for (job, output) in jobs.into_iter().zip(outputs) {
-            let _ = job.reply.send(output);
+            if let Some(reply) = job.reply {
+                let _ = reply.send(output);
+            }
         }
     }
 }

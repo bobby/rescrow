@@ -637,6 +637,13 @@ impl Live {
             .filter(|tx| tx.is_due(now_ms))
             .collect()
     }
+    /// The earliest deadline among prepared transactions, if any has one.
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.prepared
+            .values()
+            .filter_map(Transaction::expires_at_ms)
+            .min()
+    }
     /// Validate that holds and prepared transactions describe each other exactly.
     /// Balances are not reconstructed from history; a full Ledger restore does that.
     pub fn restore(resources: Vec<Resource>, prepared: Vec<Transaction>) -> Result<Self, Error> {

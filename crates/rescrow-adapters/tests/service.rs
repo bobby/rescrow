@@ -7,7 +7,7 @@ use rescrow_application::{
 use std::{
     sync::{
         Arc, Barrier,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -65,6 +65,65 @@ fn prepare(id: &str) -> Command {
         }],
         hold_ms: None,
     })
+}
+fn held(id: &str, hold_ms: u64) -> Command {
+    let Command::Prepare(mut request) = prepare(id) else {
+        unreachable!()
+    };
+    request.hold_ms = Some(hold_ms);
+    Command::Prepare(request)
+}
+fn show<S: LogStore + Send + Sync + 'static>(service: &Service<S>) -> (String, String) {
+    quantity(
+        service
+            .execute(Command::ShowResource {
+                resource_id: "r".into(),
+            })
+            .unwrap(),
+    )
+}
+fn lapsed(output: Output) -> bool {
+    matches!(
+        output,
+        Output::Transaction(Transaction {
+            state: State::Aborted {
+                cause: AbortReason::Lapsed,
+                ..
+            },
+            ..
+        })
+    )
+}
+/// Entries in the store's history that lapse `id`.
+fn lapses(store: &MemoryStore, id: &str) -> usize {
+    store
+        .history()
+        .unwrap()
+        .into_iter()
+        .filter(|e| match &e.record {
+            Record::Transaction(tx) => {
+                tx.request.transaction_id == id
+                    && matches!(
+                        tx.state,
+                        State::Aborted {
+                            cause: AbortReason::Lapsed,
+                            ..
+                        }
+                    )
+            }
+            _ => false,
+        })
+        .count()
+}
+/// A service and a clock it reads, which moves only when the test moves it.
+fn clocked(store: &MemoryStore, now: u64) -> (Service<MemoryStore>, Arc<AtomicU64>) {
+    let app = Application::new(store.clone());
+    app.initialize().unwrap();
+    app.execute(create("5")).unwrap();
+    let clock = Arc::new(AtomicU64::new(now));
+    let read = clock.clone();
+    let app = Application::new(store.clone()).with_clock(move || read.load(Ordering::Relaxed));
+    (Service::start(app).unwrap(), clock)
 }
 fn id(n: u128) -> String {
     uuid_v7(system_clock(), n)
@@ -221,4 +280,73 @@ fn an_unknown_outcome_reaches_every_write_in_its_batch_and_reloads() {
     let snapshot = Application::new(store.clone()).snapshot().unwrap();
     assert_eq!(snapshot.transactions.len(), 5);
     assert_eq!(snapshot.resources[0].reserved_down, "5");
+}
+
+#[test]
+fn an_idle_service_lapses_a_hold_at_its_deadline() {
+    let store = MemoryStore::default();
+    let service = ready(&store, "5");
+    let tx = id(0);
+    service.execute(held(&tx, 50)).unwrap();
+    assert_eq!(show(&service), ("5".into(), "1".into()));
+    // Nothing else is written; reads alone see the capacity come back.
+    let start = Instant::now();
+    while show(&service).1 != "0" {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the hold never lapsed"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    let show_tx = Command::ShowTransaction {
+        transaction_id: tx.clone(),
+    };
+    assert!(lapsed(service.execute(show_tx.clone()).unwrap()));
+    // The lapse is a durable decision, which replay accepts.
+    assert!(lapsed(
+        Application::new(store.clone()).execute(show_tx).unwrap()
+    ));
+    assert_eq!(lapses(&store, &tx), 1);
+}
+#[test]
+fn a_hold_another_writer_lapsed_is_not_lapsed_again() {
+    let store = MemoryStore::default();
+    let now = system_clock();
+    let (service, clock) = clocked(&store, now);
+    let tx = id(0);
+    service.execute(held(&tx, 10)).unwrap();
+    // Another process, whose clock has passed the deadline, writes the
+    // resource and so lapses the hold. The service hasn't seen it.
+    let other = Application::new(store.clone()).with_clock(move || now + 1000);
+    other.execute(prepare(&id(1))).unwrap();
+    assert_eq!(lapses(&store, &tx), 1);
+    // Now the service's clock passes the deadline too. Its timer, or this
+    // lapse, loses the race to append, reloads, and finds nothing due.
+    clock.store(now + 1000, Ordering::Relaxed);
+    assert_eq!(service.lapse().unwrap(), vec![]);
+    assert_eq!(lapses(&store, &tx), 1);
+    assert_eq!(show(&service), ("5".into(), "1".into()));
+}
+#[test]
+fn a_failed_lapse_is_retried_after_a_pause() {
+    let store = MemoryStore::default();
+    let now = system_clock();
+    let (service, clock) = clocked(&store, now);
+    let tx = id(0);
+    service.execute(held(&tx, 10)).unwrap();
+    let appends = store.evaluations();
+    store.inject(Fault::BeforePublication);
+    clock.store(now + 100, Ordering::Relaxed);
+    let start = Instant::now();
+    while lapses(&store, &tx) == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the hold never lapsed"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    // One failed append, then one that lapsed it a second later, not a spin.
+    assert_eq!(store.evaluations() - appends, 2);
+    assert!(start.elapsed() >= Duration::from_millis(900));
+    assert_eq!(show(&service), ("5".into(), "0".into()));
 }
