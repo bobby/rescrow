@@ -366,3 +366,53 @@ fn machine_errors_invalid_inputs_and_exact_large_signed_values() {
             .contains("quantity=-9007199254740993")
     );
 }
+#[test]
+fn an_abandoned_hold_lapses_when_a_later_prepare_needs_its_capacity() {
+    let c = Case::new();
+    c.ready("10");
+    let all = c.file(
+        "all.json",
+        r#"[{"operation_id":"o","resource_id":"r","delta":"-10"}]"#,
+    );
+    let prepare = |name: &str, extra: &[&str]| {
+        let id = tx(name);
+        let mut args = vec!["transaction", "prepare", &id, "--operations", &all];
+        args.extend_from_slice(extra);
+        c.run(&args)
+    };
+    let held = prepare("abandoned", &["--hold", "1s"]);
+    assert!(held.status.success());
+    let Output::Transaction(held) = serde_json::from_slice(&held.stdout).unwrap() else {
+        panic!("expected a transaction")
+    };
+    assert_eq!(held.request.hold_ms, Some(1_000));
+    assert!(held.expires_at_ms.is_some());
+    // While the hold lasts, its capacity is unavailable.
+    assert_eq!(prepare("early", &[]).status.code(), Some(3));
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    assert!(prepare("later", &[]).status.success());
+    let Output::Transaction(lapsed) = c.ok(&["transaction", "show", &tx("abandoned")]) else {
+        panic!("expected a transaction")
+    };
+    assert_eq!(
+        lapsed.state,
+        State::Aborted {
+            cause: AbortReason::Lapsed,
+            capacity: None,
+        }
+    );
+    assert_eq!(
+        c.run(&["transaction", "commit", &tx("abandoned")])
+            .status
+            .code(),
+        Some(4)
+    );
+    // Durations need a unit and must fit the 30-day limit.
+    for invalid in ["10", "5x", "31d", "0s"] {
+        assert_eq!(
+            prepare("invalid", &["--hold", invalid]).status.code(),
+            Some(2),
+            "{invalid}"
+        );
+    }
+}

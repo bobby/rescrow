@@ -41,6 +41,7 @@ fn prepare_raw(transaction_id: &str, delta: &str) -> Command {
             resource_id: "r".into(),
             delta: delta.into(),
         }],
+        hold_ms: None,
     })
 }
 fn snapshot(store: &MemoryStore) -> Snapshot {
@@ -342,6 +343,7 @@ fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
             resource_id: "r".into(),
             delta: "-3".into(),
         }],
+        hold_ms: None,
     })
     .unwrap();
     let request = Prepare {
@@ -351,6 +353,7 @@ fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
             resource_id: "r".into(),
             delta: "-4".into(),
         }],
+        hold_ms: None,
     };
     let error = app.prepare(request.clone()).unwrap_err();
     assert_eq!(
@@ -509,4 +512,155 @@ fn recorded_times_never_go_backwards() {
         app.execute(Command::ListResources).unwrap_err().code,
         Code::CorruptState
     );
+}
+
+fn hold_at(name: &str, created_at_ms: u64, delta: &str, hold_ms: Option<u64>) -> Command {
+    let Command::Prepare(mut request) = prepare_raw(&id_at(name, created_at_ms), delta) else {
+        unreachable!()
+    };
+    request.hold_ms = hold_ms;
+    Command::Prepare(request)
+}
+fn transaction(output: Output) -> Transaction {
+    let Output::Transaction(tx) = output else {
+        panic!("expected a transaction")
+    };
+    tx
+}
+fn lapsed() -> State {
+    State::Aborted {
+        cause: AbortReason::Lapsed,
+        capacity: None,
+    }
+}
+#[test]
+fn a_hold_lapses_in_the_same_append_as_the_write_that_needs_its_capacity() {
+    let (store, app, clock) = clocked();
+    let held = transaction(app.execute(hold_at("held", T, "-5", Some(1_000))).unwrap());
+    assert_eq!(held.expires_at_ms, Some(T + 1_000));
+    // Before the deadline the hold keeps its capacity.
+    clock.store(T + 999, Ordering::Relaxed);
+    assert_eq!(
+        app.execute(hold_at("early", T, "-1", None))
+            .unwrap_err()
+            .code,
+        Code::Capacity
+    );
+    // After it, reads still show the hold until a write needs its capacity.
+    clock.store(T + 1_000, Ordering::Relaxed);
+    assert_eq!(app.resource("r").unwrap().reserved_down, "5");
+    let (revision, appends) = (snapshot(&store).revision, store.evaluations());
+    app.execute(hold_at("late", T, "-5", None)).unwrap();
+    assert_eq!(store.evaluations() - appends, 1);
+    assert_eq!(snapshot(&store).revision, revision + 2);
+    let (_, entries) = store.raw();
+    let Record::Transaction(lapse) = &entries[entries.len() - 2].record else {
+        panic!("expected the lapse first")
+    };
+    assert_eq!(lapse.request.transaction_id, held.request.transaction_id);
+    assert_eq!(lapse.state, lapsed());
+    assert_eq!(
+        app.transaction(&held.request.transaction_id).unwrap(),
+        Transaction {
+            state: lapsed(),
+            ..held
+        }
+    );
+}
+#[test]
+fn a_decision_after_the_deadline_finds_the_hold_lapsed() {
+    let (_, app, clock) = clocked();
+    let held = |name| hold_at(name, T, "-1", Some(1_000));
+    app.execute(held("won")).unwrap();
+    app.execute(held("lost")).unwrap();
+    app.execute(held("aborted")).unwrap();
+    // A commit before the deadline wins.
+    clock.store(T + 999, Ordering::Relaxed);
+    app.execute(commit_at("won", T)).unwrap();
+    clock.store(T + 1_000, Ordering::Relaxed);
+    let commit = app.execute(commit_at("lost", T)).unwrap_err();
+    assert_eq!(
+        (commit.code, commit.transaction_id),
+        (Code::Conflict, Some(id_at("lost", T)))
+    );
+    let abort = app
+        .execute(Command::Abort {
+            transaction_id: id_at("aborted", T),
+        })
+        .unwrap();
+    assert_eq!(transaction(abort).state, lapsed());
+    // A retried prepare returns the lapse with its original deadline; a
+    // different hold is a different request.
+    let replay = transaction(app.execute(held("lost")).unwrap());
+    assert_eq!(
+        (replay.state, replay.expires_at_ms),
+        (lapsed(), Some(T + 1_000))
+    );
+    assert_eq!(
+        app.execute(hold_at("lost", T, "-1", Some(2_000)))
+            .unwrap_err()
+            .code,
+        Code::Conflict
+    );
+    assert_eq!(app.resource("r").unwrap().quantity, "4");
+}
+#[test]
+fn writes_lapse_only_holds_on_their_own_resources() {
+    let (store, app, clock) = clocked();
+    app.execute(Command::CreateResource(ResourceSpec {
+        resource_id: "s".into(),
+        lower: "0".into(),
+        upper: None,
+        initial: "5".into(),
+        unit: "u".into(),
+        scale: 0,
+    }))
+    .unwrap();
+    let Command::Prepare(mut elsewhere) = hold_at("elsewhere", T, "-1", Some(10)) else {
+        unreachable!()
+    };
+    elsewhere.operations[0].resource_id = "s".into();
+    app.execute(Command::Prepare(elsewhere)).unwrap();
+    app.execute(hold_at("forever", T, "-1", None)).unwrap();
+    clock.store(T + 30 * 24 * HOUR, Ordering::Relaxed);
+    let revision = snapshot(&store).revision;
+    app.execute(hold_at("here", T + 30 * 24 * HOUR, "-1", None))
+        .unwrap();
+    // Only the new prepare was appended: the hold on `s` waits for a write
+    // there, and a hold without a deadline never lapses.
+    assert_eq!(snapshot(&store).revision, revision + 1);
+    assert_eq!(app.resource("s").unwrap().reserved_down, "1");
+    assert_eq!(app.resource("r").unwrap().reserved_down, "2");
+}
+#[test]
+fn holds_must_last_from_one_millisecond_to_thirty_days() {
+    let (store, app, _) = clocked();
+    let before = snapshot(&store);
+    for hold in [0, 30 * 24 * HOUR + 1] {
+        let error = app
+            .execute(hold_at("invalid", T, "-1", Some(hold)))
+            .unwrap_err();
+        assert_eq!(
+            (error.category, error.code),
+            (Category::Input, Code::InvalidInput)
+        );
+    }
+    assert_eq!(snapshot(&store), before);
+    app.execute(hold_at("longest", T, "-1", Some(30 * 24 * HOUR)))
+        .unwrap();
+}
+#[test]
+fn a_recorded_lapse_must_follow_its_deadline() {
+    let (store, app, clock) = clocked();
+    app.execute(hold_at("held", T, "-1", Some(1_000))).unwrap();
+    clock.store(T + 1_000, Ordering::Relaxed);
+    app.execute(hold_at("next", T, "-1", None)).unwrap();
+    let (checkpoint, mut entries) = store.raw();
+    // Recording the lapse before its deadline would release capacity early.
+    let lapse = entries.len() - 2;
+    entries[lapse].recorded_at_ms = T + 999;
+    let next = entries.len() - 1;
+    entries[next].recorded_at_ms = T + 999;
+    store.set_raw(checkpoint.unwrap(), entries);
+    assert_eq!(app.resource("r").unwrap_err().code, Code::CorruptState);
 }

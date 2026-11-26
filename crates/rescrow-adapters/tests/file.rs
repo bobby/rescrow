@@ -103,6 +103,7 @@ fn prepare_raw(id: &str) -> Command {
             resource_id: "r".into(),
             delta: "-3".into(),
         }],
+        hold_ms: None,
     })
 }
 fn prepare() -> Command {

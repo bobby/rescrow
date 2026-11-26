@@ -477,7 +477,10 @@ impl<S: LogStore> Application<S> {
                             d::State::Prepared | d::State::Aborted(d::AbortReason::Rejected(_))
                         ) | (
                             Some(d::State::Prepared),
-                            d::State::Committed(_) | d::State::Aborted(d::AbortReason::Requested)
+                            d::State::Committed(_)
+                                | d::State::Aborted(
+                                    d::AbortReason::Requested | d::AbortReason::Lapsed
+                                )
                         )
                     );
                     if !valid || previous.is_some_and(|p| p.request() != tx.request()) {
@@ -620,18 +623,14 @@ impl<S: LogStore> Application<S> {
             let mut entries = Vec::new();
             let mut outputs = Vec::with_capacity(writes.len());
             for write in writes {
-                outputs.push(self.evaluate(&view, write).and_then(|(changes, output)| {
-                    if !changes.is_empty() {
-                        let sequence = view.position;
-                        view.advance(&changes)?;
-                        entries.push(dto::Entry {
-                            sequence,
-                            recorded_at_ms: view.now_ms,
-                            record: record(&changes),
-                        });
-                    }
-                    output
-                }));
+                outputs.push(
+                    lapse_due(&mut view, write, &mut entries)
+                        .and_then(|()| self.evaluate(&view, write))
+                        .and_then(|(changes, output)| {
+                            push(&mut view, &changes, &mut entries)?;
+                            output
+                        }),
+                );
             }
             if entries.is_empty() {
                 return (Some(view), outputs);
@@ -678,9 +677,13 @@ impl<S: LogStore> Application<S> {
                     Some(prepared) => Some(prepared.clone()),
                     None => self.lookup(view, request.id(), self.admit(view, request)?)?,
                 };
-                let changes =
-                    transition::prepare(request.clone(), existing.as_ref(), view.live.resources())
-                        .map_err(Error::domain)?;
+                let changes = transition::prepare(
+                    request.clone(),
+                    existing.as_ref(),
+                    view.live.resources(),
+                    view.now_ms,
+                )
+                .map_err(Error::domain)?;
                 let tx = changes
                     .transaction()
                     .or(existing.as_ref())
@@ -713,6 +716,55 @@ impl<S: LogStore> Application<S> {
     }
 }
 
+/// Advance `view` by a write's changes, recording them as the next entry.
+fn push(
+    view: &mut View,
+    changes: &transition::Changes,
+    entries: &mut Vec<dto::Entry>,
+) -> Result<(), Error> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let sequence = view.position;
+    view.advance(changes)?;
+    entries.push(dto::Entry {
+        sequence,
+        recorded_at_ms: view.now_ms,
+        record: record(changes),
+    });
+    Ok(())
+}
+/// Lapse the overdue holds on the resources a write could reserve or
+/// release, recording each lapse ahead of the write. Capacity returns only
+/// through these durable decisions, exactly when a write may need it.
+fn lapse_due(view: &mut View, write: &Write, entries: &mut Vec<dto::Entry>) -> Result<(), Error> {
+    let request = match write {
+        Write::Create(_) => return Ok(()),
+        Write::Prepare(request) => Some(request),
+        Write::Commit { id, .. } | Write::Abort(id) => {
+            view.live.prepared().get(id).map(d::Transaction::request)
+        }
+    };
+    let Some(request) = request else {
+        return Ok(());
+    };
+    let due: Vec<d::Id> = view
+        .live
+        .due(
+            request.operations().iter().map(d::Operation::resource),
+            view.now_ms,
+        )
+        .into_iter()
+        .map(|tx| tx.request().id().clone())
+        .collect();
+    for id in due {
+        let tx = view.live.prepared()[&id].clone();
+        let changes =
+            transition::lapse(&tx, view.live.resources(), view.now_ms).map_err(Error::domain)?;
+        push(view, &changes, entries)?;
+    }
+    Ok(())
+}
 /// Re-run the recorded transition and require that it reproduces the record.
 fn replay(view: &mut View, record: dto::Record) -> Result<(), Error> {
     let changes = match record {
@@ -735,7 +787,7 @@ fn replay(view: &mut View, record: dto::Record) -> Result<(), Error> {
                 (d::State::Prepared | d::State::Aborted(d::AbortReason::Rejected(_)), _)
                     if !known =>
                 {
-                    transition::prepare(tx.request().clone(), None, resources)
+                    transition::prepare(tx.request().clone(), None, resources, view.recorded_at_ms)
                 }
                 (d::State::Committed(actuals), Some(prepared)) => transition::commit(
                     prepared,
@@ -750,6 +802,9 @@ fn replay(view: &mut View, record: dto::Record) -> Result<(), Error> {
                 ),
                 (d::State::Aborted(d::AbortReason::Requested), Some(prepared)) => {
                     transition::abort(prepared, resources)
+                }
+                (d::State::Aborted(d::AbortReason::Lapsed), Some(prepared)) => {
+                    transition::lapse(prepared, resources, view.recorded_at_ms)
                 }
                 _ => return Err(corrupt("transaction record out of order")),
             }

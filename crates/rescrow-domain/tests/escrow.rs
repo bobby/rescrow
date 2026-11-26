@@ -46,7 +46,7 @@ fn construction_and_numeric_edges() {
         .create(resource("min", i128::MIN, Some(-1), i128::MIN))
         .unwrap();
     let min = min
-        .prepare(req("t", &[("o", "min", i128::MAX)]))
+        .prepare(req("t", &[("o", "min", i128::MAX)]), 0)
         .unwrap()
         .commit(&id("t"), None)
         .unwrap();
@@ -59,25 +59,29 @@ fn construction_and_numeric_edges() {
     let max = Ledger::default()
         .create(resource("max", 0, None, i128::MAX))
         .unwrap();
-    let rejected = max.prepare(req("t", &[("o", "max", 1)])).unwrap();
+    let rejected = max.prepare(req("t", &[("o", "max", 1)]), 0).unwrap();
     assert!(rejected.transactions()[&id("t")].rejection().is_some());
 }
 #[test]
 fn directions_do_not_fund_each_other_and_participants_are_atomic() {
     let original = base().create(resource("s", 0, Some(10), 1)).unwrap();
-    let held = original.prepare(req("credit", &[("a", "r", 5)])).unwrap();
-    let rejected = held.prepare(req("debit", &[("a", "r", -6)])).unwrap();
+    let held = original
+        .prepare(req("credit", &[("a", "r", 5)]), 0)
+        .unwrap();
+    let rejected = held.prepare(req("debit", &[("a", "r", -6)]), 0).unwrap();
     assert_eq!(rejected.resources(), held.resources());
     assert_eq!(original.resources()[&id("r")].holds().len(), 0);
-    let held = original.prepare(req("debit", &[("a", "r", -5)])).unwrap();
+    let held = original
+        .prepare(req("debit", &[("a", "r", -5)]), 0)
+        .unwrap();
     assert_eq!(
-        held.prepare(req("credit", &[("a", "r", 6)]))
+        held.prepare(req("credit", &[("a", "r", 6)]), 0)
             .unwrap()
             .resources(),
         held.resources()
     );
     let rejected = original
-        .prepare(req("multi", &[("a", "r", -2), ("b", "s", -2)]))
+        .prepare(req("multi", &[("a", "r", -2), ("b", "s", -2)]), 0)
         .unwrap();
     assert_eq!(rejected.resources(), original.resources());
     assert_eq!(
@@ -87,7 +91,7 @@ fn directions_do_not_fund_each_other_and_participants_are_atomic() {
         ))
     );
     let missing = original
-        .prepare(req("missing", &[("a", "unknown", 1)]))
+        .prepare(req("missing", &[("a", "unknown", 1)]), 0)
         .unwrap();
     assert_eq!(missing.resources(), original.resources());
     assert_eq!(
@@ -97,7 +101,7 @@ fn directions_do_not_fund_each_other_and_participants_are_atomic() {
     let created = missing.create(resource("unknown", 0, Some(10), 0)).unwrap();
     assert_eq!(
         created
-            .prepare(req("missing", &[("a", "unknown", 1)]))
+            .prepare(req("missing", &[("a", "unknown", 1)]), 0)
             .unwrap(),
         created
     );
@@ -111,15 +115,15 @@ fn directions_do_not_fund_each_other_and_participants_are_atomic() {
 fn replays_and_all_terminal_conflicts() {
     let request = req("t", &[("b", "r", -3), ("a", "s", 2)]);
     let original = base().create(resource("s", 0, Some(10), 1)).unwrap();
-    let prepared = original.prepare(request.clone()).unwrap();
+    let prepared = original.prepare(request.clone(), 0).unwrap();
     assert_eq!(
         prepared
-            .prepare(req("t", &[("a", "s", 2), ("b", "r", -3)]))
+            .prepare(req("t", &[("a", "s", 2), ("b", "r", -3)]), 0)
             .unwrap(),
         prepared
     );
     assert_eq!(
-        prepared.prepare(req("t", &[("b", "r", -2)])),
+        prepared.prepare(req("t", &[("b", "r", -2)]), 0),
         Err(Error::Conflict)
     );
     for actuals in [
@@ -143,37 +147,39 @@ fn replays_and_all_terminal_conflicts() {
     assert_eq!(committed.commit(&id("t"), None), Err(Error::Conflict));
     assert_eq!(committed.abort(&id("t")), Err(Error::Conflict));
     assert_eq!(
-        committed.prepare(req("t", &[("b", "r", -2)])),
+        committed.prepare(req("t", &[("b", "r", -2)]), 0),
         Err(Error::Conflict)
     );
     assert_eq!(
         committed.create(resource("r", 0, Some(10), 5)).unwrap(),
         committed
     );
-    assert_eq!(committed.prepare(request.clone()).unwrap(), committed);
+    assert_eq!(committed.prepare(request.clone(), 0).unwrap(), committed);
     let aborted = prepared.abort(&id("t")).unwrap();
     assert_eq!(aborted.abort(&id("t")).unwrap(), aborted);
     assert_eq!(aborted.commit(&id("t"), None), Err(Error::Conflict));
-    assert_eq!(aborted.prepare(request).unwrap(), aborted);
+    assert_eq!(aborted.prepare(request, 0).unwrap(), aborted);
     assert_eq!(aborted.resources(), original.resources());
     assert_eq!(
-        aborted.prepare(req("t", &[("b", "r", -2)])),
+        aborted.prepare(req("t", &[("b", "r", -2)]), 0),
         Err(Error::Conflict)
     );
-    let rejected = original.prepare(req("reject", &[("o", "r", -6)])).unwrap();
+    let rejected = original
+        .prepare(req("reject", &[("o", "r", -6)]), 0)
+        .unwrap();
     let funded = rejected
-        .prepare(req("fund", &[("o", "r", 5)]))
+        .prepare(req("fund", &[("o", "r", 5)]), 0)
         .unwrap()
         .commit(&id("fund"), None)
         .unwrap();
     assert_eq!(
-        funded.prepare(req("reject", &[("o", "r", -6)])).unwrap(),
+        funded.prepare(req("reject", &[("o", "r", -6)]), 0).unwrap(),
         funded
     );
     assert_eq!(funded.commit(&id("reject"), None), Err(Error::Conflict));
     assert_eq!(funded.abort(&id("reject")).unwrap(), funded);
     assert_eq!(
-        funded.prepare(req("reject", &[("o", "r", -5)])),
+        funded.prepare(req("reject", &[("o", "r", -5)]), 0),
         Err(Error::Conflict)
     );
     assert_eq!(
@@ -198,7 +204,7 @@ fn enumerate_reservations_outcomes_and_decision_orders() {
                 let start = Ledger::default()
                     .create(resource("r", 0, Some(4), q))
                     .unwrap();
-                let la = start.prepare(req("a", &[("o", "r", a)])).unwrap();
+                let la = start.prepare(req("a", &[("o", "r", a)]), 0).unwrap();
                 let admissible_a = a.min(0).abs() <= q && a.max(0) <= 4 - q;
                 assert_eq!(
                     la.transactions()[&id("a")].rejection().is_none(),
@@ -207,7 +213,7 @@ fn enumerate_reservations_outcomes_and_decision_orders() {
                 if !admissible_a {
                     continue;
                 }
-                let lab = la.prepare(req("b", &[("o", "r", b)])).unwrap();
+                let lab = la.prepare(req("b", &[("o", "r", b)]), 0).unwrap();
                 let admissible_b =
                     a.min(0).abs() + b.min(0).abs() <= q && a.max(0) + b.max(0) <= 4 - q;
                 assert_eq!(
@@ -249,8 +255,12 @@ fn overflowing_totals_are_retained_rejections_without_partial_holds() {
         let start = Ledger::default()
             .create(resource("r", 0, Some(i128::MAX), initial))
             .unwrap();
-        let held = start.prepare(req("first", &[("o", "r", delta)])).unwrap();
-        let rejected = held.prepare(req("overflow", &[("o", "r", extra)])).unwrap();
+        let held = start
+            .prepare(req("first", &[("o", "r", delta)]), 0)
+            .unwrap();
+        let rejected = held
+            .prepare(req("overflow", &[("o", "r", extra)]), 0)
+            .unwrap();
         assert_eq!(rejected.resources(), held.resources());
         assert_eq!(
             rejected.transactions()[&id("overflow")].rejection(),
@@ -259,7 +269,7 @@ fn overflowing_totals_are_retained_rejections_without_partial_holds() {
         let released = rejected.abort(&id("first")).unwrap();
         assert_eq!(
             released
-                .prepare(req("overflow", &[("o", "r", extra)]))
+                .prepare(req("overflow", &[("o", "r", extra)]), 0)
                 .unwrap(),
             released
         );

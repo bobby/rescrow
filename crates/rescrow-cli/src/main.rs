@@ -63,6 +63,11 @@ enum TransactionCommand {
         id: String,
         #[arg(long)]
         operations: PathBuf,
+        /// Let the hold lapse if it is still prepared this long after
+        /// admission, such as 500ms, 90s, 15m, 1h or 7d (at most 30d).
+        /// Without it, the hold lasts until committed or aborted.
+        #[arg(long, value_parser = duration_ms)]
+        hold: Option<u64>,
     },
     Show {
         id: String,
@@ -151,9 +156,14 @@ fn run(cli: &Cli) -> Result<Output, Error> {
             ResourceCommand::List => Command::ListResources,
         }),
         Top::Transaction { command } => Some(match command {
-            TransactionCommand::Prepare { id, operations } => Command::Prepare(Prepare {
+            TransactionCommand::Prepare {
+                id,
+                operations,
+                hold,
+            } => Command::Prepare(Prepare {
                 transaction_id: id.clone(),
                 operations: read_json(operations)?,
+                hold_ms: *hold,
             }),
             TransactionCommand::Show { id } => Command::ShowTransaction {
                 transaction_id: id.clone(),
@@ -177,6 +187,27 @@ fn run(cli: &Cli) -> Result<Output, Error> {
         (Some(c), _) => app.execute(c),
         (None, _) => app.initialize().map(|()| Output::Initialized),
     }
+}
+/// Milliseconds in a duration such as `500ms`, `90s`, `15m`, `1h` or `7d`.
+/// The Application checks its range.
+fn duration_ms(value: &str) -> Result<u64, String> {
+    let split = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (count, unit) = value.split_at(split);
+    let scale = match unit {
+        "ms" => 1,
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        _ => return Err("expected a whole number followed by ms, s, m, h or d".into()),
+    };
+    count
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(scale))
+        .ok_or_else(|| "expected a whole number followed by ms, s, m, h or d".into())
 }
 /// A UUIDv7 at the current time, its random bits from the OS.
 fn new_id() -> io::Result<String> {
@@ -250,8 +281,12 @@ fn transaction_text(t: &Transaction) -> String {
         ),
         State::Aborted { cause, .. } => format!("aborted ({cause:?})"),
     };
+    let expires = t
+        .expires_at_ms
+        .map(|at| format!("; expires at {at} ms"))
+        .unwrap_or_default();
     format!(
-        "{}: {state}; operations: {}",
+        "{}: {state}{expires}; operations: {}",
         t.request.transaction_id,
         t.request
             .operations

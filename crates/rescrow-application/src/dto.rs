@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub struct ResourceSpec {
     pub resource_id: String,
     pub lower: String,
-    #[serde(deserialize_with = "required_option")]
+    #[serde(deserialize_with = "required")]
     pub upper: Option<String>,
     pub initial: String,
     pub unit: String,
@@ -27,6 +27,10 @@ pub struct Prepare {
     /// is when the client first created the request; every retry repeats it.
     pub transaction_id: String,
     pub operations: Vec<Operation>,
+    /// How long the hold may last before it lapses, from 1 ms to 30 days, or
+    /// `null` for no automatic expiry. Part of the request: a retry repeats it.
+    #[serde(deserialize_with = "required")]
+    pub hold_ms: Option<u64>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,6 +97,8 @@ pub enum Rejection {
 pub enum AbortReason {
     Requested,
     Rejected(Rejection),
+    /// Still prepared when its deadline passed.
+    Lapsed,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
@@ -139,6 +145,9 @@ impl From<&d::CapacityFailure> for CapacityFailure {
 #[serde(deny_unknown_fields)]
 pub struct Transaction {
     pub request: Prepare,
+    /// When the hold may lapse, fixed at admission; `null` if it never does.
+    #[serde(deserialize_with = "required")]
+    pub expires_at_ms: Option<u64>,
     pub state: State,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,10 +221,11 @@ pub enum Output {
     Transactions(Vec<Transaction>),
 }
 
-fn required_option<'de, D: serde::Deserializer<'de>>(
+/// An optional value whose field must still be present, as `null` if absent.
+fn required<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
-) -> Result<Option<String>, D::Error> {
-    Option::<String>::deserialize(deserializer)
+) -> Result<Option<T>, D::Error> {
+    Option::<T>::deserialize(deserializer)
 }
 
 pub fn decimal(value: &str) -> Result<i128, d::Error> {
@@ -282,7 +292,8 @@ impl TryFrom<Prepare> for d::Request {
                 .into_iter()
                 .map(d::Operation::try_from)
                 .collect::<Result<_, _>>()?,
-        )
+        )?
+        .with_hold(v.hold_ms)
     }
 }
 impl From<&d::Request> for Prepare {
@@ -290,6 +301,7 @@ impl From<&d::Request> for Prepare {
         Self {
             transaction_id: v.id().as_str().into(),
             operations: v.operations().iter().map(Operation::from).collect(),
+            hold_ms: v.hold_ms(),
         }
     }
 }
@@ -357,6 +369,7 @@ impl TryFrom<Transaction> for d::Transaction {
                 }
                 d::State::Aborted(match cause {
                     AbortReason::Requested => d::AbortReason::Requested,
+                    AbortReason::Lapsed => d::AbortReason::Lapsed,
                     AbortReason::Rejected(r) => d::AbortReason::Rejected(match r {
                         Rejection::Capacity => d::Rejection::Capacity(
                             capacity.ok_or(d::Error::InvalidLedger)?.try_into()?,
@@ -367,7 +380,7 @@ impl TryFrom<Transaction> for d::Transaction {
                 })
             }
         };
-        Self::restore(request, state)
+        Self::restore(request, v.expires_at_ms, state)
     }
 }
 impl From<&d::Transaction> for Transaction {
@@ -393,6 +406,7 @@ impl From<&d::Transaction> for Transaction {
                 },
                 cause: match cause {
                     d::AbortReason::Requested => AbortReason::Requested,
+                    d::AbortReason::Lapsed => AbortReason::Lapsed,
                     d::AbortReason::Rejected(r) => AbortReason::Rejected(match r {
                         d::Rejection::Capacity(_) => Rejection::Capacity,
                         d::Rejection::Overflow => Rejection::Overflow,
@@ -403,6 +417,7 @@ impl From<&d::Transaction> for Transaction {
         };
         Self {
             request: v.request().into(),
+            expires_at_ms: v.expires_at_ms(),
             state,
         }
     }

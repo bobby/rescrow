@@ -84,6 +84,9 @@ impl Case {
                         "--operations",
                     ])
                     .arg(self.input(name, &request.operations));
+                if let Some(hold) = request.hold_ms {
+                    process.args(["--hold", &format!("{hold}ms")]);
+                }
             }
             dto::Command::Commit(request) => {
                 process.args(["transaction", "commit", &request.transaction_id]);
@@ -175,8 +178,8 @@ fn workload(case: u8) -> (Vec<Command>, Vec<Vec<Command>>) {
                 scale: 0,
             },
         ),
-        Command::Prepare(0, operations(sign * 3)),
-        Command::Prepare(1, operations(-sign * 2)),
+        Command::Prepare(0, operations(sign * 3), None),
+        Command::Prepare(1, operations(-sign * 2), None),
     ];
     let fresh = operations(sign * (1 + i64::from(case % 3)));
     let mut retry = fresh.clone();
@@ -192,20 +195,20 @@ fn workload(case: u8) -> (Vec<Command>, Vec<Vec<Command>>) {
     };
     let clients = vec![
         vec![
-            Command::Prepare(2, fresh),
+            Command::Prepare(2, fresh, None),
             Command::Commit(2, partial.clone()),
-            Command::Prepare(2, retry),
+            Command::Prepare(2, retry, None),
             Command::Commit(2, partial.clone()),
         ],
         vec![
             Command::Commit(0, partial),
             Command::Abort(1),
-            Command::Prepare(0, operations(sign * 3).into_iter().rev().collect()),
+            Command::Prepare(0, operations(sign * 3).into_iter().rev().collect(), None),
             read,
         ],
         vec![
             Command::Abort(0),
-            Command::Prepare(3, operations(-sign * 5)),
+            Command::Prepare(3, operations(-sign * 5), None),
             Command::Commit(
                 3,
                 if case & 4 == 0 {

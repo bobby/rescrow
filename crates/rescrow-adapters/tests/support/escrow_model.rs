@@ -1,6 +1,8 @@
 //! Independent small-integer specification. Materialized quantities and pending
 //! extrema are derived from accepted transaction history, never cached or updated
 //! using the production transition functions. DTOs are used only for observation.
+//! A hold lapses when a write that could reserve or release its resources
+//! runs at or after its deadline.
 use rescrow_application::dto;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -22,7 +24,8 @@ pub struct Op {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Command {
     Create(u8, Spec),
-    Prepare(u16, Vec<Op>),
+    /// Operations, and an optional hold in milliseconds.
+    Prepare(u16, Vec<Op>, Option<u64>),
     Commit(u16, Option<Vec<(u8, i64)>>),
     Abort(u16),
     Resource(u8),
@@ -33,7 +36,7 @@ pub enum Command {
 impl Command {
     pub fn transaction_id(&self) -> Option<u16> {
         match self {
-            Self::Prepare(id, _)
+            Self::Prepare(id, ..)
             | Self::Commit(id, _)
             | Self::Abort(id)
             | Self::Transaction(id) => Some(*id),
@@ -43,7 +46,7 @@ impl Command {
     pub fn dto(&self) -> dto::Command {
         match self {
             Self::Create(id, spec) => dto::Command::CreateResource(spec.dto(*id)),
-            Self::Prepare(id, ops) => dto::Command::Prepare(dto::Prepare {
+            Self::Prepare(id, ops, hold) => dto::Command::Prepare(dto::Prepare {
                 transaction_id: tx_id(*id),
                 operations: ops
                     .iter()
@@ -53,6 +56,7 @@ impl Command {
                         delta: o.delta.to_string(),
                     })
                     .collect(),
+                hold_ms: *hold,
             }),
             Self::Commit(id, actuals) => dto::Command::Commit(dto::Commit {
                 transaction_id: tx_id(*id),
@@ -112,18 +116,50 @@ pub enum State {
     Prepared,
     Committed(Vec<(u8, i64)>),
     Aborted(Option<Failure>),
+    Lapsed,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transaction {
     pub operations: Vec<Op>,
+    pub hold: Option<u64>,
+    pub expires: Option<u64>,
     pub state: State,
 }
+/// The longest hold, in milliseconds: 30 days.
+const MAX_HOLD: u64 = 30 * 24 * 60 * 60 * 1000;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Model {
     pub resources: BTreeMap<u8, Spec>,
     pub transactions: BTreeMap<u16, Transaction>,
+    /// The store's clock, in milliseconds since the Unix epoch.
+    pub now: u64,
+    /// Entries appended so far.
+    pub position: u64,
 }
 impl Model {
+    /// Lapse overdue holds on any of `resources`, one entry each.
+    fn lapse_due(&mut self, resources: &[u8]) {
+        let now = self.now;
+        for tx in self.transactions.values_mut() {
+            if tx.state == State::Prepared
+                && tx.expires.is_some_and(|at| at <= now)
+                && tx
+                    .operations
+                    .iter()
+                    .any(|op| resources.contains(&op.resource))
+            {
+                tx.state = State::Lapsed;
+                self.position += 1;
+            }
+        }
+    }
+    fn resources_of(&self, id: u16) -> Vec<u8> {
+        self.transactions[&id]
+            .operations
+            .iter()
+            .map(|op| op.resource)
+            .collect()
+    }
     pub fn quantity(&self, resource: u8) -> i64 {
         self.resources[&resource].initial
             + self
@@ -159,11 +195,13 @@ impl Model {
                 Some(_) => Ok(()),
                 None => {
                     self.resources.insert(*id, spec.clone());
+                    self.position += 1;
                     Ok(())
                 }
             },
-            Command::Prepare(id, operations) => {
-                if operations.is_empty()
+            Command::Prepare(id, operations, hold) => {
+                if hold.is_some_and(|h| h == 0 || h > MAX_HOLD)
+                    || operations.is_empty()
                     || operations.iter().enumerate().any(|(i, op)| {
                         op.delta == 0
                             || operations[..i]
@@ -175,8 +213,9 @@ impl Model {
                 }
                 let mut operations = operations.clone();
                 operations.sort_by_key(|op| op.id);
+                self.lapse_due(&operations.iter().map(|op| op.resource).collect::<Vec<_>>());
                 if let Some(old) = self.transactions.get(id) {
-                    if old.operations != operations {
+                    if old.operations != operations || old.hold != *hold {
                         return Err(Failure::Conflict);
                     }
                     return match &old.state {
@@ -213,10 +252,13 @@ impl Model {
                         }
                     })
                 };
+                self.position += 1;
                 self.transactions.insert(
                     *id,
                     Transaction {
                         operations,
+                        hold: *hold,
+                        expires: hold.map(|h| self.now + h),
                         state: match &failure {
                             Some(f) => State::Aborted(Some(f.clone())),
                             None => State::Prepared,
@@ -229,7 +271,10 @@ impl Model {
                 }
             }
             Command::Commit(id, supplied) => {
-                let tx = self.transactions.get(id).ok_or(Failure::Missing)?;
+                if self.transactions.get(id).ok_or(Failure::Missing)?.state == State::Prepared {
+                    self.lapse_due(&self.resources_of(*id));
+                }
+                let tx = &self.transactions[id];
                 let mut actuals = supplied
                     .clone()
                     .unwrap_or_else(|| tx.operations.iter().map(|o| (o.id, o.delta)).collect());
@@ -248,21 +293,30 @@ impl Model {
                 actuals.sort_by_key(|(id, _)| *id);
                 match &tx.state {
                     State::Committed(old) if *old == actuals => Ok(()),
-                    State::Committed(_) | State::Aborted(_) => Err(Failure::Conflict),
+                    State::Committed(_) | State::Aborted(_) | State::Lapsed => {
+                        Err(Failure::Conflict)
+                    }
                     State::Prepared => {
                         self.transactions.get_mut(id).unwrap().state = State::Committed(actuals);
+                        self.position += 1;
                         Ok(())
                     }
                 }
             }
-            Command::Abort(id) => match &self.transactions.get(id).ok_or(Failure::Missing)?.state {
-                State::Committed(_) => Err(Failure::Conflict),
-                State::Aborted(_) => Ok(()),
-                State::Prepared => {
-                    self.transactions.get_mut(id).unwrap().state = State::Aborted(None);
-                    Ok(())
+            Command::Abort(id) => {
+                if self.transactions.get(id).ok_or(Failure::Missing)?.state == State::Prepared {
+                    self.lapse_due(&self.resources_of(*id));
                 }
-            },
+                match &self.transactions[id].state {
+                    State::Committed(_) => Err(Failure::Conflict),
+                    State::Aborted(_) | State::Lapsed => Ok(()),
+                    State::Prepared => {
+                        self.transactions.get_mut(id).unwrap().state = State::Aborted(None);
+                        self.position += 1;
+                        Ok(())
+                    }
+                }
+            }
             Command::Resource(id) => self
                 .resources
                 .contains_key(id)
@@ -335,7 +389,7 @@ impl Model {
                     .find(|r| r.spec.resource_id == resource_id(*id))
                     .unwrap(),
             ),
-            Command::Prepare(id, _)
+            Command::Prepare(id, ..)
             | Command::Commit(id, _)
             | Command::Abort(id)
             | Command::Transaction(id) => dto::Output::Transaction(self.transactions[id].dto(*id)),
@@ -360,7 +414,8 @@ impl Spec {
 }
 impl Transaction {
     fn dto(&self, id: u16) -> dto::Transaction {
-        let dto::Command::Prepare(request) = Command::Prepare(id, self.operations.clone()).dto()
+        let dto::Command::Prepare(request) =
+            Command::Prepare(id, self.operations.clone(), self.hold).dto()
         else {
             unreachable!()
         };
@@ -386,8 +441,16 @@ impl Transaction {
                 },
                 capacity: failure.as_ref().and_then(Failure::capacity),
             },
+            State::Lapsed => dto::State::Aborted {
+                cause: dto::AbortReason::Lapsed,
+                capacity: None,
+            },
         };
-        dto::Transaction { request, state }
+        dto::Transaction {
+            request,
+            expires_at_ms: self.expires,
+            state,
+        }
     }
 }
 pub fn tx_id(id: u16) -> String {

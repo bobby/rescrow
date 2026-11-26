@@ -19,10 +19,11 @@ fn sample() -> Snapshot {
             resource_id: "r".into(),
             delta: "-3".into(),
         }],
+        hold_ms: None,
     }
     .try_into()
     .unwrap();
-    Snapshot::from_ledger(&ledger.prepare(request).unwrap(), 2)
+    Snapshot::from_ledger(&ledger.prepare(request, 0).unwrap(), 2)
 }
 #[test]
 fn canonical_decimal_and_typed_json() {
@@ -51,7 +52,14 @@ fn canonical_decimal_and_typed_json() {
     ] {
         assert_eq!(decimal(s).unwrap().to_string(), s);
     }
-    let cmd: Command = serde_json::from_str(r#"{"command":"prepare","input":{"transaction_id":"t","operations":[{"operation_id":"o","resource_id":"r","delta":"-9007199254740993"}]}}"#).unwrap();
+    // A hold is optional but its field is not: `null` means no deadline.
+    assert!(
+        serde_json::from_str::<Command>(
+            r#"{"command":"prepare","input":{"transaction_id":"t","operations":[]}}"#
+        )
+        .is_err()
+    );
+    let cmd: Command = serde_json::from_str(r#"{"command":"prepare","input":{"transaction_id":"t","operations":[{"operation_id":"o","resource_id":"r","delta":"-9007199254740993"}],"hold_ms":null}}"#).unwrap();
     let Command::Prepare(p) = cmd else { panic!() };
     assert_eq!(
         d::Request::try_from(p).unwrap().operations()[0].delta(),
@@ -93,9 +101,11 @@ fn round_trips_every_lifecycle() {
                     resource_id: "r".into(),
                     delta: "-6".into(),
                 }],
+                hold_ms: None,
             }
             .try_into()
             .unwrap(),
+            0,
         )
         .unwrap();
     assert_eq!(
@@ -162,6 +172,7 @@ fn documented_json_examples_use_the_validated_contract() {
     let request: d::Request = Prepare {
         transaction_id: "work".into(),
         operations,
+        hold_ms: None,
     }
     .try_into()
     .unwrap();
@@ -185,6 +196,7 @@ fn documented_json_examples_use_the_validated_contract() {
     let _: d::Request = Prepare {
         transaction_id: "credit".into(),
         operations: credit,
+        hold_ms: None,
     }
     .try_into()
     .unwrap();
@@ -212,9 +224,11 @@ fn capacity_details_are_required_and_validated() {
                     resource_id: "r".into(),
                     delta: "-6".into(),
                 }],
+                hold_ms: None,
             }
             .try_into()
             .unwrap(),
+            0,
         )
         .unwrap();
     let dto = Snapshot::from_ledger(&rejected, 4);

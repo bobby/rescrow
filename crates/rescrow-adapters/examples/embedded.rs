@@ -37,6 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             resource_id: "example".into(),
             delta: "-40".into(),
         }],
+        hold_ms: None,
     })?;
     app.commit(Commit {
         transaction_id: work,

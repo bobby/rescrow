@@ -28,7 +28,7 @@ fn replacements_include_only_participants_and_leave_inputs_unchanged() {
         .into_iter()
         .map(|name| (id(name), resource(name)))
         .collect();
-    let changes = transition::prepare(request(), None, &before).unwrap();
+    let changes = transition::prepare(request(), None, &before, 0).unwrap();
     assert_eq!(changes.resources().len(), 2);
     assert!(
         changes
@@ -44,7 +44,7 @@ fn replacements_include_only_participants_and_leave_inputs_unchanged() {
         .collect();
     let tx = changes.transaction().unwrap();
     assert!(
-        transition::prepare(request(), Some(tx), &held)
+        transition::prepare(request(), Some(tx), &held, 0)
             .unwrap()
             .is_empty()
     );
@@ -55,7 +55,7 @@ fn replacements_include_only_participants_and_leave_inputs_unchanged() {
 }
 #[test]
 fn individually_valid_records_do_not_bypass_participant_validation() {
-    let tx = Transaction::restore(request(), State::Prepared).unwrap();
+    let tx = Transaction::restore(request(), None, State::Prepared).unwrap();
     let resources = [(id("a"), resource("a")), (id("b"), resource("b"))]
         .into_iter()
         .collect();
@@ -68,7 +68,102 @@ fn individually_valid_records_do_not_bypass_participant_validation() {
         Error::InvalidLedger
     );
     assert_eq!(
-        transition::prepare(request(), Some(&tx), &resources).unwrap_err(),
+        transition::prepare(request(), Some(&tx), &resources, 0).unwrap_err(),
+        Error::InvalidLedger
+    );
+}
+fn held(hold_ms: Option<u64>) -> Request {
+    request().with_hold(hold_ms).unwrap()
+}
+fn by_id(resources: &[Resource]) -> BTreeMap<Id, Resource> {
+    resources
+        .iter()
+        .map(|r| (r.spec().id().clone(), r.clone()))
+        .collect()
+}
+#[test]
+fn holds_last_from_one_millisecond_to_thirty_days() {
+    for invalid in [0, MAX_HOLD_MS + 1] {
+        assert_eq!(
+            request().with_hold(Some(invalid)).unwrap_err(),
+            Error::InvalidHold
+        );
+    }
+    assert_eq!(held(Some(MAX_HOLD_MS)).hold_ms(), Some(MAX_HOLD_MS));
+    assert_eq!(held(None).hold_ms(), None);
+    // The hold is part of the request, so a retry with another one conflicts.
+    assert_ne!(held(Some(1)), held(Some(2)));
+    let before = by_id(&[resource("a"), resource("b")]);
+    assert_eq!(
+        transition::prepare(held(Some(1)), None, &before, u64::MAX).unwrap_err(),
+        Error::Overflow
+    );
+}
+#[test]
+fn a_hold_lapses_only_once_its_deadline_passes_and_releases_both_directions() {
+    let before = by_id(&[resource("a"), resource("b"), resource("unrelated")]);
+    let prepared = transition::prepare(held(Some(100)), None, &before, 1_000).unwrap();
+    let tx = prepared.transaction().unwrap().clone();
+    assert_eq!(tx.expires_at_ms(), Some(1_100));
+    let resources = by_id(prepared.resources());
+    let live = Live::restore(resources.values().cloned().collect(), vec![tx.clone()]).unwrap();
+    // A replay keeps the deadline fixed at admission.
+    assert!(
+        transition::prepare(held(Some(100)), Some(&tx), &resources, 1_050)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        transition::prepare(held(Some(200)), Some(&tx), &resources, 1_050).unwrap_err(),
+        Error::Conflict
+    );
+    assert!(!tx.is_due(1_099));
+    assert!(live.due([&id("a")], 1_099).is_empty());
+    assert_eq!(
+        transition::lapse(&tx, &resources, 1_099).unwrap_err(),
+        Error::Conflict
+    );
+    assert!(live.due([&id("unrelated")], 1_100).is_empty());
+    assert_eq!(live.due([&id("a"), &id("b")], 1_100), vec![&tx]);
+    let lapsed = transition::lapse(&tx, &resources, 1_100).unwrap();
+    let after = lapsed.transaction().unwrap();
+    assert_eq!(*after.state(), State::Aborted(AbortReason::Lapsed));
+    assert_eq!(after.expires_at_ms(), Some(1_100));
+    // Both directions are released, and no quantity changes.
+    assert!(lapsed.resources().iter().all(|r| r.holds().is_empty()));
+    assert!(lapsed.resources().iter().all(|r| r.quantity() == 5));
+    let released = by_id(lapsed.resources());
+    // A lapsed transaction cannot commit; aborting it again is a replay.
+    assert_eq!(
+        transition::commit(after, None, &released).unwrap_err(),
+        Error::Conflict
+    );
+    assert!(transition::abort(after, &released).unwrap().is_empty());
+    assert_eq!(
+        transition::lapse(after, &released, 2_000).unwrap_err(),
+        Error::Conflict
+    );
+}
+#[test]
+fn holds_without_a_deadline_never_lapse() {
+    let before = by_id(&[resource("a"), resource("b")]);
+    let prepared = transition::prepare(held(None), None, &before, 0).unwrap();
+    let tx = prepared.transaction().unwrap().clone();
+    assert_eq!(tx.expires_at_ms(), None);
+    let resources = by_id(prepared.resources());
+    let live = Live::restore(resources.values().cloned().collect(), vec![tx.clone()]).unwrap();
+    assert!(live.due([&id("a"), &id("b")], u64::MAX).is_empty());
+    assert_eq!(
+        transition::lapse(&tx, &resources, u64::MAX).unwrap_err(),
+        Error::Conflict
+    );
+    // A deadline must agree with the request's hold.
+    assert_eq!(
+        Transaction::restore(held(None), Some(5), State::Prepared).unwrap_err(),
+        Error::InvalidLedger
+    );
+    assert_eq!(
+        Transaction::restore(held(Some(5)), None, State::Prepared).unwrap_err(),
         Error::InvalidLedger
     );
 }
