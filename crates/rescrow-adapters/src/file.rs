@@ -373,7 +373,7 @@ impl FileStore {
         }
         Ok(scan)
     }
-    /// Every record from a position to the end of the log, under a lock the caller holds.
+    /// Every record from a position to the end of the log.
     fn tail(&self, segment: u64, offset: u64, sequence: u64) -> Result<Tail, StoreError> {
         let segments = self.segments()?;
         let start = segments
@@ -428,9 +428,25 @@ impl FileStore {
         }
         Ok(tail)
     }
+    /// Readers take no lock. Segments only grow, and every other file is
+    /// replaced by atomic rename, so an unlocked read sees a prefix of the log
+    /// ending at its last complete, checksummed record. A writer's partial
+    /// append reads as a torn tail and is ignored. One race can look like
+    /// damage: a reader can see part of a torn append and part of the record a
+    /// writer appends after removing it. So an unlocked read that finds
+    /// anything invalid is repeated under the shared lock, which excludes
+    /// writers, before failing closed.
+    fn unlocked<T>(&self, read: impl Fn() -> Result<T, StoreError>) -> Result<T, StoreError> {
+        match read() {
+            Err(StoreError::Corrupt(_)) => {
+                let (_lock, _) = self.lock(false, false)?;
+                read()
+            }
+            other => other,
+        }
+    }
     /// Complete a previous writer's potentially uncertain append or checkpoint
-    /// before confirming even a read or idempotent retry. Shared locks exclude
-    /// every writer.
+    /// before confirming even a read or idempotent retry.
     fn sync_read(&self, files: &[&File]) -> Result<(), StoreError> {
         (self.hook)(Stage::ReadSync).map_err(unknown)?;
         for file in files {
@@ -438,15 +454,23 @@ impl FileStore {
         }
         Ok(())
     }
-    /// Read the checkpoint and the entries after it under a lock the caller holds.
+    /// Read the checkpoint and the entries after it, and make what was read durable.
     fn read(&self, directory: &File) -> Result<(LiveFile, Tail), StoreError> {
-        let (live, live_file) = self.read_live()?;
-        let tail = self.tail(live.segment, live.offset, live.checkpoint.position)?;
+        let (live, live_file, tail) = self.read_unsynced()?;
         let log = open_directory(&self.log())?;
         let mut files: Vec<&File> = tail.files.iter().collect();
         files.extend([&live_file, &log, directory]);
         self.sync_read(&files)?;
         Ok((live, tail))
+    }
+    /// Read the checkpoint and the entries after it without synchronizing them.
+    /// A writer needs no more: synchronizing its append also makes every
+    /// earlier record in that segment durable, and earlier segments were
+    /// synchronized when sealed.
+    fn read_unsynced(&self) -> Result<(LiveFile, File, Tail), StoreError> {
+        let (live, live_file) = self.read_live()?;
+        let tail = self.tail(live.segment, live.offset, live.checkpoint.position)?;
+        Ok((live, live_file, tail))
     }
     /// Write a new file atomically: write, synchronize, rename, synchronize the directory.
     fn publish(&self, path: &Path, bytes: &[u8], directory: &File) -> Result<(), StoreError> {
@@ -497,6 +521,9 @@ impl FileStore {
         if !tail.sealed {
             let mut file = self.open_segment(tail.active, false)?;
             let scan = self.scan(&mut file, 0, tail.active, true)?;
+            // A previous writer's append may not have reached the disk; the
+            // segment must before anything is appended after it.
+            file.sync_all().map_err(io)?;
             let mut entries: Vec<IndexEntry> = scan
                 .entries
                 .into_iter()
@@ -724,21 +751,31 @@ impl LogStore for FileStore {
     }
     fn load(&self) -> Result<Loaded, StoreError> {
         let directory = self.directory_file()?;
-        let (_lock, _) = self.lock(false, false)?;
-        let (live, tail) = self.read(&directory)?;
-        Ok(Loaded {
-            checkpoint: live.checkpoint,
-            tail: tail.entries.into_iter().map(|(entry, ..)| entry).collect(),
+        self.unlocked(|| {
+            let (live, tail) = self.read(&directory)?;
+            Ok(Loaded {
+                checkpoint: live.checkpoint,
+                tail: tail.entries.into_iter().map(|(entry, ..)| entry).collect(),
+            })
         })
     }
-    fn append(&self, entry: &Entry) -> Result<Publication, StoreError> {
-        let directory = self.directory_file()?;
+    fn append(&self, entries: &[Entry]) -> Result<Publication, StoreError> {
+        self.directory_file()?;
         let (_lock, _) = self.lock(true, false)?;
-        let (live, tail) = self.read(&directory)?;
-        if entry.sequence != live.checkpoint.position + tail.entries.len() as u64 {
+        let (live, _, tail) = self.read_unsynced()?;
+        let first = entries[0].sequence;
+        if first != live.checkpoint.position + tail.entries.len() as u64 {
             return Ok(Publication::Conflict);
         }
-        let frame = encode_frame(entry)?;
+        // One write and one synchronization for the whole batch.
+        let mut frame = Vec::new();
+        for entry in entries {
+            let encoded = encode_frame(entry)?;
+            if encoded.len() as u64 > self.max_bytes {
+                return Err(StoreError::TooLarge);
+            }
+            frame.extend(encoded);
+        }
         // Remove an earlier writer's unacknowledged torn append before writing after it.
         if !tail.sealed && tail.file_len > tail.valid_end {
             let segment = self.open_segment(tail.active, true)?;
@@ -746,20 +783,29 @@ impl LogStore for FileStore {
             segment.sync_all().map_err(io)?;
         }
         let (active, offset) = if tail.sealed || tail.valid_end >= self.segment_bytes {
-            self.roll(&tail, entry.sequence)?;
-            (entry.sequence, 0)
+            self.roll(&tail, first)?;
+            (first, 0)
         } else {
             (tail.active, tail.valid_end)
         };
         let mut segment = self.open_segment(active, true)?;
         (self.hook)(Stage::BeforeAppend).map_err(io)?;
         segment.seek(SeekFrom::Start(offset)).map_err(io)?;
+        // A torn single record is never valid, so failing part-way through one
+        // appended nothing. A torn batch can leave its first records complete,
+        // as if only those writes had happened, so its outcome is unknown.
+        let partial = if entries.len() == 1 { io } else { unknown };
         let mid = frame.len() / 2;
-        segment.write_all(&frame[..mid]).map_err(io)?;
-        (self.hook)(Stage::DuringAppend).map_err(io)?;
-        segment.write_all(&frame[mid..]).map_err(io)?;
+        segment.write_all(&frame[..mid]).map_err(partial)?;
+        (self.hook)(Stage::DuringAppend).map_err(partial)?;
+        segment.write_all(&frame[mid..]).map_err(partial)?;
         // Once every byte is written, a failed synchronization may still have persisted it.
         segment.sync_all().map_err(unknown)?;
+        // The first record in a segment also depends on the segment's directory
+        // entry, which the writer that created it may have failed to persist.
+        if offset == 0 {
+            open_directory(&self.log())?.sync_all().map_err(unknown)?;
+        }
         (self.hook)(Stage::AppendSynced).map_err(unknown)?;
         (self.hook)(Stage::BeforeResponse).map_err(unknown)?;
         Ok(Publication::Applied)
@@ -767,7 +813,7 @@ impl LogStore for FileStore {
     fn checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), StoreError> {
         let directory = self.directory_file()?;
         let (_lock, _) = self.lock(true, false)?;
-        let (live, tail) = self.read(&directory)?;
+        let (live, _, tail) = self.read_unsynced()?;
         let Some(covered) = checkpoint.position.checked_sub(live.checkpoint.position) else {
             return Ok(());
         };
@@ -792,7 +838,20 @@ impl LogStore for FileStore {
     /// one, once the segment after it starts before `since_ms`.
     fn find(&self, transaction_id: &str, since_ms: u64) -> Result<Option<Entry>, StoreError> {
         let directory = self.directory_file()?;
-        let (_lock, _) = self.lock(false, false)?;
+        self.unlocked(|| self.find_unlocked(transaction_id, since_ms, &directory))
+    }
+    fn history(&self) -> Result<Vec<Entry>, StoreError> {
+        let directory = self.directory_file()?;
+        self.unlocked(|| self.history_unlocked(&directory))
+    }
+}
+impl FileStore {
+    fn find_unlocked(
+        &self,
+        transaction_id: &str,
+        since_ms: u64,
+        directory: &File,
+    ) -> Result<Option<Entry>, StoreError> {
         self.read_live()?;
         let segments = self.segments()?;
         let terminal = |entry: &Entry| {
@@ -813,7 +872,7 @@ impl LogStore for FileStore {
                 }
                 let mut file = self.open_segment(*first, false)?;
                 let scan = self.scan(&mut file, 0, *first, true)?;
-                self.sync_read(&[&file, &open_directory(&self.log())?, &directory])?;
+                self.sync_read(&[&file, &open_directory(&self.log())?, directory])?;
                 if let Some((entry, ..)) = scan
                     .entries
                     .iter()
@@ -849,9 +908,7 @@ impl LogStore for FileStore {
         }
         Ok(None)
     }
-    fn history(&self) -> Result<Vec<Entry>, StoreError> {
-        let directory = self.directory_file()?;
-        let (_lock, _) = self.lock(false, false)?;
+    fn history_unlocked(&self, directory: &File) -> Result<Vec<Entry>, StoreError> {
         let (live, live_file) = self.read_live()?;
         let tail = self.tail(0, 0, 0)?;
         let reaches = (live.segment, live.offset) == (0, 0)
@@ -866,7 +923,7 @@ impl LogStore for FileStore {
         }
         let log = open_directory(&self.log())?;
         let mut files: Vec<&File> = tail.files.iter().collect();
-        files.extend([&live_file, &log, &directory]);
+        files.extend([&live_file, &log, directory]);
         self.sync_read(&files)?;
         Ok(tail.entries.into_iter().map(|(entry, ..)| entry).collect())
     }

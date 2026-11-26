@@ -9,7 +9,7 @@ use proptest::{
     test_runner::{FileFailurePersistence, TestCaseError},
 };
 use rescrow_adapters::memory::{Fault, MemoryStore};
-use rescrow_application::{Application, Category, Code, Error, dto};
+use rescrow_application::{Application, Category, Code, Error, dto, service::Service};
 
 type TestResult = Result<(), TestCaseError>;
 #[derive(Clone, Debug)]
@@ -232,15 +232,28 @@ struct Harness {
     model: Model,
     store: MemoryStore,
     revision: u64,
+    /// One long-lived service for every command, or a new Application for each.
+    service: Option<Service<MemoryStore>>,
 }
 impl Harness {
-    fn new() -> Self {
+    fn new(service: bool) -> Self {
         let store = MemoryStore::default();
         Application::new(store.clone()).initialize().unwrap();
-        Self {
+        let mut harness = Self {
             model: Model::default(),
             store,
             revision: 0,
+            service: None,
+        };
+        if service {
+            harness.service = Some(Service::start(harness.app()).unwrap());
+        }
+        harness
+    }
+    fn execute(&self, command: dto::Command) -> Result<dto::Output, Error> {
+        match &self.service {
+            Some(service) => service.execute(command),
+            None => self.app().execute(command),
         }
     }
     /// A frequent checkpoint interval exercises replay from many positions.
@@ -270,7 +283,7 @@ impl Harness {
                 Effect::LostResponse => self.store.inject(Fault::LostResponse),
             }
         }
-        let mut actual = self.app().execute(command.dto());
+        let mut actual = self.execute(command.dto());
         if changed && matches!(effect, Effect::BeforePublication | Effect::LostResponse) {
             let error = actual
                 .as_ref()
@@ -296,7 +309,7 @@ impl Harness {
                 prop_assert_eq!(self.snapshot()?, next.snapshot(self.revision + 1));
             }
             // A new host retries the identical command, including rejected admissions.
-            actual = self.app().execute(command.dto());
+            actual = self.execute(command.dto());
         }
         let revision = self.revision + u64::from(changed);
         match expected {
@@ -369,6 +382,18 @@ fn check_error(error: Error, failure: &Failure, command: &Command) -> TestResult
     Ok(())
 }
 
+fn history(service: bool, initial: Vec<Spec>, steps: Vec<Step>) -> TestResult {
+    let mut h = Harness::new(service);
+    for (id, spec) in initial.into_iter().enumerate() {
+        h.apply(Command::Create(id as u8, spec), Effect::Clean, false)?;
+    }
+    for (index, step) in steps.into_iter().enumerate() {
+        let command = h.model.command(&step.action, index);
+        h.apply(command, step.effect, step.reload)?;
+    }
+    h.apply(Command::Resources, Effect::Clean, true)?;
+    h.apply(Command::Transactions, Effect::Clean, false)
+}
 proptest! {
     #![proptest_config(ProptestConfig {
         failure_persistence: Some(Box::new(FileFailurePersistence::Direct(concat!(
@@ -381,16 +406,14 @@ proptest! {
         initial in prop::collection::vec(spec(), 2..=3),
         steps in prop::collection::vec(step(), 1..=128),
     ) {
-        let mut h = Harness::new();
-        for (id, spec) in initial.into_iter().enumerate() {
-            h.apply(Command::Create(id as u8, spec), Effect::Clean, false)?;
-        }
-        for (index, step) in steps.into_iter().enumerate() {
-            let command = h.model.command(&step.action, index);
-            h.apply(command, step.effect, step.reload)?;
-        }
-        h.apply(Command::Resources, Effect::Clean, true)?;
-        h.apply(Command::Transactions, Effect::Clean, false)?;
+        history(false, initial, steps)?;
+    }
+    #[test]
+    fn generated_histories_through_a_service_match_reference_model(
+        initial in prop::collection::vec(spec(), 2..=3),
+        steps in prop::collection::vec(step(), 1..=128),
+    ) {
+        history(true, initial, steps)?;
     }
     #[test]
     fn generated_lifecycles_preserve_identity_and_partial_usage(
@@ -402,7 +425,7 @@ proptest! {
         abort in any::<bool>(),
         reload in any::<bool>(),
     ) {
-        let mut h = Harness::new();
+        let mut h = Harness::new(false);
         for resource in 0..participants {
             h.apply(Command::Create(resource, Spec {
                 lower,

@@ -182,7 +182,10 @@ fn stale_position_conflicts_and_invalid_live_state_fails_closed() {
             scale: 0,
         }),
     };
-    assert_eq!(store.append(&stale).unwrap(), Publication::Conflict);
+    assert_eq!(
+        store.append(std::slice::from_ref(&stale)).unwrap(),
+        Publication::Conflict
+    );
     let good = temp.snapshot();
     let live = fs::read(temp.store().join("live.json")).unwrap();
     for bytes in [b"{".to_vec(), b"{\"log_offset\":999999,\"checkpoint\":{\"schema_version\":2,\"position\":0,\"resources\":[],\"prepared\":[]}}".to_vec()] {
@@ -286,9 +289,9 @@ fn contention_has_a_deadline_and_permission_errors_preserve_state() {
         .open(temp.store().join("state.lock"))
         .unwrap();
     lock.lock().unwrap();
+    // Readers take no lock, so a writer holding it never delays them.
+    store.load().unwrap();
     let now = Instant::now();
-    assert_eq!(store.load().unwrap_err(), StoreError::Contention);
-    assert!(now.elapsed() < Duration::from_secs(1));
     let entry = Entry {
         sequence: 1,
         recorded_at_ms: rescrow_application::system_clock(),
@@ -301,7 +304,11 @@ fn contention_has_a_deadline_and_permission_errors_preserve_state() {
             scale: 0,
         }),
     };
-    assert_eq!(store.append(&entry).unwrap_err(), StoreError::Contention);
+    assert_eq!(
+        store.append(std::slice::from_ref(&entry)).unwrap_err(),
+        StoreError::Contention
+    );
+    assert!(now.elapsed() < Duration::from_secs(1));
     drop(lock);
     let good = temp.snapshot();
     for name in ["live.json", SEGMENT] {
@@ -542,6 +549,56 @@ fn initialization_failures_never_reset_a_missing_or_published_authority() {
         }
     }
 }
+/// Readers hammering the store once starved writers, which wait for the lock
+/// only while no reader holds it. Readers now take no lock.
+#[test]
+fn concurrent_readers_do_not_starve_writers() {
+    let temp = Temp::new();
+    ready(&temp);
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let readers: Vec<_> = (0..16)
+        .map(|_| {
+            let (path, done) = (temp.store(), done.clone());
+            std::thread::spawn(move || {
+                let app = Application::new(FileStore::new(path).unwrap());
+                while !done.load(Ordering::Relaxed) {
+                    app.resource("r").unwrap();
+                }
+            })
+        })
+        .collect();
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let path = temp.store();
+            std::thread::spawn(move || {
+                // The default lock timeout bounds the test: starvation was
+                // permanent, but a busy runner can legitimately be slow.
+                let app = Application::new(FileStore::new(path).unwrap());
+                for n in 0..10 {
+                    // Four concurrent holds of one fit the resource's five.
+                    let id = tx(&format!("w{w}-{n}"));
+                    let Command::Prepare(mut request) = prepare_raw(&id) else {
+                        unreachable!()
+                    };
+                    request.operations[0].delta = "-1".into();
+                    app.execute(Command::Prepare(request)).unwrap();
+                    app.execute(Command::Abort { transaction_id: id }).unwrap();
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    done.store(true, Ordering::Relaxed);
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    let snapshot = temp.snapshot();
+    assert_eq!(snapshot.transactions.len(), 40);
+    assert_eq!(snapshot.resources[0].quantity, "5");
+}
+/// The locked fallback of a read that found apparent damage still excludes writers.
 #[test]
 fn readers_share_the_lock_and_exclude_writers() {
     let temp = Temp::new();
@@ -565,7 +622,10 @@ fn readers_share_the_lock_and_exclude_writers() {
             scale: 0,
         }),
     };
-    assert_eq!(store.append(&entry).unwrap_err(), StoreError::Contention);
+    assert_eq!(
+        store.append(std::slice::from_ref(&entry)).unwrap_err(),
+        StoreError::Contention
+    );
     drop(lock);
     assert_eq!(store.load().unwrap(), current);
 }
