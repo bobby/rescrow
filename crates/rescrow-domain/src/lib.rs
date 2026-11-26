@@ -13,6 +13,7 @@ pub enum Error {
     InvalidBounds,
     InvalidOperations,
     InvalidActuals,
+    InvalidHold,
     Overflow,
     Capacity(CapacityFailure),
     NotFound,
@@ -30,6 +31,7 @@ impl std::fmt::Display for Error {
             Self::InvalidBounds => "quantity must be within the fixed resource bounds",
             Self::InvalidOperations => "operations must be nonempty, nonzero, and unique by operation and resource ID",
             Self::InvalidActuals => "actuals must name every operation once and stay within its reserved direction and magnitude",
+            Self::InvalidHold => "a hold must last from 1 ms to 30 days",
             Self::Overflow => "quantity, magnitude, offset, or reservation total exceeds signed 128-bit range",
             Self::NotFound => "referenced resource or transaction does not exist",
             Self::Conflict => "request conflicts with an existing identity or terminal decision",
@@ -149,10 +151,14 @@ impl Operation {
     }
 }
 
+/// The longest hold a request may ask for, in milliseconds: 30 days.
+pub const MAX_HOLD_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
     id: Id,
     operations: Vec<Operation>,
+    hold_ms: Option<u64>,
 }
 impl Request {
     pub fn new(id: Id, mut operations: Vec<Operation>) -> Result<Self, Error> {
@@ -167,13 +173,28 @@ impl Request {
             }
         }
         operations.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(Self { id, operations })
+        Ok(Self {
+            id,
+            operations,
+            hold_ms: None,
+        })
+    }
+    /// Ask for the hold to lapse this long after admission, if it is still
+    /// prepared then. Without one, a hold lasts until it is committed or aborted.
+    pub fn with_hold(self, hold_ms: Option<u64>) -> Result<Self, Error> {
+        if hold_ms.is_some_and(|ms| ms == 0 || ms > MAX_HOLD_MS) {
+            return Err(Error::InvalidHold);
+        }
+        Ok(Self { hold_ms, ..self })
     }
     pub fn id(&self) -> &Id {
         &self.id
     }
     pub fn operations(&self) -> &[Operation] {
         &self.operations
+    }
+    pub fn hold_ms(&self) -> Option<u64> {
+        self.hold_ms
     }
     pub fn actuals(&self, supplied: Option<Vec<(Id, i128)>>) -> Result<Actuals, Error> {
         let mut values = BTreeMap::new();
@@ -216,8 +237,7 @@ impl Actuals {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Rejection {
-    /// Details are absent only for legacy stored capacity rejections.
-    Capacity(Option<CapacityFailure>),
+    Capacity(CapacityFailure),
     Overflow,
     NotFound,
 }
@@ -225,6 +245,8 @@ pub enum Rejection {
 pub enum AbortReason {
     Requested,
     Rejected(Rejection),
+    /// Still prepared when its hold's deadline passed.
+    Lapsed,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum State {
@@ -235,16 +257,25 @@ pub enum State {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transaction {
     request: Request,
+    /// When the hold may lapse, fixed at admission from the request's hold.
+    expires_at_ms: Option<u64>,
     state: State,
 }
 impl Transaction {
-    pub fn restore(request: Request, state: State) -> Result<Self, Error> {
+    pub fn restore(
+        request: Request,
+        expires_at_ms: Option<u64>,
+        state: State,
+    ) -> Result<Self, Error> {
+        if expires_at_ms.is_some() != request.hold_ms.is_some() {
+            return Err(Error::InvalidLedger);
+        }
         if let State::Committed(actuals) = &state {
             request.actuals(Some(
                 actuals.0.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             ))?;
         }
-        if let State::Aborted(AbortReason::Rejected(Rejection::Capacity(Some(failure)))) = &state
+        if let State::Aborted(AbortReason::Rejected(Rejection::Capacity(failure))) = &state
             && !request
                 .operations
                 .iter()
@@ -252,10 +283,21 @@ impl Transaction {
         {
             return Err(Error::InvalidLedger);
         }
-        Ok(Self { request, state })
+        Ok(Self {
+            request,
+            expires_at_ms,
+            state,
+        })
     }
     pub fn request(&self) -> &Request {
         &self.request
+    }
+    pub fn expires_at_ms(&self) -> Option<u64> {
+        self.expires_at_ms
+    }
+    /// Prepared, with a deadline at or before `now_ms`.
+    pub fn is_due(&self, now_ms: u64) -> bool {
+        self.state == State::Prepared && self.expires_at_ms.is_some_and(|at| at <= now_ms)
     }
     pub fn state(&self) -> &State {
         &self.state
@@ -454,11 +496,12 @@ impl Ledger {
         let changes = transition::create(spec.clone(), self.resources.get(spec.id()))?;
         Ok(self.apply(changes))
     }
-    pub fn prepare(&self, request: Request) -> Result<Self, Error> {
+    pub fn prepare(&self, request: Request, now_ms: u64) -> Result<Self, Error> {
         let changes = transition::prepare(
             request.clone(),
             self.transactions.get(request.id()),
             &self.resources,
+            now_ms,
         )?;
         Ok(self.apply(changes))
     }
@@ -576,6 +619,23 @@ impl Live {
     }
     pub fn prepared(&self) -> &BTreeMap<Id, Transaction> {
         &self.prepared
+    }
+    /// Prepared transactions holding any of `resources` whose deadline has
+    /// passed by `now_ms`, in ID order.
+    pub fn due<'a>(
+        &self,
+        resources: impl IntoIterator<Item = &'a Id>,
+        now_ms: u64,
+    ) -> Vec<&Transaction> {
+        let ids: BTreeSet<&Id> = resources
+            .into_iter()
+            .filter_map(|id| self.resources.get(id))
+            .flat_map(|r| r.holds.keys())
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| self.prepared.get(id))
+            .filter(|tx| tx.is_due(now_ms))
+            .collect()
     }
     /// Validate that holds and prepared transactions describe each other exactly.
     /// Balances are not reconstructed from history; a full Ledger restore does that.

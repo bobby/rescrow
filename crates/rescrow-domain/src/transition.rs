@@ -57,10 +57,13 @@ pub fn validate_participants(
     Ok(())
 }
 
+/// Admit a new request at `now_ms`, which fixes its hold's deadline, or
+/// replay an identical existing one.
 pub fn prepare(
     request: Request,
     existing: Option<&Transaction>,
     resources: &BTreeMap<Id, Resource>,
+    now_ms: u64,
 ) -> Result<Changes, Error> {
     if let Some(tx) = existing {
         if tx.request != request {
@@ -76,6 +79,10 @@ pub fn prepare(
             return Err(Error::InvalidLedger);
         }
     }
+    let expires_at_ms = request
+        .hold_ms
+        .map(|hold| now_ms.checked_add(hold).ok_or(Error::Overflow))
+        .transpose()?;
     let mut replacements = Vec::new();
     let mut state = State::Prepared;
     if request
@@ -90,7 +97,7 @@ pub fn prepare(
                 Ok(resource) => replacements.push(resource),
                 Err(error) => {
                     let reason = match error {
-                        Error::Capacity(failure) => Rejection::Capacity(Some(failure)),
+                        Error::Capacity(failure) => Rejection::Capacity(failure),
                         Error::Overflow => Rejection::Overflow,
                         other => return Err(other),
                     };
@@ -103,7 +110,11 @@ pub fn prepare(
     }
     Ok(Changes {
         resources: replacements,
-        transaction: Some(Transaction { request, state }),
+        transaction: Some(Transaction {
+            request,
+            expires_at_ms,
+            state,
+        }),
     })
 }
 
@@ -130,6 +141,19 @@ pub fn abort(tx: &Transaction, resources: &BTreeMap<Id, Resource>) -> Result<Cha
     }
 }
 
+/// Abort a prepared transaction whose deadline has passed by `now_ms`.
+pub fn lapse(
+    tx: &Transaction,
+    resources: &BTreeMap<Id, Resource>,
+    now_ms: u64,
+) -> Result<Changes, Error> {
+    validate_participants(tx, resources)?;
+    if !tx.is_due(now_ms) {
+        return Err(Error::Conflict);
+    }
+    finish(tx, State::Aborted(AbortReason::Lapsed), resources)
+}
+
 fn finish(
     tx: &Transaction,
     state: State,
@@ -154,6 +178,7 @@ fn finish(
         resources: replacements,
         transaction: Some(Transaction {
             request: tx.request.clone(),
+            expires_at_ms: tx.expires_at_ms,
             state,
         }),
     })

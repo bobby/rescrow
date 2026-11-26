@@ -247,6 +247,7 @@ mod tests {
                 resource: 0,
                 delta,
             }],
+            None,
         )
     }
     #[test]

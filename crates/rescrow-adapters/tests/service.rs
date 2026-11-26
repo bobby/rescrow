@@ -24,9 +24,6 @@ impl LogStore for Slow {
     fn initialize(&self, c: &Checkpoint) -> Result<(), StoreError> {
         self.inner.initialize(c)
     }
-    fn import(&self, c: &Checkpoint, entries: &[Entry]) -> Result<(), StoreError> {
-        self.inner.import(c, entries)
-    }
     fn load(&self) -> Result<Loaded, StoreError> {
         self.inner.load()
     }
@@ -66,6 +63,7 @@ fn prepare(id: &str) -> Command {
             resource_id: "r".into(),
             delta: "-1".into(),
         }],
+        hold_ms: None,
     })
 }
 fn id(n: u128) -> String {

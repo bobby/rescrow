@@ -57,14 +57,7 @@ impl Error {
     }
     fn rejection(reason: d::Rejection) -> Self {
         match reason {
-            d::Rejection::Capacity(Some(failure)) => Self::domain(d::Error::Capacity(failure)),
-            d::Rejection::Capacity(None) => Self {
-                category: Category::Domain,
-                code: Code::Capacity,
-                message: "insufficient unreserved quantity or upward room (legacy rejection without details)".into(),
-                transaction_id: None,
-                capacity: None,
-            },
+            d::Rejection::Capacity(failure) => Self::domain(d::Error::Capacity(failure)),
             d::Rejection::Overflow => Self::domain(d::Error::Overflow),
             d::Rejection::NotFound => Self::domain(d::Error::NotFound),
         }
@@ -194,13 +187,6 @@ pub struct Loaded {
 /// replaces state.
 pub trait LogStore {
     fn initialize(&self, empty: &dto::Checkpoint) -> Result<(), StoreError>;
-    /// Create an authority holding exactly these entries, with a checkpoint at
-    /// their end. Like initialization, never replaces existing live state.
-    fn import(
-        &self,
-        checkpoint: &dto::Checkpoint,
-        entries: &[dto::Entry],
-    ) -> Result<(), StoreError>;
     fn load(&self) -> Result<Loaded, StoreError>;
     /// Append consecutive entries only if the log holds exactly
     /// `entries[0].sequence` entries. Entries are never empty. A failure may
@@ -216,7 +202,7 @@ pub trait LogStore {
     fn history(&self) -> Result<Vec<dto::Entry>, StoreError>;
 }
 
-/// Validate a schema-1 whole-ledger snapshot, the format before the log.
+/// Validate a whole-ledger snapshot, as `Application::snapshot` returns it.
 pub fn validated_snapshot(snapshot: Snapshot) -> Result<d::Ledger, Error> {
     if snapshot.schema_version != 1 {
         return Err(StoreError::Unsupported(snapshot.schema_version).into());
@@ -383,18 +369,6 @@ impl<S: LogStore> Application<S> {
             .initialize(&checkpoint_dto(&d::Live::default(), 0, 0))?;
         Ok(())
     }
-    /// Create a log-structured authority from a schema-1 snapshot. The snapshot
-    /// is fully validated first, and the new log is then rebuilt and compared
-    /// with it. Transaction history keeps its decisions but not the old revision.
-    pub fn import(&self, snapshot: Snapshot) -> Result<(), Error> {
-        let ledger = validated_snapshot(snapshot)?;
-        let (checkpoint, entries) = imported(&ledger, (self.clock)());
-        self.store.import(&checkpoint, &entries)?;
-        if self.snapshot()? != Snapshot::from_ledger(&ledger, checkpoint.position) {
-            return Err(corrupt("imported log does not reproduce its snapshot"));
-        }
-        Ok(())
-    }
     /// Transport dispatcher; Rust callers may use the specific methods below.
     pub fn execute(&self, command: Command) -> Result<Output, Error> {
         match command {
@@ -503,7 +477,10 @@ impl<S: LogStore> Application<S> {
                             d::State::Prepared | d::State::Aborted(d::AbortReason::Rejected(_))
                         ) | (
                             Some(d::State::Prepared),
-                            d::State::Committed(_) | d::State::Aborted(d::AbortReason::Requested)
+                            d::State::Committed(_)
+                                | d::State::Aborted(
+                                    d::AbortReason::Requested | d::AbortReason::Lapsed
+                                )
                         )
                     );
                     if !valid || previous.is_some_and(|p| p.request() != tx.request()) {
@@ -646,18 +623,14 @@ impl<S: LogStore> Application<S> {
             let mut entries = Vec::new();
             let mut outputs = Vec::with_capacity(writes.len());
             for write in writes {
-                outputs.push(self.evaluate(&view, write).and_then(|(changes, output)| {
-                    if !changes.is_empty() {
-                        let sequence = view.position;
-                        view.advance(&changes)?;
-                        entries.push(dto::Entry {
-                            sequence,
-                            recorded_at_ms: view.now_ms,
-                            record: record(&changes),
-                        });
-                    }
-                    output
-                }));
+                outputs.push(
+                    lapse_due(&mut view, write, &mut entries)
+                        .and_then(|()| self.evaluate(&view, write))
+                        .and_then(|(changes, output)| {
+                            push(&mut view, &changes, &mut entries)?;
+                            output
+                        }),
+                );
             }
             if entries.is_empty() {
                 return (Some(view), outputs);
@@ -704,9 +677,13 @@ impl<S: LogStore> Application<S> {
                     Some(prepared) => Some(prepared.clone()),
                     None => self.lookup(view, request.id(), self.admit(view, request)?)?,
                 };
-                let changes =
-                    transition::prepare(request.clone(), existing.as_ref(), view.live.resources())
-                        .map_err(Error::domain)?;
+                let changes = transition::prepare(
+                    request.clone(),
+                    existing.as_ref(),
+                    view.live.resources(),
+                    view.now_ms,
+                )
+                .map_err(Error::domain)?;
                 let tx = changes
                     .transaction()
                     .or(existing.as_ref())
@@ -739,6 +716,55 @@ impl<S: LogStore> Application<S> {
     }
 }
 
+/// Advance `view` by a write's changes, recording them as the next entry.
+fn push(
+    view: &mut View,
+    changes: &transition::Changes,
+    entries: &mut Vec<dto::Entry>,
+) -> Result<(), Error> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let sequence = view.position;
+    view.advance(changes)?;
+    entries.push(dto::Entry {
+        sequence,
+        recorded_at_ms: view.now_ms,
+        record: record(changes),
+    });
+    Ok(())
+}
+/// Lapse the overdue holds on the resources a write could reserve or
+/// release, recording each lapse ahead of the write. Capacity returns only
+/// through these durable decisions, exactly when a write may need it.
+fn lapse_due(view: &mut View, write: &Write, entries: &mut Vec<dto::Entry>) -> Result<(), Error> {
+    let request = match write {
+        Write::Create(_) => return Ok(()),
+        Write::Prepare(request) => Some(request),
+        Write::Commit { id, .. } | Write::Abort(id) => {
+            view.live.prepared().get(id).map(d::Transaction::request)
+        }
+    };
+    let Some(request) = request else {
+        return Ok(());
+    };
+    let due: Vec<d::Id> = view
+        .live
+        .due(
+            request.operations().iter().map(d::Operation::resource),
+            view.now_ms,
+        )
+        .into_iter()
+        .map(|tx| tx.request().id().clone())
+        .collect();
+    for id in due {
+        let tx = view.live.prepared()[&id].clone();
+        let changes =
+            transition::lapse(&tx, view.live.resources(), view.now_ms).map_err(Error::domain)?;
+        push(view, &changes, entries)?;
+    }
+    Ok(())
+}
 /// Re-run the recorded transition and require that it reproduces the record.
 fn replay(view: &mut View, record: dto::Record) -> Result<(), Error> {
     let changes = match record {
@@ -761,7 +787,7 @@ fn replay(view: &mut View, record: dto::Record) -> Result<(), Error> {
                 (d::State::Prepared | d::State::Aborted(d::AbortReason::Rejected(_)), _)
                     if !known =>
                 {
-                    transition::prepare(tx.request().clone(), None, resources)
+                    transition::prepare(tx.request().clone(), None, resources, view.recorded_at_ms)
                 }
                 (d::State::Committed(actuals), Some(prepared)) => transition::commit(
                     prepared,
@@ -776,6 +802,9 @@ fn replay(view: &mut View, record: dto::Record) -> Result<(), Error> {
                 ),
                 (d::State::Aborted(d::AbortReason::Requested), Some(prepared)) => {
                     transition::abort(prepared, resources)
+                }
+                (d::State::Aborted(d::AbortReason::Lapsed), Some(prepared)) => {
+                    transition::lapse(prepared, resources, view.recorded_at_ms)
                 }
                 _ => return Err(corrupt("transaction record out of order")),
             }
@@ -792,38 +821,6 @@ fn replay(view: &mut View, record: dto::Record) -> Result<(), Error> {
     };
     view.live = view.live.apply(&changes);
     Ok(())
-}
-/// Entries that rebuild a validated ledger: each resource's creation, then each
-/// transaction's preparation and decision. They precede the checkpoint, so they
-/// are validated as whole history rather than replayed in order.
-fn imported(ledger: &d::Ledger, now_ms: u64) -> (dto::Checkpoint, Vec<dto::Entry>) {
-    let mut records: Vec<dto::Record> = ledger
-        .resources()
-        .values()
-        .map(|r| dto::Record::ResourceCreated(r.spec().into()))
-        .collect();
-    for tx in ledger.transactions().values() {
-        match tx.state() {
-            d::State::Prepared | d::State::Aborted(d::AbortReason::Rejected(_)) => {}
-            d::State::Committed(_) | d::State::Aborted(d::AbortReason::Requested) => {
-                let mut prepared = dto::Transaction::from(tx);
-                prepared.state = dto::State::Prepared {};
-                records.push(dto::Record::Transaction(prepared));
-            }
-        }
-        records.push(dto::Record::Transaction(tx.into()));
-    }
-    let entries: Vec<_> = records
-        .into_iter()
-        .zip(0..)
-        .map(|(record, sequence)| dto::Entry {
-            sequence,
-            recorded_at_ms: now_ms,
-            record,
-        })
-        .collect();
-    let checkpoint = checkpoint_dto(&ledger.live(), entries.len() as u64, now_ms);
-    (checkpoint, entries)
 }
 fn record(changes: &transition::Changes) -> dto::Record {
     match changes.transaction() {

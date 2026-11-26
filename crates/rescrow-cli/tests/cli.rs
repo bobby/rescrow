@@ -367,43 +367,52 @@ fn machine_errors_invalid_inputs_and_exact_large_signed_values() {
     );
 }
 #[test]
-fn migrate_converts_a_schema_1_store_once() {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+fn an_abandoned_hold_lapses_when_a_later_prepare_needs_its_capacity() {
     let c = Case::new();
-    c.ready("60");
-    let ops = c.file(
-        "ops.json",
-        r#"[{"operation_id":"o","resource_id":"r","delta":"-3"}]"#,
+    c.ready("10");
+    let all = c.file(
+        "all.json",
+        r#"[{"operation_id":"o","resource_id":"r","delta":"-10"}]"#,
     );
-    c.ok(&["transaction", "prepare", &tx("held"), "--operations", &ops]);
-    // Rewrite the same ledger in the schema-1 layout.
-    let mut source = c.snapshot();
-    source.schema_version = 1;
-    let store = c.root.join("store");
-    fs::remove_dir_all(&store).unwrap();
-    fs::DirBuilder::new().mode(0o700).create(&store).unwrap();
-    for (name, bytes) in [
-        ("state.lock", Vec::new()),
-        ("state.json", serde_json::to_vec(&source).unwrap()),
-    ] {
-        use std::io::Write;
-        fs::File::options()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(store.join(name))
-            .unwrap()
-            .write_all(&bytes)
-            .unwrap();
-    }
-    let refused = c.run(&["transaction", "list"]);
-    assert_eq!(refused.status.code(), Some(6), "{refused:?}");
-    assert_eq!(c.ok(&["migrate"]), Output::Migrated);
-    let Output::Transactions(transactions) = c.ok(&["transaction", "list"]) else {
-        panic!()
+    let prepare = |name: &str, extra: &[&str]| {
+        let id = tx(name);
+        let mut args = vec!["transaction", "prepare", &id, "--operations", &all];
+        args.extend_from_slice(extra);
+        c.run(&args)
     };
-    assert_eq!(transactions, source.transactions);
-    c.ok(&["transaction", "commit", &tx("held")]);
-    assert_eq!(c.snapshot().resources[0].quantity, "57");
-    assert_eq!(c.run(&["migrate"]).status.code(), Some(4));
+    let held = prepare("abandoned", &["--hold", "1s"]);
+    assert!(held.status.success());
+    let Output::Transaction(held) = serde_json::from_slice(&held.stdout).unwrap() else {
+        panic!("expected a transaction")
+    };
+    assert_eq!(held.request.hold_ms, Some(1_000));
+    assert!(held.expires_at_ms.is_some());
+    // While the hold lasts, its capacity is unavailable.
+    assert_eq!(prepare("early", &[]).status.code(), Some(3));
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    assert!(prepare("later", &[]).status.success());
+    let Output::Transaction(lapsed) = c.ok(&["transaction", "show", &tx("abandoned")]) else {
+        panic!("expected a transaction")
+    };
+    assert_eq!(
+        lapsed.state,
+        State::Aborted {
+            cause: AbortReason::Lapsed,
+            capacity: None,
+        }
+    );
+    assert_eq!(
+        c.run(&["transaction", "commit", &tx("abandoned")])
+            .status
+            .code(),
+        Some(4)
+    );
+    // Durations need a unit and must fit the 30-day limit.
+    for invalid in ["10", "5x", "31d", "0s"] {
+        assert_eq!(
+            prepare("invalid", &["--hold", invalid]).status.code(),
+            Some(2),
+            "{invalid}"
+        );
+    }
 }

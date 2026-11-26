@@ -7,7 +7,7 @@
 //! The lock inode is never replaced or removed.
 use rescrow_application::{
     Loaded, LogStore, Publication, StoreError,
-    dto::{Checkpoint, Entry, Record, Snapshot, State as TxState},
+    dto::{Checkpoint, Entry, Record, State as TxState},
 };
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -27,10 +27,6 @@ pub const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 pub const SEGMENT_BYTES: u64 = 4 * 1024 * 1024;
 const LIVE: &str = "live.json";
 const LOG: &str = "log";
-/// The schema-1 snapshot file. Its presence means the store needs migration.
-const LEGACY: &str = "state.json";
-/// A migrated schema-1 snapshot, kept for inspection and never read again.
-const RETIRED: &str = "state.json.migrated";
 const HEADER: usize = 8;
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -215,11 +211,7 @@ impl FileStore {
         let mut file = match File::open(self.directory.join(LIVE)) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(if self.directory.join(LEGACY).exists() {
-                    StoreError::Unsupported(1)
-                } else {
-                    StoreError::Missing
-                });
+                return Err(StoreError::Missing);
             }
             Err(e) => return Err(io(e)),
         };
@@ -562,34 +554,6 @@ impl FileStore {
             .map_err(io)?;
         log.sync_all().map_err(io)
     }
-    /// Read a schema-1 store's snapshot for migration. Decoding is not validation;
-    /// the Application validates it during import.
-    pub fn legacy(&self) -> Result<Snapshot, StoreError> {
-        self.directory_file()?;
-        let (_lock, _) = self.lock(false, false)?;
-        let mut file = match File::open(self.directory.join(LEGACY)) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(match self.read_live() {
-                    Ok(_) => StoreError::Exists,
-                    Err(e) => e,
-                });
-            }
-            Err(e) => return Err(io(e)),
-        };
-        check_file(&file)?;
-        let bytes = self.read_bounded(&mut file)?;
-        serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))
-    }
-    /// Keep a migrated snapshot for inspection under a name nothing reads, so it
-    /// can never be imported again over newer state.
-    fn retire_legacy(&self, directory: &File) -> Result<(), StoreError> {
-        match fs::rename(self.directory.join(LEGACY), self.directory.join(RETIRED)) {
-            Ok(()) => directory.sync_all().map_err(unknown),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(unknown(e)),
-        }
-    }
     fn read_record(&self, first: u64, offset: u64) -> Result<Entry, StoreError> {
         let mut file = self.open_segment(first, false)?;
         file.seek(SeekFrom::Start(offset)).map_err(io)?;
@@ -675,79 +639,6 @@ impl LogStore for FileStore {
             },
             &directory,
         )
-    }
-    /// Migration writes one segment holding every entry, then publishes
-    /// `live.json` as its commit point, then retires `state.json`. A log left by
-    /// an interrupted migration is discarded and rebuilt only while `state.json`
-    /// is still the authority.
-    fn import(&self, checkpoint: &Checkpoint, entries: &[Entry]) -> Result<(), StoreError> {
-        let ordered = entries.iter().zip(0..).all(|(e, n)| e.sequence == n);
-        if !ordered || checkpoint.position != entries.len() as u64 {
-            return Err(StoreError::Corrupt(
-                "imported entries must be numbered from zero, with the checkpoint at their end"
-                    .into(),
-            ));
-        }
-        let mut segment = Vec::new();
-        for entry in entries {
-            let frame = encode_frame(entry)?;
-            if (frame.len() - HEADER) as u64 > self.max_bytes {
-                return Err(StoreError::TooLarge);
-            }
-            segment.extend_from_slice(&frame);
-        }
-        let mut builder = DirBuilder::new();
-        #[cfg(unix)]
-        builder.mode(0o700);
-        match builder.create(&self.directory) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(io(e)),
-        }
-        let directory = self.directory_file()?;
-        let (_lock, created_lock) = self.lock(true, true)?;
-        match self.read_live() {
-            Ok(_) => {
-                // Finish retiring a snapshot left by a migration that published
-                // live state but stopped before renaming it.
-                self.retire_legacy(&directory)?;
-                return Err(StoreError::Exists);
-            }
-            Err(StoreError::Missing | StoreError::Unsupported(1)) => {}
-            Err(e) => return Err(e),
-        }
-        let legacy = self.directory.join(LEGACY).exists();
-        if !created_lock && !legacy {
-            return Err(StoreError::Missing);
-        }
-        match fs::symlink_metadata(self.log()) {
-            Ok(_) if legacy => {
-                fs::remove_dir_all(self.log()).map_err(io)?;
-                directory.sync_all().map_err(io)?;
-            }
-            Ok(_) => return Err(StoreError::Missing),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io(e)),
-        }
-        builder.create(self.log()).map_err(io)?;
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(self.segment_path(0)).map_err(io)?;
-        file.write_all(&segment).map_err(io)?;
-        file.sync_all().map_err(io)?;
-        open_directory(&self.log())?.sync_all().map_err(io)?;
-        directory.sync_all().map_err(io)?;
-        self.publish_live(
-            &LiveFile {
-                segment: 0,
-                offset: segment.len() as u64,
-                checkpoint: checkpoint.clone(),
-            },
-            &directory,
-        )?;
-        self.retire_legacy(&directory)
     }
     fn load(&self) -> Result<Loaded, StoreError> {
         let directory = self.directory_file()?;

@@ -1,6 +1,7 @@
 //! Sequential model checking, not OS-schedule replay or a throughput benchmark.
 //! Commands are generated independently of the SUT. Selection of existing IDs and
 //! actuals consults only the reference model, keeping histories useful while shrinking.
+//! The store's clock is the model's, and advances only between commands.
 #[path = "support/escrow_model.rs"]
 mod model;
 use model::{Command, Failure, Model, Op, Spec, State, tx_id};
@@ -10,6 +11,10 @@ use proptest::{
 };
 use rescrow_adapters::memory::{Fault, MemoryStore};
 use rescrow_application::{Application, Category, Code, Error, dto, service::Service};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 type TestResult = Result<(), TestCaseError>;
 #[derive(Clone, Debug)]
@@ -39,12 +44,16 @@ enum Action {
         fresh: bool,
         slot: u8,
         operations: Vec<Op>,
+        hold: Option<u64>,
     },
     Replay {
         target: Target,
         reverse: bool,
         change: bool,
+        rehold: bool,
     },
+    /// Advance the clock by this many milliseconds.
+    Wait(u64),
     Commit(Target, Actuals),
     Abort(Target),
     InspectResource(u8),
@@ -92,13 +101,23 @@ fn operations() -> impl Strategy<Value = Vec<Op>> {
         2=>prop::collection::vec((0_u8..4,0_u8..4,-8_i64..=8),0..=4).prop_map(|ops|ops.into_iter().map(|(id,resource,delta)|Op {id,resource,delta}).collect()),
     ]
 }
+/// Mostly short holds that lapse within a history, sometimes none, and
+/// occasionally an invalid one.
+fn hold() -> impl Strategy<Value = Option<u64>> {
+    prop_oneof![
+        4=>Just(None),
+        6=>(1_u64..=40).prop_map(Some),
+        1=>prop_oneof![Just(0), Just(30 * 24 * 60 * 60 * 1000 + 1)].prop_map(Some),
+    ]
+}
 fn step() -> impl Strategy<Value = Step> {
     let actuals = prop_oneof![3=>Just(Actuals::Full),2=>Just(Actuals::Zero),3=>(0_u8..=3).prop_map(Actuals::Fraction),3=>Just(Actuals::Replay),1=>Just(Actuals::Overuse),1=>Just(Actuals::Reverse),1=>Just(Actuals::Missing),1=>Just(Actuals::Duplicate),1=>Just(Actuals::Unknown)];
     let action = prop_oneof![
         2=>(0_u8..4,spec()).prop_map(|(id,spec)|Action::Create(id,spec)),
         1=>(0_u8..4).prop_map(Action::Recreate),
-        7=>(any::<bool>(),0_u8..8,operations()).prop_map(|(fresh,slot,operations)|Action::Prepare {fresh,slot,operations}),
-        4=>(target(),any::<bool>(),any::<bool>()).prop_map(|(target,reverse,change)|Action::Replay {target,reverse,change}),
+        7=>(any::<bool>(),0_u8..8,operations(),hold()).prop_map(|(fresh,slot,operations,hold)|Action::Prepare {fresh,slot,operations,hold}),
+        4=>(target(),any::<bool>(),any::<bool>(),prop::bool::weighted(0.2)).prop_map(|(target,reverse,change,rehold)|Action::Replay {target,reverse,change,rehold}),
+        3=>(0_u64..=20).prop_map(Action::Wait),
         6=>(target(),actuals).prop_map(|(t,a)|Action::Commit(t,a)),
         4=>target().prop_map(Action::Abort),
         1=>(0_u8..4).prop_map(Action::InspectResource),
@@ -134,8 +153,10 @@ impl Model {
             candidates[usize::from(index) % candidates.len()]
         }
     }
-    fn command(&self, action: &Action, index: usize) -> Command {
-        match action {
+    /// The command an action issues, or `None` for one that only waits.
+    fn command(&self, action: &Action, index: usize) -> Option<Command> {
+        Some(match action {
+            Action::Wait(_) => return None,
             Action::Create(id, spec) => Command::Create(*id, spec.clone()),
             Action::Recreate(id) => Command::Create(
                 *id,
@@ -151,6 +172,7 @@ impl Model {
                 fresh,
                 slot,
                 operations,
+                hold,
             } => Command::Prepare(
                 if *fresh {
                     1000 + index as u16
@@ -158,39 +180,50 @@ impl Model {
                     u16::from(*slot)
                 },
                 operations.clone(),
+                *hold,
             ),
             Action::Replay {
                 target,
                 reverse,
                 change,
+                rehold,
             } => {
                 let id = self.select(target);
-                let mut operations = self
+                let (mut operations, mut hold) = self
                     .transactions
                     .get(&id)
-                    .map(|tx| tx.operations.clone())
+                    .map(|tx| (tx.operations.clone(), tx.hold))
                     .unwrap_or_else(|| {
-                        vec![Op {
-                            id: 0,
-                            resource: 0,
-                            delta: 1,
-                        }]
+                        (
+                            vec![Op {
+                                id: 0,
+                                resource: 0,
+                                delta: 1,
+                            }],
+                            None,
+                        )
                     });
+                if *rehold {
+                    hold = match hold {
+                        None => Some(10),
+                        Some(_) => None,
+                    };
+                }
                 if *change {
                     operations[0].delta = if operations[0].delta == 1 { 2 } else { 1 };
                 }
                 if *reverse {
                     operations.reverse();
                 }
-                Command::Prepare(id, operations)
+                Command::Prepare(id, operations, hold)
             }
             Action::Commit(target, mode) => {
                 let id = self.select(target);
                 let Some(tx) = self.transactions.get(&id) else {
-                    return Command::Commit(id, None);
+                    return Some(Command::Commit(id, None));
                 };
                 if matches!(mode, Actuals::Full) {
-                    return Command::Commit(id, None);
+                    return Some(Command::Commit(id, None));
                 }
                 let mut actuals: Vec<_> = tx.operations.iter().map(|o| (o.id, o.delta)).collect();
                 match mode {
@@ -224,14 +257,15 @@ impl Model {
                     Command::Transactions
                 }
             }
-        }
+        })
     }
 }
 
 struct Harness {
     model: Model,
     store: MemoryStore,
-    revision: u64,
+    /// The store's clock, kept equal to the model's.
+    clock: Arc<AtomicU64>,
     /// One long-lived service for every command, or a new Application for each.
     service: Option<Service<MemoryStore>>,
 }
@@ -239,10 +273,15 @@ impl Harness {
     fn new(service: bool) -> Self {
         let store = MemoryStore::default();
         Application::new(store.clone()).initialize().unwrap();
+        // Requests are created when the process starts, so they are admitted.
+        let now = model::created();
         let mut harness = Self {
-            model: Model::default(),
+            model: Model {
+                now,
+                ..Model::default()
+            },
             store,
-            revision: 0,
+            clock: Arc::new(AtomicU64::new(now)),
             service: None,
         };
         if service {
@@ -258,7 +297,14 @@ impl Harness {
     }
     /// A frequent checkpoint interval exercises replay from many positions.
     fn app(&self) -> Application<MemoryStore> {
-        Application::new(self.store.clone()).with_checkpoint_interval(3)
+        let clock = self.clock.clone();
+        Application::new(self.store.clone())
+            .with_checkpoint_interval(3)
+            .with_clock(move || clock.load(Ordering::Relaxed))
+    }
+    fn wait(&mut self, ms: u64) {
+        self.model.now += ms;
+        self.clock.store(self.model.now, Ordering::Relaxed);
     }
     fn snapshot(&self) -> Result<dto::Snapshot, TestCaseError> {
         self.app()
@@ -304,14 +350,15 @@ impl Harness {
                 command.transaction_id().map(tx_id)
             );
             if matches!(effect, Effect::BeforePublication) {
-                prop_assert_eq!(self.snapshot()?, self.model.snapshot(self.revision));
+                prop_assert_eq!(self.snapshot()?, self.model.snapshot(self.model.position));
             } else {
-                prop_assert_eq!(self.snapshot()?, next.snapshot(self.revision + 1));
+                prop_assert_eq!(self.snapshot()?, next.snapshot(next.position));
             }
             // A new host retries the identical command, including rejected admissions.
             actual = self.execute(command.dto());
         }
-        let revision = self.revision + u64::from(changed);
+        // Lapses are entries too, appended ahead of the command's own.
+        let revision = next.position;
         match expected {
             Ok(()) => prop_assert_eq!(
                 actual.map_err(|e| TestCaseError::fail(format!(
@@ -359,7 +406,6 @@ impl Harness {
             prop_assert_eq!(self.snapshot()?, expected_snapshot);
         }
         self.model = next;
-        self.revision = revision;
         Ok(())
     }
 }
@@ -388,8 +434,14 @@ fn history(service: bool, initial: Vec<Spec>, steps: Vec<Step>) -> TestResult {
         h.apply(Command::Create(id as u8, spec), Effect::Clean, false)?;
     }
     for (index, step) in steps.into_iter().enumerate() {
-        let command = h.model.command(&step.action, index);
-        h.apply(command, step.effect, step.reload)?;
+        match h.model.command(&step.action, index) {
+            Some(command) => h.apply(command, step.effect, step.reload)?,
+            None => {
+                if let Action::Wait(ms) = step.action {
+                    h.wait(ms);
+                }
+            }
+        }
     }
     h.apply(Command::Resources, Effect::Clean, true)?;
     h.apply(Command::Transactions, Effect::Clean, false)
@@ -439,8 +491,8 @@ proptest! {
         let ops: Vec<_> = (0..participants)
             .map(|resource| Op { id: resource, resource, delta })
             .collect();
-        h.apply(Command::Prepare(0, ops.clone()), Effect::LostResponse, reload)?;
-        h.apply(Command::Prepare(0, ops.iter().rev().cloned().collect()), Effect::Clean, reload)?;
+        h.apply(Command::Prepare(0, ops.clone(), None), Effect::LostResponse, reload)?;
+        h.apply(Command::Prepare(0, ops.iter().rev().cloned().collect(), None), Effect::Clean, reload)?;
         let decision = if abort {
             Command::Abort(0)
         } else {
@@ -453,6 +505,6 @@ proptest! {
         h.apply(if abort { Command::Commit(0, None) } else { Command::Abort(0) }, Effect::Clean, reload)?;
         let mut changed = ops;
         changed[0].delta = -changed[0].delta;
-        h.apply(Command::Prepare(0, changed), Effect::Clean, reload)?;
+        h.apply(Command::Prepare(0, changed, None), Effect::Clean, reload)?;
     }
 }

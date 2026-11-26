@@ -19,10 +19,11 @@ fn sample() -> Snapshot {
             resource_id: "r".into(),
             delta: "-3".into(),
         }],
+        hold_ms: None,
     }
     .try_into()
     .unwrap();
-    Snapshot::from_ledger(&ledger.prepare(request).unwrap(), 2)
+    Snapshot::from_ledger(&ledger.prepare(request, 0).unwrap(), 2)
 }
 #[test]
 fn canonical_decimal_and_typed_json() {
@@ -51,7 +52,14 @@ fn canonical_decimal_and_typed_json() {
     ] {
         assert_eq!(decimal(s).unwrap().to_string(), s);
     }
-    let cmd: Command = serde_json::from_str(r#"{"command":"prepare","input":{"transaction_id":"t","operations":[{"operation_id":"o","resource_id":"r","delta":"-9007199254740993"}]}}"#).unwrap();
+    // A hold is optional but its field is not: `null` means no deadline.
+    assert!(
+        serde_json::from_str::<Command>(
+            r#"{"command":"prepare","input":{"transaction_id":"t","operations":[]}}"#
+        )
+        .is_err()
+    );
+    let cmd: Command = serde_json::from_str(r#"{"command":"prepare","input":{"transaction_id":"t","operations":[{"operation_id":"o","resource_id":"r","delta":"-9007199254740993"}],"hold_ms":null}}"#).unwrap();
     let Command::Prepare(p) = cmd else { panic!() };
     assert_eq!(
         d::Request::try_from(p).unwrap().operations()[0].delta(),
@@ -93,9 +101,11 @@ fn round_trips_every_lifecycle() {
                     resource_id: "r".into(),
                     delta: "-6".into(),
                 }],
+                hold_ms: None,
             }
             .try_into()
             .unwrap(),
+            0,
         )
         .unwrap();
     assert_eq!(
@@ -162,6 +172,7 @@ fn documented_json_examples_use_the_validated_contract() {
     let request: d::Request = Prepare {
         transaction_id: "work".into(),
         operations,
+        hold_ms: None,
     }
     .try_into()
     .unwrap();
@@ -185,6 +196,7 @@ fn documented_json_examples_use_the_validated_contract() {
     let _: d::Request = Prepare {
         transaction_id: "credit".into(),
         operations: credit,
+        hold_ms: None,
     }
     .try_into()
     .unwrap();
@@ -201,7 +213,7 @@ fn documented_json_examples_use_the_validated_contract() {
 }
 
 #[test]
-fn capacity_details_validate_and_legacy_rejections_still_decode() {
+fn capacity_details_are_required_and_validated() {
     let prepared = validated_snapshot(sample()).unwrap();
     let rejected = prepared
         .prepare(
@@ -212,13 +224,15 @@ fn capacity_details_validate_and_legacy_rejections_still_decode() {
                     resource_id: "r".into(),
                     delta: "-6".into(),
                 }],
+                hold_ms: None,
             }
             .try_into()
             .unwrap(),
+            0,
         )
         .unwrap();
     let dto = Snapshot::from_ledger(&rejected, 4);
-    for change in [0, 1, 2, 3] {
+    for change in [0, 1, 2, 3, 4] {
         let mut invalid = dto.clone();
         let State::Aborted { cause, capacity } = &mut invalid.transactions[0].state else {
             panic!()
@@ -227,6 +241,7 @@ fn capacity_details_validate_and_legacy_rejections_still_decode() {
             0 => capacity.as_mut().unwrap().available = "6".into(),
             1 => capacity.as_mut().unwrap().requested_delta = "-7".into(),
             2 => capacity.as_mut().unwrap().resource_id = "other".into(),
+            3 => *capacity = None,
             _ => *cause = AbortReason::Requested,
         }
         assert_eq!(
@@ -234,16 +249,4 @@ fn capacity_details_validate_and_legacy_rejections_still_decode() {
             Code::CorruptState
         );
     }
-    let mut legacy = dto;
-    let State::Aborted { capacity, .. } = &mut legacy.transactions[0].state else {
-        panic!()
-    };
-    *capacity = None;
-    let json = serde_json::to_string(&legacy).unwrap();
-    assert!(!json.contains("\"capacity\":"));
-    let restored = validated_snapshot(serde_json::from_str(&json).unwrap()).unwrap();
-    assert_eq!(
-        restored.transactions()[&d::Id::new("reject".into()).unwrap()].rejection(),
-        Some(d::Rejection::Capacity(None))
-    );
 }

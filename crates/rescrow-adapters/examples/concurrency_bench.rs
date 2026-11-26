@@ -40,6 +40,7 @@ fn prepare(id: &str) -> Command {
             resource_id: "r".into(),
             delta: "-1".into(),
         }],
+        hold_ms: None,
     })
 }
 /// How the threads reach the store.
