@@ -90,7 +90,7 @@ pub fn prepare(
                 Ok(resource) => replacements.push(resource),
                 Err(error) => {
                     let reason = match error {
-                        Error::Capacity(failure) => Rejection::Capacity(Some(failure)),
+                        Error::Capacity(failure) => Rejection::Capacity(failure),
                         Error::Overflow => Rejection::Overflow,
                         other => return Err(other),
                     };

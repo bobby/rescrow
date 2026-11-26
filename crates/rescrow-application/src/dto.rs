@@ -206,7 +206,6 @@ pub struct Entry {
 )]
 pub enum Output {
     Initialized,
-    Migrated,
     Resource(Resource),
     Resources(Vec<Resource>),
     Transaction(Transaction),
@@ -360,7 +359,7 @@ impl TryFrom<Transaction> for d::Transaction {
                     AbortReason::Requested => d::AbortReason::Requested,
                     AbortReason::Rejected(r) => d::AbortReason::Rejected(match r {
                         Rejection::Capacity => d::Rejection::Capacity(
-                            capacity.map(d::CapacityFailure::try_from).transpose()?,
+                            capacity.ok_or(d::Error::InvalidLedger)?.try_into()?,
                         ),
                         Rejection::Overflow => d::Rejection::Overflow,
                         Rejection::NotFound => d::Rejection::NotFound,
@@ -387,7 +386,7 @@ impl From<&d::Transaction> for Transaction {
             },
             d::State::Aborted(cause) => State::Aborted {
                 capacity: match cause {
-                    d::AbortReason::Rejected(d::Rejection::Capacity(Some(failure))) => {
+                    d::AbortReason::Rejected(d::Rejection::Capacity(failure)) => {
                         Some(failure.into())
                     }
                     _ => None,

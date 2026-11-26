@@ -216,8 +216,7 @@ impl Actuals {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Rejection {
-    /// Details are absent only for legacy stored capacity rejections.
-    Capacity(Option<CapacityFailure>),
+    Capacity(CapacityFailure),
     Overflow,
     NotFound,
 }
@@ -244,7 +243,7 @@ impl Transaction {
                 actuals.0.iter().map(|(k, v)| (k.clone(), *v)).collect(),
             ))?;
         }
-        if let State::Aborted(AbortReason::Rejected(Rejection::Capacity(Some(failure)))) = &state
+        if let State::Aborted(AbortReason::Rejected(Rejection::Capacity(failure))) = &state
             && !request
                 .operations
                 .iter()
