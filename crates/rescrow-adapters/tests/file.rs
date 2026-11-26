@@ -554,9 +554,18 @@ fn concurrent_readers_do_not_starve_writers() {
         .map(|w| {
             let path = temp.store();
             std::thread::spawn(move || {
-                // The default lock timeout bounds the test: starvation was
-                // permanent, but a busy runner can legitimately be slow.
                 let app = Application::new(FileStore::new(path).unwrap());
+                // Contention asks the client to retry. Starvation was permanent,
+                // so a generous deadline catches it while tolerating a busy runner.
+                let start = Instant::now();
+                let execute = |command: Command| loop {
+                    match app.execute(command.clone()) {
+                        Err(e)
+                            if e.code == Code::Contention
+                                && start.elapsed() < Duration::from_secs(60) => {}
+                        result => break result,
+                    }
+                };
                 for n in 0..10 {
                     // Four concurrent holds of one fit the resource's five.
                     let id = tx(&format!("w{w}-{n}"));
@@ -564,8 +573,8 @@ fn concurrent_readers_do_not_starve_writers() {
                         unreachable!()
                     };
                     request.operations[0].delta = "-1".into();
-                    app.execute(Command::Prepare(request)).unwrap();
-                    app.execute(Command::Abort { transaction_id: id }).unwrap();
+                    execute(Command::Prepare(request)).unwrap();
+                    execute(Command::Abort { transaction_id: id }).unwrap();
                 }
             })
         })
