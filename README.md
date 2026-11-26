@@ -2,7 +2,7 @@
 
 Rescrow is a Rust implementation of local durable escrow transactions for resource budgets. Reserve a bounded quantity, coordinate work, and settle actual usage while other agents and workflows continue using the remaining capacity.
 
-The first milestone implements a pure Domain, a synchronous Application API with validated transfer types, and a file-backed local CLI. [PLAN.md](PLAN.md) records the scope and completion evidence. [DESIGN.md](DESIGN.md) describes the broader proposed distributed protocol, security model, and enterprise qualification targets. Enterprise performance and durability remain unqualified. A small local benchmark is described below; it is not a throughput or latency guarantee.
+The first milestone implements a pure Domain, a synchronous Application API with validated transfer types, and a file-backed local CLI. [DESIGN.md](DESIGN.md) describes the broader proposed distributed protocol, security model, and enterprise qualification targets. Enterprise performance and durability remain unqualified. A small local benchmark is described below; it is not a throughput or latency guarantee.
 
 ## Build and run locally
 
