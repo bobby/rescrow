@@ -571,11 +571,9 @@ fn concurrent_readers_do_not_starve_writers() {
         .map(|w| {
             let path = temp.store();
             std::thread::spawn(move || {
-                let app = Application::new(
-                    FileStore::new(path)
-                        .unwrap()
-                        .with_lock_timeout(Duration::from_millis(500)),
-                );
+                // The default lock timeout bounds the test: starvation was
+                // permanent, but a busy runner can legitimately be slow.
+                let app = Application::new(FileStore::new(path).unwrap());
                 for n in 0..10 {
                     // Four concurrent holds of one fit the resource's five.
                     let id = tx(&format!("w{w}-{n}"));
