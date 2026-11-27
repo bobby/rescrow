@@ -13,6 +13,7 @@ fn sample() -> Snapshot {
         .create(spec.try_into().unwrap())
         .unwrap();
     let request: d::Request = Prepare {
+        namespace: None,
         transaction_id: "t".into(),
         operations: vec![Operation {
             operation_id: "o".into(),
@@ -95,6 +96,7 @@ fn round_trips_every_lifecycle() {
     let rejected = prepared
         .prepare(
             Prepare {
+                namespace: None,
                 transaction_id: "reject".into(),
                 operations: vec![Operation {
                     operation_id: "o".into(),
@@ -170,6 +172,7 @@ fn documented_json_examples_use_the_validated_contract() {
     let operations: Vec<Operation> =
         serde_json::from_str(include_str!("../../../examples/operations.json")).unwrap();
     let request: d::Request = Prepare {
+        namespace: None,
         transaction_id: "work".into(),
         operations,
         hold_ms: None,
@@ -194,6 +197,7 @@ fn documented_json_examples_use_the_validated_contract() {
     let credit: Vec<Operation> =
         serde_json::from_str(include_str!("../../../examples/credit.json")).unwrap();
     let _: d::Request = Prepare {
+        namespace: None,
         transaction_id: "credit".into(),
         operations: credit,
         hold_ms: None,
@@ -218,6 +222,7 @@ fn capacity_details_are_required_and_validated() {
     let rejected = prepared
         .prepare(
             Prepare {
+                namespace: None,
                 transaction_id: "reject".into(),
                 operations: vec![Operation {
                     operation_id: "o".into(),
@@ -249,4 +254,41 @@ fn capacity_details_are_required_and_validated() {
             Code::CorruptState
         );
     }
+}
+
+#[test]
+fn qualified_identities_round_trip_without_string_joining() {
+    let decode = |namespace: &str| {
+        let request: d::Request = Prepare {
+            transaction_id: "same".into(),
+            namespace: Some(namespace.into()),
+            operations: vec![Operation {
+                operation_id: "op".into(),
+                resource_id: "r".into(),
+                delta: "-1".into(),
+            }],
+            hold_ms: None,
+        }
+        .try_into()
+        .unwrap();
+        request
+    };
+    let a = decode("a");
+    let b = decode("b");
+    assert_ne!(a.id(), b.id());
+    assert_eq!(a.id().as_str(), "same");
+    assert_eq!(Prepare::from(&a).namespace.as_deref(), Some("a"));
+    assert_eq!(d::Request::try_from(Prepare::from(&a)).unwrap(), a);
+    let spec =
+        d::ResourceSpec::new(d::Id::new("r".into()).unwrap(), 0, None, 5, "u".into(), 0).unwrap();
+    let resource =
+        d::Resource::restore(spec, 5, vec![(a.id().clone(), -1), (b.id().clone(), -1)]).unwrap();
+    let transfer = Resource::from(&resource);
+    assert_eq!(transfer.holds.len(), 2);
+    assert_eq!(d::Resource::try_from(transfer).unwrap(), resource);
+    let invalid = Prepare {
+        namespace: Some("../escape".into()),
+        ..Prepare::from(&a)
+    };
+    assert!(d::Request::try_from(invalid).is_err());
 }

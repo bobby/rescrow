@@ -1,0 +1,13 @@
+[package]
+name = "rescrow-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rescrow-application.workspace = true
+tokio = { version = "1.54", features = ["rt", "sync"] }
+
+[dev-dependencies]
+rescrow-adapters.workspace = true
+tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "time"] }

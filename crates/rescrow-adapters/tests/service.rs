@@ -57,6 +57,7 @@ fn create(initial: &str) -> Command {
 }
 fn prepare(id: &str) -> Command {
     Command::Prepare(Prepare {
+        namespace: None,
         transaction_id: id.into(),
         operations: vec![Operation {
             operation_id: "o".into(),
@@ -253,7 +254,7 @@ fn an_unknown_outcome_reaches_every_write_in_its_batch_and_reloads() {
         thread::spawn(move || service.execute(prepare(&id(0))).unwrap())
     };
     thread::sleep(DELAY / 5);
-    store.inner.inject(Fault::LostResponse);
+    store.inner.inject(Fault::LostResponseUnresolved);
     let ids: Vec<_> = (1..=4).map(id).collect();
     let queued: Vec<_> = ids
         .iter()

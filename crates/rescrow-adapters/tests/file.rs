@@ -97,6 +97,7 @@ fn prepare_as(name: &str) -> Command {
 }
 fn prepare_raw(id: &str) -> Command {
     Command::Prepare(Prepare {
+        namespace: None,
         transaction_id: id.into(),
         operations: vec![Operation {
             operation_id: "o".into(),
@@ -172,6 +173,7 @@ fn stale_position_conflicts_and_invalid_live_state_fails_closed() {
     let old = store.load().unwrap();
     temp.app().execute(prepare()).unwrap();
     let stale = Entry {
+        publication_id: None,
         sequence: old.checkpoint.position + old.tail.len() as u64,
         recorded_at_ms: rescrow_application::system_clock(),
         record: Record::ResourceCreated(ResourceSpec {
@@ -194,9 +196,10 @@ fn stale_position_conflicts_and_invalid_live_state_fails_closed() {
         assert!(matches!(store.load(), Err(StoreError::Corrupt(_))));
         assert_eq!(fs::read(temp.store().join("live.json")).unwrap(), bytes);
     }
-    let unsupported = String::from_utf8(live.clone())
-        .unwrap()
-        .replace("\"schema_version\":2", "\"schema_version\":99");
+    let unsupported = String::from_utf8(live.clone()).unwrap().replace(
+        &format!("\"schema_version\":{}", rescrow_application::SCHEMA_VERSION),
+        "\"schema_version\":99",
+    );
     fs::write(temp.store().join("live.json"), unsupported).unwrap();
     assert_eq!(
         temp.app().execute(Command::ListResources).unwrap_err().code,
@@ -283,6 +286,7 @@ fn contention_has_a_deadline_and_permission_errors_preserve_state() {
     store.load().unwrap();
     let now = Instant::now();
     let entry = Entry {
+        publication_id: None,
         sequence: 1,
         recorded_at_ms: rescrow_application::system_clock(),
         record: Record::ResourceCreated(ResourceSpec {
@@ -349,6 +353,10 @@ fn child_worker() {
     if std::env::var("RESCROW_TEST_CHECKPOINT").is_ok() {
         app = app.with_checkpoint_interval(1);
     }
+    if let Ok(now) = std::env::var("RESCROW_TEST_NOW") {
+        let now = now.parse().unwrap();
+        app = app.with_clock(move || now);
+    }
     let result = match std::env::var("RESCROW_TEST_ACTION").as_deref() {
         Ok("init") => app.initialize().map(|()| Output::Initialized),
         _ => app.execute(prepare()),
@@ -378,6 +386,17 @@ fn child(temp: &Temp, stage: Stage, mode: &str, expect: &str) -> std::process::C
         .env("RESCROW_TEST_EXPECT", expect)
         .env("RESCROW_TEST_CREATED", created().to_string())
         .stdout(std::process::Stdio::null());
+    if expect == "batch" {
+        process.env(
+            "RESCROW_TEST_NOW",
+            temp.app()
+                .transaction(&tx("first"))
+                .unwrap()
+                .expires_at_ms
+                .unwrap()
+                .to_string(),
+        );
+    }
     if expect == "ok" {
         process.env("RESCROW_TEST_CHECKPOINT", "1");
     }
@@ -413,7 +432,6 @@ fn finish(temp: &Temp) {
     assert_eq!(committed.resources[0].quantity, "2");
     assert_eq!(committed.revision, 3);
 }
-#[test]
 fn kill_at_append_boundaries_exposes_old_or_new_log() {
     for stage in [
         Stage::BeforeAppend,
@@ -449,7 +467,9 @@ fn injected_append_and_read_failures_preserve_replay_identity() {
         let temp = Temp::new();
         ready(&temp);
         let old = temp.snapshot();
-        let expect = if appended(stage) || stage == Stage::ReadSync {
+        let expect = if appended(stage) {
+            "ok"
+        } else if stage == Stage::ReadSync {
             "unknown"
         } else {
             "io"
@@ -534,7 +554,6 @@ fn initialization_failures_never_reset_a_missing_or_published_authority() {
 }
 /// Readers hammering the store once starved writers, which wait for the lock
 /// only while no reader holds it. Readers now take no lock.
-#[test]
 fn concurrent_readers_do_not_starve_writers() {
     let temp = Temp::new();
     ready(&temp);
@@ -603,6 +622,7 @@ fn readers_share_the_lock_and_exclude_writers() {
     lock.lock_shared().unwrap();
     let current = store.load().unwrap();
     let entry = Entry {
+        publication_id: None,
         sequence: current.checkpoint.position + current.tail.len() as u64,
         recorded_at_ms: rescrow_application::system_clock(),
         record: Record::ResourceCreated(ResourceSpec {
@@ -862,4 +882,53 @@ fn new_prepares_skip_segments_older_than_their_skew_bound() {
         .code,
         Code::CorruptState
     );
+}
+
+#[test]
+fn declared_file_capabilities_have_process_and_crash_evidence() {
+    use rescrow_test_support::qualification::{self, Hooks};
+    let temp = Temp::new();
+    let store = ready(&temp);
+    qualification::run(
+        &store,
+        Hooks {
+            cross_process: Some(&concurrent_readers_do_not_starve_writers),
+            crash_reopen: Some(&kill_at_append_boundaries_exposes_old_or_new_log),
+        },
+    );
+}
+#[test]
+fn an_interrupted_lapse_and_prepare_batch_never_publishes_a_prefix() {
+    for stage in [Stage::DuringAppend, Stage::AppendSynced] {
+        let temp = Temp::new();
+        ready(&temp);
+        let app = Application::new(FileStore::new(temp.store()).unwrap()).with_clock(created);
+        let Command::Prepare(mut first) = prepare_raw(&tx("first")) else {
+            unreachable!()
+        };
+        first.operations[0].delta = "-4".into();
+        first.hold_ms = Some(1);
+        let deadline = app.prepare(first).unwrap().expires_at_ms.unwrap();
+        let before = app.snapshot().unwrap();
+        kill_with(&temp, stage, "batch", child(&temp, stage, "kill", "batch"));
+        let observed = app.snapshot().unwrap();
+        if stage == Stage::DuringAppend {
+            assert_eq!(observed, before);
+        } else {
+            assert_eq!(observed.revision, before.revision + 2);
+            assert_eq!(observed.transactions.len(), 2);
+        }
+        let recovered =
+            Application::new(FileStore::new(temp.store()).unwrap()).with_clock(move || deadline);
+        recovered.execute(prepare()).unwrap();
+        assert_eq!(recovered.snapshot().unwrap().revision, before.revision + 2);
+        assert_eq!(recovered.resource("r").unwrap().reserved_down, "3");
+        assert!(matches!(
+            recovered.transaction(&tx("first")).unwrap().state,
+            State::Aborted {
+                cause: AbortReason::Lapsed,
+                ..
+            }
+        ));
+    }
 }

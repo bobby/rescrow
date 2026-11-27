@@ -13,6 +13,7 @@ pub enum Fault {
     Conflict,
     BeforePublication,
     LostResponse,
+    LostResponseUnresolved,
 }
 #[derive(Default)]
 struct State {
@@ -20,6 +21,7 @@ struct State {
     entries: Vec<Entry>,
     faults: VecDeque<Fault>,
     evaluations: usize,
+    unresolved: bool,
 }
 #[derive(Clone, Default)]
 pub struct MemoryStore(Arc<Mutex<State>>);
@@ -76,6 +78,21 @@ impl LogStore for MemoryStore {
         state.evaluations += 1;
         let checkpoint = state.checkpoint.as_ref().ok_or(StoreError::Missing)?;
         let length = (state.entries.len() as u64).max(checkpoint.position);
+        if let Some(identity) = &entries[0].publication_id {
+            let existing: Vec<_> = state
+                .entries
+                .iter()
+                .filter(|e| e.publication_id.as_ref() == Some(identity))
+                .cloned()
+                .collect();
+            if !existing.is_empty() {
+                return if existing == entries {
+                    Ok(Publication::Applied)
+                } else {
+                    Err(StoreError::Corrupt("publication identity reused".into()))
+                };
+            }
+        }
         if entries[0].sequence != length {
             return Ok(Publication::Conflict);
         }
@@ -88,7 +105,13 @@ impl LogStore for MemoryStore {
             _ => {}
         }
         state.entries.extend_from_slice(entries);
-        if matches!(fault, Some(Fault::LostResponse)) {
+        if matches!(fault, Some(Fault::LostResponseUnresolved)) {
+            state.unresolved = true;
+        }
+        if matches!(
+            fault,
+            Some(Fault::LostResponse | Fault::LostResponseUnresolved)
+        ) {
             return Err(StoreError::Unknown("injected lost response".into()));
         }
         Ok(Publication::Applied)
@@ -120,6 +143,12 @@ impl LogStore for MemoryStore {
             .cloned())
     }
     fn history(&self) -> Result<Vec<Entry>, StoreError> {
-        Ok(self.0.lock().unwrap().entries.clone())
+        let mut state = self.0.lock().unwrap();
+        if std::mem::take(&mut state.unresolved) {
+            return Err(StoreError::Unknown(
+                "injected unavailable resolution read".into(),
+            ));
+        }
+        Ok(state.entries.clone())
     }
 }

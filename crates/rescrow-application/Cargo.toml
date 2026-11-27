@@ -8,6 +8,7 @@ rust-version.workspace = true
 arc-swap.workspace = true
 rescrow-domain.workspace = true
 serde.workspace = true
+getrandom = "0.4"
 
 [dev-dependencies]
 serde_json.workspace = true

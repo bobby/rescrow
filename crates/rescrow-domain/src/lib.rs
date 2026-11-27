@@ -42,7 +42,10 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Id(String);
+pub struct Id {
+    value: String,
+    namespace: Option<String>,
+}
 impl Id {
     pub fn new(value: String) -> Result<Self, Error> {
         if value.is_empty()
@@ -53,10 +56,27 @@ impl Id {
         {
             return Err(Error::InvalidId);
         }
-        Ok(Self(value))
+        Ok(Self {
+            value,
+            namespace: None,
+        })
     }
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.value
+    }
+    /// Qualify a transaction identity without joining strings or changing its
+    /// external ID. Resource and operation identities remain unqualified.
+    pub fn qualified(namespace: Id, id: Id) -> Result<Self, Error> {
+        if namespace.namespace.is_some() || id.namespace.is_some() {
+            return Err(Error::InvalidId);
+        }
+        Ok(Self {
+            value: id.value,
+            namespace: Some(namespace.value),
+        })
+    }
+    pub fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
     }
 }
 
@@ -78,6 +98,9 @@ impl ResourceSpec {
         unit: String,
         scale: u32,
     ) -> Result<Self, Error> {
+        if id.namespace().is_some() {
+            return Err(Error::InvalidId);
+        }
         if unit.is_empty()
             || unit.len() > 64
             || unit.chars().any(char::is_control)
@@ -130,6 +153,9 @@ pub struct Operation {
 }
 impl Operation {
     pub fn new(id: Id, resource: Id, delta: i128) -> Result<Self, Error> {
+        if id.namespace().is_some() || resource.namespace().is_some() {
+            return Err(Error::InvalidId);
+        }
         if delta == 0 {
             return Err(Error::InvalidOperations);
         }

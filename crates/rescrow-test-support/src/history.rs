@@ -11,6 +11,31 @@ pub struct Response {
     pub stderr: String,
     pub result: Option<Result<dto::Output, Error>>,
 }
+impl Response {
+    pub fn application(result: Result<dto::Output, Error>) -> Self {
+        let (exit, stdout, stderr) = match &result {
+            Ok(output) => (0, serde_json::to_string(output).unwrap(), String::new()),
+            Err(error) => {
+                let exit = match error.code {
+                    Code::InvalidInput => 2,
+                    Code::Capacity | Code::Overflow => 3,
+                    Code::NotFound | Code::Conflict | Code::Expired | Code::AlreadyInitialized => 4,
+                    Code::Contention => 5,
+                    Code::UnknownOutcome => 7,
+                    _ => 6,
+                };
+                (exit, String::new(), serde_json::to_string(error).unwrap())
+            }
+        };
+        Self {
+            exit: Some(exit),
+            stdout,
+            stderr,
+            result: Some(result),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Call {
     pub command: Command,
