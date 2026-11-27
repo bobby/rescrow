@@ -2,7 +2,7 @@
 
 Rescrow is a Rust implementation of local durable escrow transactions for resource budgets. Reserve a bounded quantity, coordinate work, and settle actual usage while other agents and workflows continue using the remaining capacity.
 
-The local CLI and [M1 server foundation](https://github.com/bobby/rescrow/milestone/1) are implemented: a pure Domain, one transactional Application port, tenant and namespace identities, verified durability profiles, and a bounded async server boundary. [DESIGN.md](DESIGN.md) describes the broader proposed distributed protocol, security model, and enterprise qualification targets. Enterprise performance and durability remain unqualified. A small local benchmark is described below; it is not a throughput or latency guarantee.
+The local CLI, [M1 server foundation](https://github.com/bobby/rescrow/milestone/1), and [M2 HTTP API](API.md) are implemented: a pure Domain, one transactional Application port, tenant and namespace identities, verified durability profiles, bounded async serving, workload JWT authorization, and remote clients. [DESIGN.md](DESIGN.md) describes the broader proposed distributed protocol, security model, and enterprise qualification targets. Enterprise performance and durability remain unqualified. A small local benchmark is described below; it is not a throughput or latency guarantee.
 
 ## Build and run locally
 
@@ -76,30 +76,38 @@ Use `--json` for typed Application results on stdout and structured errors on st
 
 An unknown outcome is never a known rollback. A new transaction ID can reserve again, so preserve the original ID and actuals across retries, and finish retrying within the 24-hour window. After uncertain initialization, inspect the store; retrying `init` validates and synchronizes existing state before reporting `already_initialized`. A directory with an existing lock file but no live snapshot fails closed even for `init`; choose a fresh directory for a new store. A failed initialization before publication may leave such a directory.
 
+## HTTP API and remote clients
+
+The optional `rescrow-http` executable uses Tokio, Axum/Tower and pinned workload JWT verification over the same Application. [API.md](API.md) contains configuration, a runnable local service example, the [OpenAPI 3.1 contract](openapi/rescrow-v1.json), limits, the exhaustive problem table, and client generation/verification commands. Resource/transaction endpoints support tenant isolation, current authorization on replay, signed keyset cursors, bounded traffic lanes and atomic outstanding-hold quotas. Memory is an explicit disposable simulation; file storage retains its local durability profile.
+
+Build `cargo build -p rescrow-cli --features remote --locked` to enable `--endpoint`. The default CLI build keeps Tokio, Axum, HTTP clients and cloud SDKs out of its normal dependency graph, checked in CI. Rust, generated Python and generated TypeScript clients preserve the same identity and request through bounded retries; alternate endpoints require a pinned actual authority generation. Regional and enterprise backends remain unimplemented and unqualified.
+
 ## Rust callers and boundaries
 
-The local build has four production crates; server composition and test support have separate dependency boundaries:
+The local build has four production crates; optional HTTP/client composition and test support have separate dependency boundaries:
 
 ```text
 rescrow-cli -> rescrow-adapters -> rescrow-application -> rescrow-domain
            -> rescrow-application
-rescrow-server -> rescrow-application          (Tokio boundary, no HTTP yet)
+rescrow-server -> rescrow-application          (bounded Tokio boundary)
+rescrow-http -> rescrow-server + rescrow-adapters (Axum/Tower + JWT + TLS)
+rescrow-client -> rescrow-application          (reqwest + Tokio; optional CLI remote feature)
 rescrow-test-support -> rescrow-application    (tests only)
 ```
 
 The Domain has no dependencies or serialization. The Application owns `dto::Command`, `dto::Output`, structured errors, conversions, and the [`authority::TransactionalStore`](crates/rescrow-application/src/authority.rs) port. Rust callers use `create_resource`, `resource`, `resources`, `prepare`, `commit`, `abort`, `transaction`, and `transactions`, each returning its specific DTO. `initialize` returns `Result<(), Error>`. The CLI dispatches through `execute` to those same methods.
 
-The authority reads validated structured keys within one `TenantId`, returning a consistent set of records and opaque versions, including absent identities. The Application hydrates linked holds to validate the input context, evaluates pure transitions, and conditions only the records the commands and their changes depend on. `Commit::from_changes` maps Domain replacements and their append-only history into one atomic publication. A batch includes every lapse and every queued write together. Record authorities use individual version conditions; unrelated resources have no shared optimistic counter. The local log supplies an explicit coarse fence, preserving its simpler serialized implementation behind the same port. `LogStore` is a local persistence mechanism, rather than a separate Application write path.
+The authority reads validated structured keys within one `TenantId`, returning a consistent set of records and opaque versions, including absent identities. The Application hydrates linked holds to validate the input context, evaluates pure transitions, and conditions only the records the commands and their changes depend on. `Commit::from_changes` maps Domain replacements and their append-only history into one atomic publication. A batch includes every lapse and every queued write together. Record authorities use individual version conditions. Unauthenticated embedded/local transitions on unrelated resources have no shared optimistic counter; authenticated transitions also condition an atomic tenant quota record for outstanding holds, described in API.md. The local log supplies an explicit coarse fence, preserving its simpler serialized implementation behind the same port. `LogStore` is a local persistence mechanism, rather than a separate Application write path.
 
 `Applied` supplies new versions, `Conflict` reloads and reevaluates (at most 32 attempts), and `Unknown` triggers lookup by an immutable publication UUID. A confirmed exact history returns the computed outcome, including a durable business rejection. A proven `NotApplied` must fence delayed publication before reevaluation; the memory authority retains that fence. Inconclusive or unavailable resolution returns `unknown_outcome` without another publication attempt. The file bridge treats absent history as inconclusive. Terminal business retries still use the original transaction ID and actuals. The publication UUID's timestamp equals its first recording time, supporting bounded local history lookup. Times never decrease along resource/transaction versions: the Application uses the maximum of its clock and read dependencies, protected by the same version conditions. File recording time also respects its serialized log's time floor.
 
-`Scope::new(TenantId, namespace)` comes from the composition root's authorized context, never a request path or body. Resources are tenant scoped; transaction identities also carry the namespace as a separate validated value. Two namespaces can reserve against the same tenant resource with identical external transaction IDs. `with_scope` selects the context for an Application. Transaction listing filters its namespace; `snapshot` is an administrative tenant-wide integrity inspection that requires separate authorization in a future HTTP composition. The Domain carries namespace-qualified transaction identities because holds must distinguish them; tenant routing stays in the Application. Local stores use `Scope::local()` with one implicit tenant and namespace, so CLI commands and JSON output remain unchanged. Authentication and HTTP authorization arrive in M2.
+`Scope::new(TenantId, namespace)` comes from the composition root's authorized context, never a request path or body. Resources are tenant scoped; transaction identities also carry the namespace as a separate validated value. Two namespaces can reserve against the same tenant resource with identical external transaction IDs. `with_scope` selects the context for an Application. Transaction listing filters its namespace; `snapshot` is an administrative tenant-wide integrity inspection and is not exposed by HTTP v1. The Domain carries namespace-qualified transaction identities because holds must distinguish them; tenant routing stays in the Application. Local stores use `Scope::local()` with one implicit tenant and namespace, so CLI commands and JSON output remain unchanged. HTTP authorization uses verified workload identities and current resource grants; see [API.md](API.md).
 
 [`authority_memory::MemoryAuthority`](crates/rescrow-adapters/src/authority_memory.rs) implements the record port directly. The existing `memory::MemoryStore` is a serialized log fixture retained for corruption and local-format regression tests. Both are simulations without a durability promise. [`rescrow-test-support::fault::FaultStore`](crates/rescrow-test-support/src/fault.rs) wraps any authority with conflicts, known pre-publication failures, lost responses, and unresolved responses.
 
 `service::Service` wraps an Application for a long-lived embedded process. One writer thread evaluates queued commands and publishes a batch atomically, answering after durability or history resolution. Its timer also publishes overdue lapses while idle. Reads come from its last durable in-memory view behind `ArcSwap`; transaction listing inspects authority history. Other writers remain safe through conditional publication, but cached reads can lag them until a subsequent write detects a conflict and reloads. The cache now includes the tenant's inspected transaction records, so its memory grows with retained history.
 
-`rescrow-server::Server` supplies async calls through a bounded Tokio blocking pool. It acquires a semaphore permit asynchronously and keeps it with the operation even if the request is cancelled. Domain, Application, adapters, and installed CLI need no Tokio or HTTP stack. This synchronous boundary is the M1 choice; it costs a blocking thread per dispatched operation and needs measurement again when database adapters arrive. [`async_bench`](crates/rescrow-server/examples/async_bench.rs) measures it against the memory authority.
+`rescrow-server::Server` supplies async calls through a bounded Tokio blocking pool. It acquires a semaphore permit asynchronously and keeps it with the operation even if the request is cancelled. Domain, Application, adapters, and the default installed CLI need no Tokio or HTTP stack. This synchronous boundary is the M1 choice; it costs a blocking thread per dispatched operation and needs measurement again when database adapters arrive. [`async_bench`](crates/rescrow-server/examples/async_bench.rs) measures it against the memory authority.
 
 `ReadyApplication::start` and `Server::start` probe `Readiness` before serving a required profile. Capabilities report consistency, failure domain, active/witness Regions, record and participant limits, partition behavior, tenancy, and process/reopen qualification. The memory authority reports `simulation`; the file authority validates the selected store, permissions, encoding, and synchronization and reports `local`. Neither can serve `regional` or `enterprise-mr`. Future infrastructure adapters must inspect actual peering/topology, not echo requested configuration. Server responses carry the actual `durability_profile`; each call can also require a profile. These checks do not qualify a future enterprise backend.
 
@@ -111,7 +119,7 @@ cargo run -p rescrow-adapters --example embedded -- .rescrow
 # remaining credits and is rejected for capacity.
 ```
 
-A capacity rejection always records its details, validated against the original operation; details attached to other abort causes are rejected. The local storage schema is now 3, so older binaries reject the new atomic batch format before writing. This pre-release project has no migration path: re-create a store written by an older build. Administrative `dto::Snapshot` inspection remains schema 1.
+A capacity rejection always records its details, validated against the original operation; details attached to other abort causes are rejected. The local storage schema is now 4, adding a stable authority generation and bounded request context/authorization facts to the atomic format. Older binaries reject it before writing. This pre-release project has no migration path: re-create a store written by an older build. Administrative `dto::Snapshot` inspection remains schema 1.
 
 File-store fault hooks are explicit Rust constructor options used by qualification tests, never activated by CLI environment variables.
 
@@ -269,7 +277,7 @@ All shapes preserve escrow bounds, durable decisions, retry identity, and safe s
 Server work is tracked as GitHub milestones, roughly in order. Each builds on the earlier ones, although work in M3–M5 can overlap.
 
 1. [M1 · Server foundation](https://github.com/bobby/rescrow/milestone/1): a transactional storage port, an async boundary, tenants, durability profiles, and an adapter conformance suite.
-2. [M2 · HTTP API v1](https://github.com/bobby/rescrow/milestone/2): the `/v1` resources of DESIGN.md §8, with idempotency, errors, authentication, limits, and clients.
+2. [M2 · HTTP API v1](https://github.com/bobby/rescrow/milestone/2): the implemented [OpenAPI v1 subset](API.md), with idempotency, errors, authentication, limits, and clients; execution claims/receipts/events remain M7.
 3. [M3 · Regional backends](https://github.com/bobby/rescrow/milestone/3): PostgreSQL/Aurora and SlateDB on S3.
 4. [M4 · Operability](https://github.com/bobby/rescrow/milestone/4): telemetry, health, configuration, releases, background work, SLOs, and scaling signals, without assuming a platform.
 5. [M5 · Hot resources and throughput](https://github.com/bobby/rescrow/milestone/5): rights shards, batching, rebalancing, and the DESIGN.md §9.3 gates.
@@ -281,7 +289,7 @@ Server work is tracked as GitHub milestones, roughly in order. Each builds on th
 
 The following instructions apply to all contributors, human and agent, throughout this repository. Read [DESIGN.md](DESIGN.md) for the current technical proposal. Agent contributors must also read [AGENTS.md](AGENTS.md) for agent-specific instructions. Keep shared contributor guidance here and reserve AGENTS.md for instructions specific to agents.
 
-The local CLI and M1 server foundation are implemented; HTTP, infrastructure backends, and the broader distributed/enterprise design remain proposed. Do not imply that deferred APIs, commands, guarantees, benchmarks, or crates already exist. Keep the public explanation, architecture, and implementation consistent as the project develops.
+The local CLI, M1 server foundation and M2 HTTP API are implemented; infrastructure backends and the broader distributed/enterprise design remain proposed. Do not imply that deferred APIs, commands, guarantees, benchmarks, or crates already exist. Keep the public explanation, architecture, and implementation consistent as the project develops.
 
 ### Simplicity and design judgment
 

@@ -8,8 +8,18 @@ use crate::{
     input, millis, system_clock, uuid_v7, uuid_v7_millis,
 };
 use rescrow_domain::{self as d, transition};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
+/// Publication-aware outcome, computed during conditional evaluation so races
+/// cannot cause two HTTP requests to both claim they created one identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Execution {
+    pub output: Output,
+    pub replayed: bool,
+}
 type Evaluation = (transition::Changes, Result<Output, Error>);
 #[derive(Clone)]
 pub(crate) struct View {
@@ -19,6 +29,7 @@ pub(crate) struct View {
     now_ms: u64,
     complete: bool,
     terminal_since_ms: u64,
+    pending: d::access::Pending,
 }
 impl View {
     fn from_read(read: Read, now: u64) -> Result<Self, Error> {
@@ -26,11 +37,13 @@ impl View {
         let mut prepared = Vec::new();
         let mut transactions = BTreeMap::new();
         let mut now_ms = now.max(read.recorded_at_ms);
+        let mut pending = d::access::Pending::default();
         for (key, value) in &read.records {
             if let Some(value) = value {
                 value.value.validate(key)?;
                 now_ms = now_ms.max(value.recorded_at_ms);
                 match &value.value {
+                    Value::Pending(value) => pending = value.clone().try_into().map_err(corrupt)?,
                     Value::Resource(r) => resources.push(r.clone().try_into().map_err(corrupt)?),
                     Value::Transaction(tx) => {
                         let tx: d::Transaction = tx.clone().try_into().map_err(corrupt)?;
@@ -41,6 +54,16 @@ impl View {
                     }
                 }
             }
+        }
+        let known = d::access::Pending::from_prepared(&prepared).map_err(corrupt)?;
+        if known
+            .entries()
+            .iter()
+            .any(|(id, count)| pending.for_credential(id) < *count)
+        {
+            return Err(corrupt(
+                "pending counter omits loaded prepared transactions",
+            ));
         }
         let live = d::Live::restore(resources, prepared).map_err(corrupt)?;
         for (_, tx) in transactions.values() {
@@ -53,17 +76,30 @@ impl View {
             now_ms,
             complete: false,
             terminal_since_ms: 0,
+            pending,
         })
     }
     pub(crate) fn live(&self) -> &d::Live {
         &self.live
     }
-    fn advance(&mut self, changes: &transition::Changes) {
+    fn advance(&mut self, changes: &transition::Changes) -> Result<(), Error> {
+        let pending = match changes.transaction() {
+            Some(tx) => self
+                .pending
+                .apply(
+                    self.transactions.get(tx.request().id()).map(|(_, tx)| tx),
+                    tx,
+                )
+                .map_err(corrupt)?,
+            None => self.pending.clone(),
+        };
         self.live = self.live.apply(changes);
+        self.pending = pending;
         if let Some(tx) = changes.transaction() {
             self.transactions
                 .insert(tx.request().id().clone(), (self.now_ms, tx.clone()));
         }
+        Ok(())
     }
     fn received(&mut self, commit: &Commit, receipt: Receipt) -> Result<(), Error> {
         if !receipt.versions.keys().eq(commit.replacements().keys()) {
@@ -88,22 +124,42 @@ impl View {
 }
 
 pub struct Application<S> {
-    store: S,
+    store: Arc<S>,
     scope: Scope,
     attempts: usize,
     window: RetryWindow,
-    pub(crate) clock: Box<dyn Fn() -> u64 + Send + Sync>,
+    pub(crate) clock: Arc<dyn Fn() -> u64 + Send + Sync>,
+    pending_limits: crate::access::PendingLimits,
     checkpoint_interval: usize,
 }
 impl<S: TransactionalStore> Application<S> {
     pub fn new(store: S) -> Self {
         Self {
-            store,
+            store: Arc::new(store),
             scope: Scope::local(),
             attempts: 32,
             window: RetryWindow::default(),
-            clock: Box::new(system_clock),
+            clock: Arc::new(system_clock),
+            pending_limits: crate::access::PendingLimits::default(),
             checkpoint_interval: 64,
+        }
+    }
+    pub fn with_pending_limits(
+        mut self,
+        limits: crate::access::PendingLimits,
+    ) -> Result<Self, Error> {
+        self.pending_limits = limits.validate()?;
+        Ok(self)
+    }
+    pub fn scoped(&self, scope: Scope) -> Self {
+        Self {
+            store: self.store.clone(),
+            scope,
+            attempts: self.attempts,
+            window: self.window,
+            clock: self.clock.clone(),
+            checkpoint_interval: self.checkpoint_interval,
+            pending_limits: self.pending_limits,
         }
     }
     pub fn with_checkpoint_interval(mut self, entries: usize) -> Self {
@@ -142,7 +198,9 @@ impl<S: TransactionalStore> Application<S> {
                 )
                 .map_err(input)?
                 .with_hold(request.hold_ms())
-                .map_err(input)?;
+                .map_err(input)?
+                .with_context(request.context().clone())
+                .with_authorization(request.authorization().cloned());
                 Write::Prepare(request)
             }
             Write::Commit { id, actuals } => Write::Commit {
@@ -158,7 +216,7 @@ impl<S: TransactionalStore> Application<S> {
         self
     }
     pub fn with_clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
-        self.clock = Box::new(clock);
+        self.clock = Arc::new(clock);
         self
     }
     pub fn with_retry_window(mut self, window: RetryWindow) -> Self {
@@ -185,6 +243,168 @@ impl<S: TransactionalStore> Application<S> {
             }
             Command::ListTransactions => self.transactions().map(Output::Transactions),
         }
+    }
+    pub fn execute_detailed(&self, command: Command) -> Result<Execution, Error> {
+        let transaction_id = match &command {
+            Command::Prepare(v) => Some(v.transaction_id.clone()),
+            Command::Commit(v) => Some(v.transaction_id.clone()),
+            Command::Abort { transaction_id } => Some(transaction_id.clone()),
+            _ => None,
+        };
+        let write = match command {
+            Command::CreateResource(v) => Write::create(v),
+            Command::Prepare(v) => Write::prepare(v),
+            Command::Commit(v) => Write::commit(v),
+            Command::Abort { transaction_id } => Write::abort(&transaction_id),
+            read => {
+                return self.execute(read).map(|output| Execution {
+                    output,
+                    replayed: false,
+                });
+            }
+        };
+        write
+            .and_then(|w| self.qualify(w))
+            .and_then(|w| self.write_detailed(&w))
+            .map_err(|mut e| {
+                if transaction_id.is_some() {
+                    e.transaction_id = transaction_id;
+                }
+                e
+            })
+    }
+    /// Read-only resolution for an in-flight HTTP prepare. `None` is not a
+    /// rollback proof. Only a matching durable original request can be reported
+    /// as processing; this never admits work or extends a deadline.
+    pub fn inspect_preparation(
+        &self,
+        context: &crate::access::AccessContext,
+        request: dto::Prepare,
+    ) -> Result<Option<dto::Transaction>, Error> {
+        let id = request.transaction_id.clone();
+        (|| {
+            context.validate_at((self.clock)())?;
+            let app = self.scoped(context.scope().clone());
+            let request = context.bind_prepare(request)?;
+            let write = app.qualify(Write::prepare(request)?)?;
+            let Write::Prepare(request) = &write else {
+                unreachable!()
+            };
+            let since = uuid_v7_millis(request.id().as_str())
+                .unwrap_or(0)
+                .saturating_sub(millis(self.window.skew));
+            let view = app.load_keys(Self::keys(&write), since)?;
+            let existing = match view.live.prepared().get(request.id()) {
+                Some(tx) => Some(tx.clone()),
+                None => app.lookup(&view, request.id(), app.admit(&view, request)?)?,
+            };
+            let Some(tx) = existing else { return Ok(None) };
+            let changes = transition::prepare(
+                request.clone(),
+                Some(&tx),
+                view.live.resources(),
+                view.now_ms,
+            )
+            .map_err(Error::domain)?;
+            if !changes.is_empty() {
+                return Err(corrupt("preparation inspection produced a mutation"));
+            }
+            if let Some(reason) = tx.rejection() {
+                return Err(Error::rejection(reason));
+            }
+            Ok(Some((&tx).into()))
+        })()
+        .map_err(|e: Error| e.with_transaction(&id))
+    }
+    pub fn execute_authorized(
+        &self,
+        context: &crate::access::AccessContext,
+        command: Command,
+    ) -> Result<Execution, Error> {
+        let id = match &command {
+            Command::Prepare(v) => Some(v.transaction_id.clone()),
+            Command::Commit(v) => Some(v.transaction_id.clone()),
+            Command::Abort { transaction_id } | Command::ShowTransaction { transaction_id } => {
+                Some(transaction_id.clone())
+            }
+            _ => None,
+        };
+        self.execute_authorized_inner(context, command)
+            .map_err(|mut e| {
+                if e.transaction_id.is_none() {
+                    e.transaction_id = id;
+                }
+                e
+            })
+    }
+    fn execute_authorized_inner(
+        &self,
+        context: &crate::access::AccessContext,
+        command: Command,
+    ) -> Result<Execution, Error> {
+        use crate::access::Action;
+        context.validate_at((self.clock)())?;
+        let app = self.scoped(context.scope().clone());
+        let command = match command {
+            Command::CreateResource(spec) => {
+                context.resource(Action::Create, &spec.resource_id, None)?;
+                Command::CreateResource(spec)
+            }
+            Command::Prepare(request) => Command::Prepare(context.bind_prepare(request)?),
+            Command::Commit(commit) => {
+                context.require(Action::Commit)?;
+                let tx = app.transaction(&commit.transaction_id)?;
+                context.request(Action::Commit, &tx.request)?;
+                Command::Commit(commit)
+            }
+            Command::Abort { transaction_id } => {
+                context.require(Action::Abort)?;
+                let tx = app.transaction(&transaction_id)?;
+                context.request(Action::Abort, &tx.request)?;
+                Command::Abort { transaction_id }
+            }
+            Command::ShowResource { resource_id } => {
+                context.resource(Action::Read, &resource_id, None)?;
+                Command::ShowResource { resource_id }
+            }
+            Command::ShowTransaction { transaction_id } => {
+                context.require(Action::Read)?;
+                let tx = app.transaction(&transaction_id)?;
+                context.request(Action::Read, &tx.request)?;
+                return Ok(Execution {
+                    output: Output::Transaction(tx),
+                    replayed: false,
+                });
+            }
+            Command::ListResources => {
+                context.require(Action::Read)?;
+                let mut visible = Vec::new();
+                for resource in app.resources()? {
+                    let id = d::Id::new(resource.spec.resource_id.clone()).map_err(corrupt)?;
+                    if context.policy().can_read(&id) {
+                        visible.push(resource);
+                    }
+                }
+                return Ok(Execution {
+                    output: Output::Resources(visible),
+                    replayed: false,
+                });
+            }
+            Command::ListTransactions => {
+                context.require(Action::Read)?;
+                let mut visible = Vec::new();
+                for tx in app.transactions()? {
+                    if context.request(Action::Read, &tx.request).is_ok() {
+                        visible.push(tx);
+                    }
+                }
+                return Ok(Execution {
+                    output: Output::Transactions(visible),
+                    replayed: false,
+                });
+            }
+        };
+        app.execute_detailed(command)
     }
     pub fn create_resource(&self, spec: dto::ResourceSpec) -> Result<dto::Resource, Error> {
         match self.write(&Write::create(spec)?)? {
@@ -357,6 +577,13 @@ impl<S: TransactionalStore> Application<S> {
         {
             return Err(corrupt("records disagree with history"));
         }
+        if view.pending
+            != d::access::Pending::from_prepared(transactions.values()).map_err(corrupt)?
+        {
+            return Err(corrupt(
+                "pending counter disagrees with transaction history",
+            ));
+        }
         let ledger = d::Ledger::restore(
             live.resources().values().cloned().collect(),
             transactions.into_values().collect(),
@@ -382,12 +609,16 @@ impl<S: TransactionalStore> Application<S> {
                 if let Some(value) = value {
                     value.value.validate(key)?;
                     match &value.value {
+                        Value::Pending(_) => (),
                         Value::Resource(r) => {
                             let r: d::Resource = r.clone().try_into().map_err(corrupt)?;
                             keys.extend(r.holds().keys().cloned().map(RecordKey::Transaction));
                         }
                         Value::Transaction(tx) => {
                             let tx: d::Transaction = tx.clone().try_into().map_err(corrupt)?;
+                            if tx.request().authorization().is_some() {
+                                keys.insert(RecordKey::Pending);
+                            }
                             keys.extend(
                                 tx.request()
                                     .operations()
@@ -414,6 +645,7 @@ impl<S: TransactionalStore> Application<S> {
                 .iter()
                 .map(|op| RecordKey::Resource(op.resource().clone()))
                 .chain([RecordKey::Transaction(request.id().clone())])
+                .chain(request.authorization().map(|_| RecordKey::Pending))
                 .collect(),
             Write::Commit { id, .. } | Write::Abort(id) => {
                 BTreeSet::from([RecordKey::Transaction(id.clone())])
@@ -422,6 +654,9 @@ impl<S: TransactionalStore> Application<S> {
         }
     }
     fn write(&self, write: &Write) -> Result<Output, Error> {
+        self.write_detailed(write).map(|e| e.output)
+    }
+    fn write_detailed(&self, write: &Write) -> Result<Execution, Error> {
         let since = match write {
             Write::Prepare(request) => uuid_v7_millis(request.id().as_str())
                 .unwrap_or(0)
@@ -432,7 +667,7 @@ impl<S: TransactionalStore> Application<S> {
             _ => 0,
         };
         let view = self.load_keys(Self::keys(write), since)?;
-        let (_, mut outputs) = self.commit_batch(view, &[write]);
+        let (_, mut outputs) = self.commit_batch_detailed(view, &[write]);
         outputs.pop().expect("one output per write")
     }
     fn lookup(
@@ -496,6 +731,19 @@ impl<S: TransactionalStore> Application<S> {
                     Some(prepared) => Some(prepared.clone()),
                     None => self.lookup(view, request.id(), self.admit(view, request)?)?,
                 };
+                if existing.is_none()
+                    && let Some(facts) = request.authorization()
+                {
+                    view.pending
+                        .reserve(
+                            facts.credential_id(),
+                            self.pending_limits.tenant,
+                            self.pending_limits.credential,
+                        )
+                        .map_err(|e| {
+                            Error::new(Category::Admission, Code::Throttled, e.to_string())
+                        })?;
+                }
                 let changes = transition::prepare(
                     request.clone(),
                     existing.as_ref(),
@@ -543,9 +791,20 @@ impl<S: TransactionalStore> Application<S> {
 impl<S: TransactionalStore> Application<S> {
     pub(crate) fn commit_batch(
         &self,
-        mut base: View,
+        base: View,
         writes: &[&Write],
     ) -> (Option<View>, Vec<Result<Output, Error>>) {
+        let (view, outputs) = self.commit_batch_detailed(base, writes);
+        (
+            view,
+            outputs.into_iter().map(|v| v.map(|e| e.output)).collect(),
+        )
+    }
+    fn commit_batch_detailed(
+        &self,
+        mut base: View,
+        writes: &[&Write],
+    ) -> (Option<View>, Vec<Result<Execution, Error>>) {
         let fail = |error: Error| writes.iter().map(|_| Err(error.clone())).collect();
         if base.complete {
             for key in writes.iter().flat_map(|w| Self::keys(w)) {
@@ -600,12 +859,14 @@ impl<S: TransactionalStore> Application<S> {
 
                 outputs.push(lapse_due(&mut view, write, &mut changes).and_then(
                     |lapsed| match write {
-                        Write::Lapse => Ok(Output::Transactions(
-                            lapsed.iter().map(Into::into).collect(),
-                        )),
+                        Write::Lapse => Ok(Execution {
+                            replayed: lapsed.is_empty(),
+                            output: Output::Transactions(lapsed.iter().map(Into::into).collect()),
+                        }),
                         _ => self.evaluate(&view, write).and_then(|(next, output)| {
-                            push(&mut view, &next, &mut changes);
-                            output
+                            let replayed = next.is_empty();
+                            push(&mut view, &next, &mut changes)?;
+                            output.map(|output| Execution { output, replayed })
                         }),
                     },
                 ));
@@ -614,6 +875,12 @@ impl<S: TransactionalStore> Application<S> {
                 return (Some(view), outputs);
             }
             for (_, change) in &changes {
+                if change
+                    .transaction()
+                    .is_some_and(|tx| tx.request().authorization().is_some())
+                {
+                    dependencies.insert(RecordKey::Pending);
+                }
                 dependencies.extend(
                     change
                         .resources()
@@ -712,11 +979,12 @@ fn push(
     view: &mut View,
     changes: &transition::Changes,
     entries: &mut Vec<(u64, transition::Changes)>,
-) {
+) -> Result<(), Error> {
     if !changes.is_empty() {
-        view.advance(changes);
+        view.advance(changes)?;
         entries.push((view.now_ms, changes.clone()));
     }
+    Ok(())
 }
 fn lapse_due(
     view: &mut View,
@@ -743,7 +1011,7 @@ fn lapse_due(
     let mut lapsed = Vec::new();
     for tx in due {
         let changes = transition::lapse(&tx, view.live.resources(), now).map_err(Error::domain)?;
-        push(view, &changes, entries);
+        push(view, &changes, entries)?;
         lapsed.extend(changes.transaction().cloned());
     }
     Ok(lapsed)
@@ -754,12 +1022,56 @@ fn lapse_due(
 pub struct ReadyApplication<S> {
     app: Application<S>,
     capabilities: capabilities::Capabilities,
+    authority_generation: String,
 }
 impl<S: TransactionalStore + Readiness> ReadyApplication<S> {
     pub fn start(app: Application<S>, required: DurabilityProfile) -> Result<Self, Error> {
         let capabilities = app.store.readiness()?;
         capabilities.require(required)?;
-        Ok(Self { app, capabilities })
+        let authority_generation = app.store.identity()?;
+        if crate::uuid_v7_millis(&authority_generation).is_none() {
+            return Err(corrupt("authority identity is not a canonical UUIDv7"));
+        }
+        Ok(Self {
+            app,
+            capabilities,
+            authority_generation,
+        })
+    }
+    pub fn execute_authorized(
+        &self,
+        context: &crate::access::AccessContext,
+        command: Command,
+        required: DurabilityProfile,
+    ) -> Result<Execution, Error> {
+        self.capabilities.require(required)?;
+        if !self.capabilities.multi_tenant && *context.scope() != Scope::local() {
+            return Err(Error::new(
+                Category::Authorization,
+                Code::Forbidden,
+                "authority supports only its implicit local tenant and namespace",
+            ));
+        }
+        self.app.execute_authorized(context, command)
+    }
+    pub fn inspect_preparation(
+        &self,
+        context: &crate::access::AccessContext,
+        request: dto::Prepare,
+        required: DurabilityProfile,
+    ) -> Result<Option<dto::Transaction>, Error> {
+        self.capabilities.require(required)?;
+        if !self.capabilities.multi_tenant && *context.scope() != Scope::local() {
+            return Err(Error::new(
+                Category::Authorization,
+                Code::Forbidden,
+                "authority supports only its implicit local tenant and namespace",
+            ));
+        }
+        self.app.inspect_preparation(context, request)
+    }
+    pub fn authority_generation(&self) -> &str {
+        &self.authority_generation
     }
     pub fn capabilities(&self) -> &capabilities::Capabilities {
         &self.capabilities

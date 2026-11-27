@@ -8,12 +8,18 @@ rust-version.workspace = true
 name = "rescrow"
 path = "src/main.rs"
 
+[features]
+default = []
+remote = ["dep:rescrow-client", "dep:tokio"]
+
 [dependencies]
 rescrow-application.workspace = true
 rescrow-adapters.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 clap.workspace = true
+rescrow-client = { path = "../rescrow-client", optional = true }
+tokio = { version = "1.54", features = ["rt", "time", "net"], optional = true }
 
 [dev-dependencies]
 rescrow-test-support.workspace = true

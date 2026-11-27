@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod access;
 pub mod transition;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14,6 +15,9 @@ pub enum Error {
     InvalidOperations,
     InvalidActuals,
     InvalidHold,
+    InvalidContext,
+    InvalidAuthorization,
+    AdmissionLimit,
     Overflow,
     Capacity(CapacityFailure),
     NotFound,
@@ -32,6 +36,9 @@ impl std::fmt::Display for Error {
             Self::InvalidOperations => "operations must be nonempty, nonzero, and unique by operation and resource ID",
             Self::InvalidActuals => "actuals must name every operation once and stay within its reserved direction and magnitude",
             Self::InvalidHold => "a hold must last from 1 ms to 30 days",
+            Self::InvalidContext => "context must have unique ASCII keys and bounded UTF-8 string values (at most 4096 bytes)",
+            Self::InvalidAuthorization => "authorization facts or resource grants are invalid",
+            Self::AdmissionLimit => "outstanding hold limit reached; settle existing holds before retrying",
             Self::Overflow => "quantity, magnitude, offset, or reservation total exceeds signed 128-bit range",
             Self::NotFound => "referenced resource or transaction does not exist",
             Self::Conflict => "request conflicts with an existing identity or terminal decision",
@@ -185,6 +192,8 @@ pub struct Request {
     id: Id,
     operations: Vec<Operation>,
     hold_ms: Option<u64>,
+    context: access::Context,
+    authorization: Option<access::Facts>,
 }
 impl Request {
     pub fn new(id: Id, mut operations: Vec<Operation>) -> Result<Self, Error> {
@@ -203,6 +212,8 @@ impl Request {
             id,
             operations,
             hold_ms: None,
+            context: access::Context::default(),
+            authorization: None,
         })
     }
     /// Ask for the hold to lapse this long after admission, if it is still
@@ -212,6 +223,29 @@ impl Request {
             return Err(Error::InvalidHold);
         }
         Ok(Self { hold_ms, ..self })
+    }
+    pub fn with_context(self, context: access::Context) -> Self {
+        Self { context, ..self }
+    }
+    pub fn with_authorization(self, authorization: Option<access::Facts>) -> Self {
+        Self {
+            authorization,
+            ..self
+        }
+    }
+    pub fn context(&self) -> &access::Context {
+        &self.context
+    }
+    pub fn authorization(&self) -> Option<&access::Facts> {
+        self.authorization.as_ref()
+    }
+    /// Credentials may rotate or narrow on a replay; only business parameters
+    /// define intent. The original admission evidence is never replaced.
+    pub fn same_intent(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.operations == other.operations
+            && self.hold_ms == other.hold_ms
+            && self.context == other.context
     }
     pub fn id(&self) -> &Id {
         &self.id

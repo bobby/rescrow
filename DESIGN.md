@@ -1,10 +1,10 @@
 # Rescrow: durable escrow transactions in Rust
 
-Status: proposed distributed/enterprise design. The local CLI and M1 server foundation are implemented; see README.md for supported commands and tested limits. Local development benchmark measurements are recorded in README.md; enterprise performance and durability remain unqualified.
+Status: proposed distributed/enterprise design. The local CLI, M1 server foundation and M2 HTTP API are implemented; see README.md for supported commands and tested limits. Local development benchmark measurements are recorded in README.md; enterprise performance and durability remain unqualified.
 
 Date: 2026-11-13.
 
-The implementation so far is local: a pure Domain, Application/transfer types, and separate CLI invocations sharing a log-structured file store, documented in [README.md](README.md). It establishes escrow semantics before adding the distributed protocol. The broader mechanisms and acceptance targets below remain proposed.
+The implementation includes a pure Domain, Application/transfer types, CLI invocations sharing a log-structured file store, and optional HTTP serving with remote clients, documented in [README.md](README.md) and [API.md](API.md). It establishes escrow semantics before adding the distributed protocol. The broader mechanisms and acceptance targets below remain proposed.
 
 Deployment spectrum: embedded Rust, concurrent local CLI use, an optional local service, regional APIs, and the enterprise multi-region service. The enterprise profile requires active capacity across three US AWS Regions, synchronously replicated authority, and automatic regional traffic failover. S3 Standard and Express are the first object-storage backends. The enterprise authority is an Aurora DSQL multi-Region cluster, subject to prototype gates (§6.4).
 
@@ -248,7 +248,7 @@ The implemented Application uses one `authority::TransactionalStore` port: tenan
 
 Recording time is nondecreasing along each resource/transaction version. Evaluation takes the maximum of its clock and read dependencies' recorded times, and conditions those records in the same publication. There is no shared timestamp counter for independent record transitions. The publication UUID timestamp equals its first recording time. The local bridge also enforces the serialized log's global time floor, preserving the lapse/retry rule and bounded segment lookup.
 
-`MemoryAuthority` implements record conditions directly, so independent resources do not share a log-position conflict. The file adapter retains `LogStore` as its narrower internal persistence interface behind the same authority port: checkpoint/tail validation and an explicit coarse log fence. Its entire batch is one checksummed frame, synchronized before acknowledgement; checkpoints cannot split frames. History indexes cover decisions and publication identities. Local storage schema 3 prevents older binaries from treating the new framing as a torn append. Neither adapter needs the separate-key protocol below.
+`MemoryAuthority` implements record conditions directly, so independent resources do not share a log-position conflict. The file adapter retains `LogStore` as its narrower internal persistence interface behind the same authority port: checkpoint/tail validation and an explicit coarse log fence. Its entire batch is one checksummed frame, synchronized before acknowledgement; checkpoints cannot split frames. History indexes cover decisions and publication identities. Local storage schema 4 persists stable authority generation and bounded authorization/context facts; older binaries fail closed before writing. Neither adapter needs the separate-key protocol below.
 
 Tenant routing belongs in the Application. Resource keys are `(tenant, resource)`, transaction keys `(tenant, authorized namespace, transaction)`, and adapters bind/encode those validated tuples without raw concatenation. The Domain carries namespace-qualified transaction identities to distinguish holds on a shared tenant resource. The CLI retains one implicit local tenant/namespace. `snapshot` is tenant-wide administrative inspection; a future HTTP composition must authorize it separately from namespace operations.
 
@@ -481,102 +481,54 @@ This design chooses consistency during a partition. Escrow could later allocate 
 
 ## 8. HTTP API and execution integration
 
-### 8.1 Endpoints
+### 8.1 Implemented endpoints and later execution surface
 
-All business endpoints use `/v1`; tenant identity comes from authenticated credentials. Path IDs are opaque. Publish an OpenAPI contract with generated examples and conformance fixtures.
+[OpenAPI 3.1](openapi/rescrow-v1.json) and [API.md](API.md) define the implemented M2 wire contract, including captured real-server examples and conformance checks. All business endpoints use `/v1`; tenant and namespace come from authenticated credentials. Quantities are decimal strings, timestamps are UTC epoch milliseconds, and response envelopes separate `data`, serving `metadata`, and relative `links`.
 
-IDs, request digests, and idempotency namespaces are global within a transaction domain. Return `serving_region`, `deployment_cell`, `authority_generation`, and `durability_profile` as response metadata; none changes business identity on failover. Enterprise namespaces are pinned to `enterprise-mr` and cannot be silently downgraded to a regional adapter. Clients can require that profile, and receipts bind it.
-
-| Method and path | Behavior |
+| Method and path | Implemented behavior |
 | --- | --- |
-| `PUT /v1/resources/{id}` | Administrative create-only initialization, with a stable request identity. |
-| `GET /v1/resources/{id}` | Immutable metadata and explicitly sampled quantity/capacity observations. |
-| `POST /v1/transactions` | Create and prepare a fixed set of reservations. |
-| `GET /v1/transactions/{id}` | Strong authoritative state, decision, and materialization progress. |
-| `POST /v1/transactions/{id}/claim` | Trusted execution gateway binds one action and disables automatic expiry refunds before execution. |
-| `POST /v1/transactions/{id}/commit` | Decide commit, optionally with partial actual deltas. |
-| `POST /v1/transactions/{id}/abort` | Decide abort. |
-| `GET /v1/transactions/{id}/receipt` | Fetch signed prepare, execution-claim, or terminal decision evidence. |
-| `GET /v1/events?cursor=...` | Optional durable, at-least-once event feed with replay cursors. |
+| `PUT /v1/resources/{id}` | Privileged create-only initialization; identical specification replays. |
+| `GET /v1/resources/{id}` | Immutable metadata and explicitly sampled observations. |
+| `GET /v1/resources` | Visible resources with signed keyset pagination and prefix filtering. |
+| `POST /v1/transactions` | Prepare a frozen manifest under a UUIDv7 idempotency key. |
+| `GET /v1/transactions/{id}` | Authoritative transaction state and complete atomic materialization. |
+| `GET /v1/transactions` | Visible transactions in the credential namespace, with prefix/state filters and pagination. |
+| `POST /v1/transactions/{id}/commit` | Durable decision with optional partial actuals. |
+| `POST /v1/transactions/{id}/abort` | Durable abort decision. |
 
-Example request:
+Generate `Idempotency-Key` once before the first attempt, using `rescrow new-id` or a client helper. A prepare body is:
 
-```http
-POST /v1/transactions
-Authorization: Bearer <workload-token>
-Idempotency-Key: order-287-reserve-v1
-Content-Type: application/json
-
+```json
 {
-  "namespace": "checkout-workflow",
   "operations": [
-    {"id": "stock", "resource_id": "sku-42", "max_delta": "-3"},
-    {"id": "credits", "resource_id": "agent-budget", "max_delta": "-1200"}
+    {"operation_id": "stock", "resource_id": "sku-42", "delta": "-3"},
+    {"operation_id": "credits", "resource_id": "agent-budget", "delta": "-1200"}
   ],
-  "expiration": {"mode": "abort_after", "hold_seconds": 3600},
+  "hold_ms": 3600000,
   "context": {"workflow_id": "order-287"}
 }
 ```
 
+The server fixes `expires_at_ms` once at admission. Replay compares the original `hold_ms`, operations and context; it never extends that deadline. A commit body with actuals is:
+
 ```json
 {
-  "id": "tx_example",
-  "state": "PREPARED",
-  "request_digest": "sha256:...",
-  "expires_at": "2026-11-13T22:00:00Z",
-  "expiration_scope": "unclaimed",
-  "execution_claim": null,
-  "durability_profile": "enterprise-mr",
-  "serving_region": "us-east-1",
-  "deployment_cell": "enterprise-example-01",
-  "authority_generation": "ag_example",
-  "decision": null,
-  "links": {
-    "status": "/v1/transactions/tx_example",
-    "commit": "/v1/transactions/tx_example/commit",
-    "abort": "/v1/transactions/tx_example/abort",
-    "receipt": "/v1/transactions/tx_example/receipt"
-  }
-}
-```
-
-The server resolves a relative hold duration once at creation. A replay compares the original duration in the request digest and returns the original deadline; it does not extend the hold. For execution-backed budgets, `expiration_scope: unclaimed` makes the deadline's effect explicit.
-
-Before dispatch, the authorized gateway claims the prepared transaction:
-
-```http
-POST /v1/transactions/tx_example/claim
-Authorization: Bearer <execution-gateway-token>
-Content-Type: application/json
-
-{
-  "action_id": "order-287/tool-call-1",
-  "destination_id": "approved-order-tool"
-}
-```
-
-The server validates the action/destination against the admitted policy and CAS-records the claim. Its durable claim identity, signed receipt, and gateway deduplication accompany execution. A successful claim preserves the hold until authorized settlement; the original unclaimed deadline cannot refund it.
-
-```http
-POST /v1/transactions/tx_example/commit
-Authorization: Bearer <settlement-token>
-Content-Type: application/json
-
-{
-  "actual_deltas": [
+  "actuals": [
     {"operation_id": "stock", "delta": "-2"},
     {"operation_id": "credits", "delta": "-900"}
   ]
 }
 ```
 
-The response includes `state: COMMITTED`, actual deltas, the stable decision hash, and `materialization: pending | complete`. A successful decision response never waits for every physical participant update. Eventual capacity reuse may therefore lag commit or abort.
+Memory/file authorities publish decisions and all participant changes atomically. Thus M2 has `materialization: complete`; resource observations have `finalization_pending: false`. The later separate-key protocol may add pending materialization, without weakening durable decisions.
+
+Execution claims (`POST .../claim`), signed receipts (`GET .../receipt`) and event feeds remain M7 proposals. For execution-backed budgets, the planned gateway binds an action before dispatch, disables automatic expiry refunds after claim, and settles trusted actual usage. Those execution authorizations do not exist in M2; a prepare response alone is not an executable spending token. The security and conservation requirements in §8.4 still govern that later implementation.
 
 ### 8.2 Retry and error contract
 
-Use `201` for a newly prepared transaction, `200` for an authoritative replay or terminal decision, and `202` when a durable descriptor exists but processing remains incomplete. A `202` response includes `Location`, current state, and `Retry-After`; it is not a prepared promise. After a timeout with no usable response, clients retry the identical creation request to recover the transaction ID.
+Use `201` for a newly prepared transaction, `200` for an authoritative replay or terminal decision, and `202` when a durable descriptor exists but processing remains incomplete. A `202` response includes `Location`, current state, and `Retry-After`; the status code alone is not a prepared promise. M2 only emits 202 after confirming an exact durable matching preparation while the original operation is still pending; without that proof it returns an explicitly unconfirmed 503. After a timeout with no usable response, clients retry the identical creation request to recover the transaction ID.
 
-Creation requires an idempotency key: a [UUIDv7](https://www.rfc-editor.org/rfc/rfc9562#name-uuid-version-7) in canonical lowercase form, generated by the client when it first makes the request and repeated unchanged on every retry. Its scope is tenant plus an authorized stable namespace, rather than a transient process identity. Authorization controls who may use or inspect that namespace. Canonical request digests cover operations, units/generations where applicable, expiration policy, and bounded context. Define normalization precisely, reject duplicate JSON keys, and publish digest test vectors. Auth tokens and transport headers are excluded. Replays recheck current access before returning information.
+Creation requires an idempotency key: a [UUIDv7](https://www.rfc-editor.org/rfc/rfc9562#name-uuid-version-7) in canonical lowercase form, generated by the client when it first makes the request and repeated unchanged on every retry. Its scope is tenant plus an authorized stable namespace, rather than a transient process identity. Authorization controls who may use or inspect that namespace. Canonical request digests cover operations, units/generations where applicable, expiration policy, and bounded context. M2 normalization and domain-separated SHA-256 test vectors are published in API.md and openapi/fixtures/request-digests.json; duplicate JSON keys are rejected recursively. Auth tokens and transport headers are excluded. Replays recheck current access before returning information.
 
 Retries are bounded in time. Let `c` be the key's timestamp, `now` the authority's clock, `W` the maximum request age (initially 24 hours) and `S` the clock-skew bound (initially 5 minutes). A request whose transaction is still prepared always replays. Otherwise a creation with `c < now - W` fails with `expired` and a creation with `c > now + S` is invalid input; both are permanent. An admitted creation searches for an earlier decision only among records written at or after `c - S`, because every record of that request was written after the client created it, less the skew. Commit and abort search records since `now - W - S`, and report an unknown transaction outside it. Every record carries its recording time, never earlier than its prior version or the dependencies of its transition. The local serialized log additionally keeps times nondecreasing across the whole log, so its lookup bound is a log position; record authorities can index terminal recording times within each tenant. The lookup cost therefore follows the traffic within the skew bound, not the length of history.
 
@@ -822,9 +774,10 @@ crates/
   rescrow-application/  transfer types, conversions, use cases, effect interfaces
   rescrow-adapters/     local file store; later selected cloud/identity/signing adapters
   rescrow-cli/          local/direct and remote command entrypoint, composition
-  rescrow-server/       implemented bounded async boundary, no HTTP yet
+  rescrow-server/       implemented bounded async boundary and traffic lanes
   rescrow-test-support/ implemented adapter-neutral generated/concurrent suite (tests only)
-  rescrow-http/         proposed HTTP entrypoint for regional/enterprise service
+  rescrow-http/         implemented Axum/Tower HTTP composition, JWT and TLS
+  rescrow-client/       implemented retrying HTTP client; optional CLI remote feature
 ```
 
 Keep recovery, audit, policy, and operations as cohesive modules within their owning boundary. Split a crate only for a demonstrated dependency, build, ownership, or distribution need. Keep cloud adapters and their dependencies opt-in; selecting the local CLI must not compile the AWS SDK or an HTTP server. A memory/fault-injecting adapter supports deterministic Application tests. Public backend extensibility means implementing the Application's storage contract in ordinary Rust; dynamic plugins are unnecessary for the current requirements.
@@ -835,9 +788,9 @@ Use Tokio and Axum/Tower for the HTTP composition and the official AWS SDK for c
 
 Choose a synchronous Application and storage port with bounded `spawn_blocking` at the server boundary (issue #20, option 1). This preserves a single direct Rust API and keeps Tokio out of local builds. `rescrow-server::Server` acquires an async semaphore permit before dispatch and moves the permit into the blocking operation. Dropping an awaiting request cannot cancel an admitted write or prematurely free its slot. A failed task delivery reports an unknown outcome. A current-thread-runtime test blocks storage, observes timer progress, cancels the request, and verifies publication and slot retention. `Service` remains available for group commit with its dedicated writer; it also uses the same transactional port.
 
-The cost is one blocking thread per dispatched operation, bounded by configuration. This is a foundation for M2, not a claim that blocking bridges will be optimal for later database clients. Revisit with representative adapters if measurements justify an async port. The reproducible memory spike and measured throughput/p99 are in README; hot-resource contention remains visible and is M5 work.
+The cost is one blocking thread per dispatched operation, bounded by configuration. M2 uses this boundary with separate admission/decision/recovery lanes and graceful draining; it does not establish that blocking bridges will be optimal for later database clients. Revisit with representative adapters if measurements justify an async port. The reproducible memory spike and measured throughput/p99 are in README; hot-resource contention remains visible and is M5 work.
 
-`Readiness` returns capabilities observed from actual infrastructure. Startup and per-request profile requirements are fail-closed, and server response metadata reports the actual profile. Current memory/file authorities provide only simulation/local respectively. Future DSQL readiness must verify actual two-active-Region peering and a distinct witness before an enterprise profile can be served; a configuration label is insufficient. No DSQL, regional authority, HTTP, or enterprise qualification is implemented by M1.
+`Readiness` returns capabilities observed from actual infrastructure. Startup and per-request profile requirements are fail-closed, and server response metadata reports the actual profile. Current memory/file authorities provide only simulation/local respectively. Future DSQL readiness must verify actual two-active-Region peering and a distinct witness before an enterprise profile can be served; a configuration label is insufficient. M2 adds HTTP over those existing authorities. No DSQL, regional authority or enterprise qualification is implemented.
 
 ## 12. Verification and operational readiness
 

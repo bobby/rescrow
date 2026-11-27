@@ -53,6 +53,9 @@ impl<S> FaultStore<S> {
     }
 }
 impl<S: TransactionalStore> TransactionalStore for FaultStore<S> {
+    fn identity(&self) -> Result<String, StoreError> {
+        self.inner.identity()
+    }
     fn initialize(&self) -> Result<(), StoreError> {
         self.inner.initialize()
     }

@@ -1,0 +1,59 @@
+{
+  "encoding": "UTF-8 JSON with recursively sorted ASCII keys, no insignificant whitespace; operations and actuals sorted by operation_id. Hash the domain tag, a NUL byte, then these bytes. Missing context/hold normalize to {}/null. Identities, authorization facts, and headers are excluded.",
+  "prepare": [
+    {
+      "name": "single_debit",
+      "request": {
+        "operations": [
+          {
+            "operation_id": "op",
+            "resource_id": "credits",
+            "delta": "-40"
+          }
+        ]
+      },
+      "canonical": "{\"context\":{},\"hold_ms\":null,\"operations\":[{\"delta\":\"-40\",\"operation_id\":\"op\",\"resource_id\":\"credits\"}]}",
+      "digest": "sha256:62c583d6ef036b46f041557cd2a6f5aa5bac88e3a079ea6bbd029a418caf66a9"
+    },
+    {
+      "name": "normalized_multi_resource",
+      "request": {
+        "operations": [
+          {
+            "operation_id": "z",
+            "resource_id": "tokens",
+            "delta": "9007199254740993"
+          },
+          {
+            "operation_id": "a",
+            "resource_id": "credits",
+            "delta": "-25"
+          }
+        ],
+        "hold_ms": 5000,
+        "context": {
+          "workflow_id": "order-287",
+          "note": "café\nready"
+        }
+      },
+      "canonical": "{\"context\":{\"note\":\"café\\nready\",\"workflow_id\":\"order-287\"},\"hold_ms\":5000,\"operations\":[{\"delta\":\"-25\",\"operation_id\":\"a\",\"resource_id\":\"credits\"},{\"delta\":\"9007199254740993\",\"operation_id\":\"z\",\"resource_id\":\"tokens\"}]}",
+      "digest": "sha256:23fe3d54ff31f976c513c161e003ed01c21ddde73cd1102e6e9cb5448feda6d0"
+    }
+  ],
+  "actuals": [
+    {
+      "actuals": [
+        {
+          "operation_id": "z",
+          "delta": "0"
+        },
+        {
+          "operation_id": "a",
+          "delta": "-10"
+        }
+      ],
+      "canonical": "{\"actuals\":[{\"delta\":\"-10\",\"operation_id\":\"a\"},{\"delta\":\"0\",\"operation_id\":\"z\"}]}",
+      "digest": "sha256:5eca61e13a3f0e5c796218839b08866ad323662563f4922b01d95026bf436e71"
+    }
+  ]
+}

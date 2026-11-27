@@ -1,6 +1,9 @@
 //! Typed synchronous use cases over a transactional authority, with a validated
 //! transfer boundary independent of adapters.
+pub mod access;
+pub mod api;
 pub mod authority;
+pub mod canonical;
 pub mod capabilities;
 pub mod dto;
 mod log_authority;
@@ -23,6 +26,9 @@ pub enum Category {
     StoredState,
     Storage,
     UnknownOutcome,
+    Authentication,
+    Authorization,
+    Admission,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +50,13 @@ pub enum Code {
     /// admitted earlier; that outcome can no longer be replayed.
     Expired,
     UnknownOutcome,
+    Unauthenticated,
+    Forbidden,
+    Throttled,
+    LimitExceeded,
+    DeadlineExceeded,
+    MethodNotAllowed,
+    UnsupportedMediaType,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Error {
@@ -56,6 +69,15 @@ pub struct Error {
     pub capacity: Option<Box<dto::CapacityFailure>>,
 }
 impl Error {
+    pub fn new(category: Category, code: Code, message: impl Into<String>) -> Self {
+        Self {
+            category,
+            code,
+            message: message.into(),
+            transaction_id: None,
+            capacity: None,
+        }
+    }
     pub(crate) fn with_transaction(mut self, id: &str) -> Self {
         self.transaction_id = Some(id.into());
         self
@@ -82,6 +104,7 @@ impl Error {
             d::Error::Overflow => Code::Overflow,
             d::Error::NotFound => Code::NotFound,
             d::Error::Conflict => Code::Conflict,
+            d::Error::AdmissionLimit => Code::Throttled,
             _ => Code::InvalidInput,
         };
         Self {
@@ -174,7 +197,7 @@ pub enum Publication {
 }
 
 /// Schema version of checkpoints written by this Application.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Decoded storage contents. The Application validates every part: the
 /// checkpoint through `TryFrom`, and each tail entry by replaying its transition.
@@ -237,6 +260,7 @@ pub fn validated_snapshot(snapshot: Snapshot) -> Result<d::Ledger, Error> {
 /// in the tail after the checkpoint, each with its recording time.
 #[derive(Clone)]
 struct LogView {
+    authority_generation: String,
     position: u64,
     /// When the last entry was recorded.
     recorded_at_ms: u64,
@@ -393,9 +417,16 @@ impl<S: LogStore> LogReader<S> {
         if loaded.checkpoint.schema_version != SCHEMA_VERSION {
             return Err(StoreError::Unsupported(loaded.checkpoint.schema_version));
         }
+        let authority_generation = loaded.checkpoint.authority_generation.clone();
+        if uuid_v7_millis(&authority_generation).is_none() {
+            return Err(StoreError::Corrupt(
+                "authority generation is not a canonical UUIDv7".into(),
+            ));
+        }
         let (position, recorded_at_ms, live) =
             live_from(loaded.checkpoint).map_err(log_authority::storage)?;
         let mut view = LogView {
+            authority_generation,
             position,
             recorded_at_ms,
             live,
@@ -500,9 +531,15 @@ fn live_from(checkpoint: dto::Checkpoint) -> Result<(u64, u64, d::Live), Error> 
     .map_err(corrupt)?;
     Ok((checkpoint.position, checkpoint.recorded_at_ms, live))
 }
-fn checkpoint_dto(live: &d::Live, position: u64, recorded_at_ms: u64) -> dto::Checkpoint {
+fn checkpoint_dto(
+    live: &d::Live,
+    position: u64,
+    recorded_at_ms: u64,
+    authority_generation: &str,
+) -> dto::Checkpoint {
     dto::Checkpoint {
         schema_version: SCHEMA_VERSION,
+        authority_generation: authority_generation.into(),
         position,
         recorded_at_ms,
         resources: live.resources().values().map(Into::into).collect(),
@@ -577,4 +614,13 @@ impl<S: LogStore + ?Sized> LogStore for &S {
     fn capabilities(&self) -> capabilities::Capabilities {
         (**self).capabilities()
     }
+}
+
+/// Generate an identity once at an outer request boundary. Never call again to
+/// replace an ambiguous business request's idempotency key.
+pub fn new_id() -> Result<String, Error> {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes)
+        .map_err(|e| Error::from(StoreError::Io(format!("identity generation failed: {e}"))))?;
+    Ok(uuid_v7(system_clock(), u128::from_le_bytes(bytes)))
 }

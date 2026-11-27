@@ -34,6 +34,32 @@ pub struct Prepare {
     /// `null` for no automatic expiry. Part of the request: a retry repeats it.
     #[serde(deserialize_with = "required")]
     pub hold_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub context: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<AuthorizationFacts>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationFacts {
+    pub principal_id: String,
+    pub credential_id: String,
+    pub policy_digest: String,
+}
+impl TryFrom<AuthorizationFacts> for d::access::Facts {
+    type Error = d::Error;
+    fn try_from(v: AuthorizationFacts) -> Result<Self, Self::Error> {
+        Self::new(v.principal_id, v.credential_id, v.policy_digest)
+    }
+}
+impl From<&d::access::Facts> for AuthorizationFacts {
+    fn from(v: &d::access::Facts) -> Self {
+        Self {
+            principal_id: v.principal_id().into(),
+            credential_id: v.credential_id().into(),
+            policy_digest: v.policy_digest().into(),
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -182,12 +208,60 @@ impl Snapshot {
 #[serde(deny_unknown_fields)]
 pub struct Checkpoint {
     pub schema_version: u32,
+    // The invalid empty representation permits an explicit unsupported-schema
+    // error for older envelopes; schema-4 validation always requires a UUID.
+    #[serde(default)]
+    pub authority_generation: String,
     /// Number of log entries this checkpoint reflects.
     pub position: u64,
     /// When the last of those entries was recorded, or zero if there are none.
     pub recorded_at_ms: u64,
     pub resources: Vec<Resource>,
     pub prepared: Vec<Transaction>,
+}
+/// Versioned pending-hold accounting for one tenant. A vector preserves
+/// duplicate detection at the inbound boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pending {
+    pub total: u64,
+    pub credentials: Vec<CredentialPending>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialPending {
+    pub credential_id: String,
+    pub count: u64,
+}
+impl TryFrom<Pending> for d::access::Pending {
+    type Error = d::Error;
+    fn try_from(v: Pending) -> Result<Self, Self::Error> {
+        let pending = Self::restore(
+            v.credentials
+                .into_iter()
+                .map(|c| (c.credential_id, c.count))
+                .collect(),
+        )?;
+        if pending.total() != v.total {
+            return Err(d::Error::InvalidLedger);
+        }
+        Ok(pending)
+    }
+}
+impl From<&d::access::Pending> for Pending {
+    fn from(v: &d::access::Pending) -> Self {
+        Self {
+            total: v.total(),
+            credentials: v
+                .entries()
+                .iter()
+                .map(|(id, count)| CredentialPending {
+                    credential_id: id.clone(),
+                    count: *count,
+                })
+                .collect(),
+        }
+    }
 }
 /// The outcome of one state change, as appended to the log.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,7 +304,7 @@ pub enum Output {
 }
 
 /// An optional value whose field must still be present, as `null` if absent.
-fn required<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+pub(crate) fn required<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
 ) -> Result<Option<T>, D::Error> {
     Option::<T>::deserialize(deserializer)
@@ -294,14 +368,21 @@ impl From<&d::Operation> for Operation {
 impl TryFrom<Prepare> for d::Request {
     type Error = d::Error;
     fn try_from(v: Prepare) -> Result<Self, Self::Error> {
-        Self::new(
+        let request = Self::new(
             transaction_id(v.namespace, v.transaction_id)?,
             v.operations
                 .into_iter()
                 .map(d::Operation::try_from)
                 .collect::<Result<_, _>>()?,
         )?
-        .with_hold(v.hold_ms)
+        .with_hold(v.hold_ms)?;
+        Ok(request
+            .with_context(d::access::Context::new(v.context.into_iter().collect())?)
+            .with_authorization(
+                v.authorization
+                    .map(d::access::Facts::try_from)
+                    .transpose()?,
+            ))
     }
 }
 impl From<&d::Request> for Prepare {
@@ -311,6 +392,8 @@ impl From<&d::Request> for Prepare {
             namespace: v.id().namespace().map(str::to_owned),
             operations: v.operations().iter().map(Operation::from).collect(),
             hold_ms: v.hold_ms(),
+            context: v.context().entries().clone(),
+            authorization: v.authorization().map(Into::into),
         }
     }
 }

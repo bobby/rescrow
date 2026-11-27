@@ -1,0 +1,763 @@
+[
+  {
+    "headers": {
+      "authority-generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+      "content-length": "606",
+      "content-type": "application/json",
+      "date": "Fri, 27 Nov 2026 18:09:27 GMT",
+      "durability-profile": "simulation",
+      "location": "/v1/resources/credits",
+      "x-request-id": "01a21e32-aeff-757a-a6c1-d9ed7c4a0f09"
+    },
+    "operation": "create_resource",
+    "request": {
+      "initial": "60",
+      "lower": "0",
+      "scale": 0,
+      "unit": "credits",
+      "upper": "100"
+    },
+    "response": {
+      "data": {
+        "observation": {
+          "available_down": "60",
+          "available_up": "40",
+          "consistency": "sampled",
+          "finalization_pending": false,
+          "holds": [],
+          "observed_from_ms": 1795802967818,
+          "observed_until_ms": 1795802967818,
+          "quantity": "60",
+          "reserved_down": "0",
+          "reserved_up": "0"
+        },
+        "spec": {
+          "initial": "60",
+          "lower": "0",
+          "resource_id": "credits",
+          "scale": 0,
+          "unit": "credits",
+          "upper": "100"
+        }
+      },
+      "links": {
+        "self": "/v1/resources/credits"
+      },
+      "metadata": {
+        "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+        "deployment_cell": "test",
+        "durability_profile": "simulation",
+        "request_id": "01a21e32-aeff-757a-a6c1-d9ed7c4a0f09",
+        "serving_region": "local"
+      }
+    },
+    "status": 201
+  },
+  {
+    "headers": {
+      "authority-generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+      "content-length": "606",
+      "content-type": "application/json",
+      "date": "Fri, 27 Nov 2026 18:09:27 GMT",
+      "durability-profile": "simulation",
+      "location": "/v1/resources/credits",
+      "x-request-id": "01a21e32-af0b-7c3c-9e26-097dbe9b4d9d"
+    },
+    "operation": "create_resource",
+    "request": {
+      "initial": "60",
+      "lower": "0",
+      "scale": 0,
+      "unit": "credits",
+      "upper": "100"
+    },
+    "response": {
+      "data": {
+        "observation": {
+          "available_down": "60",
+          "available_up": "40",
+          "consistency": "sampled",
+          "finalization_pending": false,
+          "holds": [],
+          "observed_from_ms": 1795802967829,
+          "observed_until_ms": 1795802967830,
+          "quantity": "60",
+          "reserved_down": "0",
+          "reserved_up": "0"
+        },
+        "spec": {
+          "initial": "60",
+          "lower": "0",
+          "resource_id": "credits",
+          "scale": 0,
+          "unit": "credits",
+          "upper": "100"
+        }
+      },
+      "links": {
+        "self": "/v1/resources/credits"
+      },
+      "metadata": {
+        "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+        "deployment_cell": "test",
+        "durability_profile": "simulation",
+        "request_id": "01a21e32-af0b-7c3c-9e26-097dbe9b4d9d",
+        "serving_region": "local"
+      }
+    },
+    "status": 200
+  },
+  {
+    "headers": {
+      "authority-generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+      "content-length": "606",
+      "content-type": "application/json",
+      "date": "Fri, 27 Nov 2026 18:09:27 GMT",
+      "durability-profile": "simulation",
+      "location": "/v1/resources/credits",
+      "x-request-id": "01a21e32-af16-77d3-8f41-344fd73d70a3"
+    },
+    "operation": "get_resource",
+    "request": null,
+    "response": {
+      "data": {
+        "observation": {
+          "available_down": "60",
+          "available_up": "40",
+          "consistency": "sampled",
+          "finalization_pending": false,
+          "holds": [],
+          "observed_from_ms": 1795802967840,
+          "observed_until_ms": 1795802967840,
+          "quantity": "60",
+          "reserved_down": "0",
+          "reserved_up": "0"
+        },
+        "spec": {
+          "initial": "60",
+          "lower": "0",
+          "resource_id": "credits",
+          "scale": 0,
+          "unit": "credits",
+          "upper": "100"
+        }
+      },
+      "links": {
+        "self": "/v1/resources/credits"
+      },
+      "metadata": {
+        "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+        "deployment_cell": "test",
+        "durability_profile": "simulation",
+        "request_id": "01a21e32-af16-77d3-8f41-344fd73d70a3",
+        "serving_region": "local"
+      }
+    },
+    "status": 200
+  },
+  {
+    "headers": {
+      "authority-generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+      "content-length": "629",
+      "content-type": "application/json",
+      "date": "Fri, 27 Nov 2026 18:09:27 GMT",
+      "durability-profile": "simulation",
+      "location": "/v1/resources",
+      "x-request-id": "01a21e32-af21-7d2e-9d46-2f3bf467948d"
+    },
+    "operation": "list_resources",
+    "request": null,
+    "response": {
+      "data": {
+        "items": [
+          {
+            "observation": {
+              "available_down": "60",
+              "available_up": "40",
+              "consistency": "sampled",
+              "finalization_pending": false,
+              "holds": [],
+              "observed_from_ms": 1795802967850,
+              "observed_until_ms": 1795802967851,
+              "quantity": "60",
+              "reserved_down": "0",
+              "reserved_up": "0"
+            },
+            "spec": {
+              "initial": "60",
+              "lower": "0",
+              "resource_id": "credits",
+              "scale": 0,
+              "unit": "credits",
+              "upper": "100"
+            }
+          }
+        ],
+        "next_cursor": null
+      },
+      "links": {
+        "self": "/v1/resources"
+      },
+      "metadata": {
+        "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+        "deployment_cell": "test",
+        "durability_profile": "simulation",
+        "request_id": "01a21e32-af21-7d2e-9d46-2f3bf467948d",
+        "serving_region": "local"
+      }
+    },
+    "status": 200
+  },
+  {
+    "headers": {
+      "authority-generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+      "content-length": "1141",
+      "content-type": "application/json",
+      "date": "Fri, 27 Nov 2026 18:09:27 GMT",
+      "durability-profile": "simulation",
+      "location": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3",
+      "x-request-id": "01a21e32-af2b-78fc-8b57-20dea6288871"
+    },
+    "operation": "prepare",
+    "request": {
+      "context": {},
+      "hold_ms": null,
+      "operations": [
+        {
+          "delta": "-40",
+          "operation_id": "op",
+          "resource_id": "credits"
+        }
+      ]
+    },
+    "response": {
+      "data": {
+        "actuals_digest": null,
+        "consistency": "authoritative",
+        "materialization": "complete",
+        "processing": false,
+        "request_digest": "sha256:62c583d6ef036b46f041557cd2a6f5aa5bac88e3a079ea6bbd029a418caf66a9",
+        "transaction": {
+          "expires_at_ms": null,
+          "request": {
+            "authorization": {
+              "credential_id": "e4d395cd1c0db085bdde200664db772c9b9916e6e75f3653288df5750f6d8a8a",
+              "policy_digest": "a45415154c87fe4ecbad26f09885acab53b0c95392e826491dfb03b1783125cd",
+              "principal_id": "971963bc45dd28f6a3920bc39906c303edd217a84c694b8c4b3df0119553b180"
+            },
+            "hold_ms": null,
+            "namespace": "workflow",
+            "operations": [
+              {
+                "delta": "-40",
+                "operation_id": "op",
+                "resource_id": "credits"
+              }
+            ],
+            "transaction_id": "01a21e32-af2b-744e-9f46-657bc354a1d3"
+          },
+          "state": {
+            "status": "prepared"
+          }
+        }
+      },
+      "links": {
+        "abort": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/abort",
+        "commit": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/commit",
+        "self": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3"
+      },
+      "metadata": {
+        "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+        "deployment_cell": "test",
+        "durability_profile": "simulation",
+        "request_id": "01a21e32-af2b-78fc-8b57-20dea6288871",
+        "serving_region": "local"
+      }
+    },
+    "status": 201
+  },
+  {
+    "headers": {
+      "authority-generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+      "content-length": "1141",
+      "content-type": "application/json",
+      "date": "Fri, 27 Nov 2026 18:09:27 GMT",
+      "durability-profile": "simulation",
+      "location": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3",
+      "x-request-id": "01a21e32-af36-72e2-9213-a5741299bd39"
+    },
+    "operation": "prepare",
+    "request": {
+      "context": {},
+      "hold_ms": null,
+      "operations": [
+        {
+          "delta": "-40",
+          "operation_id": "op",
+          "resource_id": "credits"
+        }
+      ]
+    },
+    "response": {
+      "data": {
+        "actuals_digest": null,
+        "consistency": "authoritative",
+        "materialization": "complete",
+        "processing": false,
+        "request_digest": "sha256:62c583d6ef036b46f041557cd2a6f5aa5bac88e3a079ea6bbd029a418caf66a9",
+        "transaction": {
+          "expires_at_ms": null,
+          "request": {
+            "authorization": {
+              "credential_id": "e4d395cd1c0db085bdde200664db772c9b9916e6e75f3653288df5750f6d8a8a",
+              "policy_digest": "a45415154c87fe4ecbad26f09885acab53b0c95392e826491dfb03b1783125cd",
+              "principal_id": "971963bc45dd28f6a3920bc39906c303edd217a84c694b8c4b3df0119553b180"
+            },
+            "hold_ms": null,
+            "namespace": "workflow",
+            "operations": [
+              {
+                "delta": "-40",
+                "operation_id": "op",
+                "resource_id": "credits"
+              }
+            ],
+            "transaction_id": "01a21e32-af2b-744e-9f46-657bc354a1d3"
+          },
+          "state": {
+            "status": "prepared"
+          }
+        }
+      },
+      "links": {
+        "abort": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/abort",
+        "commit": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/commit",
+        "self": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3"
+      },
+      "metadata": {
+        "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+        "deployment_cell": "test",
+        "durability_profile": "simulation",
+        "request_id": "01a21e32-af36-72e2-9213-a5741299bd39",
+        "serving_region": "local"
+      }
+    },
+    "status": 200
+  },
+  {
+    "headers": {
+      "authority-generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+      "content-length": "1141",
+      "content-type": "application/json",
+      "date": "Fri, 27 Nov 2026 18:09:27 GMT",
+      "durability-profile": "simulation",
+      "location": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3",
+      "x-request-id": "01a21e32-af40-797b-b136-3da2a08456f7"
+    },
+    "operation": "get_transaction",
+    "request": null,
+    "response": {
+      "data": {
+        "actuals_digest": null,
+        "consistency": "authoritative",
+        "materialization": "complete",
+        "processing": false,
+        "request_digest": "sha256:62c583d6ef036b46f041557cd2a6f5aa5bac88e3a079ea6bbd029a418caf66a9",
+        "transaction": {
+          "expires_at_ms": null,
+          "request": {
+            "authorization": {
+              "credential_id": "e4d395cd1c0db085bdde200664db772c9b9916e6e75f3653288df5750f6d8a8a",
+              "policy_digest": "a45415154c87fe4ecbad26f09885acab53b0c95392e826491dfb03b1783125cd",
+              "principal_id": "971963bc45dd28f6a3920bc39906c303edd217a84c694b8c4b3df0119553b180"
+            },
+            "hold_ms": null,
+            "namespace": "workflow",
+            "operations": [
+              {
+                "delta": "-40",
+                "operation_id": "op",
+                "resource_id": "credits"
+              }
+            ],
+            "transaction_id": "01a21e32-af2b-744e-9f46-657bc354a1d3"
+          },
+          "state": {
+            "status": "prepared"
+          }
+        }
+      },
+      "links": {
+        "abort": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/abort",
+        "commit": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/commit",
+        "self": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3"
+      },
+      "metadata": {
+        "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+        "deployment_cell": "test",
+        "durability_profile": "simulation",
+        "request_id": "01a21e32-af40-797b-b136-3da2a08456f7",
+        "serving_region": "local"
+      }
+    },
+    "status": 200
+  },
+  {
+    "headers": {
+      "authority-generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+      "content-length": "1259",
+      "content-type": "application/json",
+      "date": "Fri, 27 Nov 2026 18:09:27 GMT",
+      "durability-profile": "simulation",
+      "location": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3",
+      "x-request-id": "01a21e32-af4b-7d39-b624-fc4f81d2a519"
+    },
+    "operation": "commit",
+    "request": {
+      "actuals": [
+        {
+          "delta": "-25",
+          "operation_id": "op"
+        }
+      ]
+    },
+    "response": {
+      "data": {
+        "actuals_digest": "sha256:8eae440ecce174ba8d2fcf524dadc0e6fea1115c96c79e07c61e86c5da4d4097",
+        "consistency": "authoritative",
+        "materialization": "complete",
+        "processing": false,
+        "request_digest": "sha256:62c583d6ef036b46f041557cd2a6f5aa5bac88e3a079ea6bbd029a418caf66a9",
+        "transaction": {
+          "expires_at_ms": null,
+          "request": {
+            "authorization": {
+              "credential_id": "e4d395cd1c0db085bdde200664db772c9b9916e6e75f3653288df5750f6d8a8a",
+              "policy_digest": "a45415154c87fe4ecbad26f09885acab53b0c95392e826491dfb03b1783125cd",
+              "principal_id": "971963bc45dd28f6a3920bc39906c303edd217a84c694b8c4b3df0119553b180"
+            },
+            "hold_ms": null,
+            "namespace": "workflow",
+            "operations": [
+              {
+                "delta": "-40",
+                "operation_id": "op",
+                "resource_id": "credits"
+              }
+            ],
+            "transaction_id": "01a21e32-af2b-744e-9f46-657bc354a1d3"
+          },
+          "state": {
+            "actuals": [
+              {
+                "delta": "-25",
+                "operation_id": "op"
+              }
+            ],
+            "status": "committed"
+          }
+        }
+      },
+      "links": {
+        "abort": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/abort",
+        "commit": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/commit",
+        "self": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3"
+      },
+      "metadata": {
+        "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+        "deployment_cell": "test",
+        "durability_profile": "simulation",
+        "request_id": "01a21e32-af4b-7d39-b624-fc4f81d2a519",
+        "serving_region": "local"
+      }
+    },
+    "status": 200
+  },
+  {
+    "headers": {
+      "authority-generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+      "content-length": "292",
+      "content-type": "application/problem+json",
+      "date": "Fri, 27 Nov 2026 18:09:27 GMT",
+      "durability-profile": "simulation",
+      "location": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3",
+      "x-request-id": "01a21e32-af57-77b0-ab68-9265a7967a3c"
+    },
+    "operation": "abort",
+    "request": {},
+    "response": {
+      "category": "domain",
+      "code": "conflict",
+      "detail": "request conflicts with an existing identity or terminal decision",
+      "request_id": "01a21e32-af57-77b0-ab68-9265a7967a3c",
+      "retryable": false,
+      "status": 409,
+      "transaction_id": "01a21e32-af2b-744e-9f46-657bc354a1d3",
+      "type": "urn:rescrow:problem:conflict"
+    },
+    "status": 409
+  },
+  {
+    "headers": {
+      "authority-generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+      "content-length": "376",
+      "content-type": "application/problem+json",
+      "date": "Fri, 27 Nov 2026 18:09:27 GMT",
+      "durability-profile": "simulation",
+      "location": "/v1/transactions/01a21e32-af62-7544-b644-5a5c4ffaf349",
+      "x-request-id": "01a21e32-af62-7d5a-9b98-f54114900c7e"
+    },
+    "operation": "prepare",
+    "request": {
+      "context": {},
+      "hold_ms": null,
+      "operations": [
+        {
+          "delta": "-40",
+          "operation_id": "op",
+          "resource_id": "credits"
+        }
+      ]
+    },
+    "response": {
+      "capacity": {
+        "available": "35",
+        "requested_delta": "-40",
+        "resource_id": "credits"
+      },
+      "category": "domain",
+      "code": "capacity",
+      "detail": "resource credits requested delta -40 but only 35 capacity is available",
+      "request_id": "01a21e32-af62-7d5a-9b98-f54114900c7e",
+      "retryable": false,
+      "status": 409,
+      "transaction_id": "01a21e32-af62-7544-b644-5a5c4ffaf349",
+      "type": "urn:rescrow:problem:capacity"
+    },
+    "status": 409
+  },
+  {
+    "headers": {
+      "authority-generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+      "content-length": "1140",
+      "content-type": "application/json",
+      "date": "Fri, 27 Nov 2026 18:09:27 GMT",
+      "durability-profile": "simulation",
+      "location": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20",
+      "x-request-id": "01a21e32-af6d-7adf-978e-bccff28ef05e"
+    },
+    "operation": "prepare",
+    "request": {
+      "context": {},
+      "hold_ms": null,
+      "operations": [
+        {
+          "delta": "-1",
+          "operation_id": "op",
+          "resource_id": "credits"
+        }
+      ]
+    },
+    "response": {
+      "data": {
+        "actuals_digest": null,
+        "consistency": "authoritative",
+        "materialization": "complete",
+        "processing": false,
+        "request_digest": "sha256:6748992c3d3450891837ae512ee1eea626642d8bcac88e08b60ad1964c4e7a4b",
+        "transaction": {
+          "expires_at_ms": null,
+          "request": {
+            "authorization": {
+              "credential_id": "e4d395cd1c0db085bdde200664db772c9b9916e6e75f3653288df5750f6d8a8a",
+              "policy_digest": "a45415154c87fe4ecbad26f09885acab53b0c95392e826491dfb03b1783125cd",
+              "principal_id": "971963bc45dd28f6a3920bc39906c303edd217a84c694b8c4b3df0119553b180"
+            },
+            "hold_ms": null,
+            "namespace": "workflow",
+            "operations": [
+              {
+                "delta": "-1",
+                "operation_id": "op",
+                "resource_id": "credits"
+              }
+            ],
+            "transaction_id": "01a21e32-af6d-7606-91bc-391529484f20"
+          },
+          "state": {
+            "status": "prepared"
+          }
+        }
+      },
+      "links": {
+        "abort": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20/abort",
+        "commit": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20/commit",
+        "self": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20"
+      },
+      "metadata": {
+        "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+        "deployment_cell": "test",
+        "durability_profile": "simulation",
+        "request_id": "01a21e32-af6d-7adf-978e-bccff28ef05e",
+        "serving_region": "local"
+      }
+    },
+    "status": 201
+  },
+  {
+    "headers": {
+      "authority-generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+      "content-length": "1170",
+      "content-type": "application/json",
+      "date": "Fri, 27 Nov 2026 18:09:27 GMT",
+      "durability-profile": "simulation",
+      "location": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20",
+      "x-request-id": "01a21e32-af79-7afc-852c-697e99a40ed0"
+    },
+    "operation": "abort",
+    "request": {},
+    "response": {
+      "data": {
+        "actuals_digest": null,
+        "consistency": "authoritative",
+        "materialization": "complete",
+        "processing": false,
+        "request_digest": "sha256:6748992c3d3450891837ae512ee1eea626642d8bcac88e08b60ad1964c4e7a4b",
+        "transaction": {
+          "expires_at_ms": null,
+          "request": {
+            "authorization": {
+              "credential_id": "e4d395cd1c0db085bdde200664db772c9b9916e6e75f3653288df5750f6d8a8a",
+              "policy_digest": "a45415154c87fe4ecbad26f09885acab53b0c95392e826491dfb03b1783125cd",
+              "principal_id": "971963bc45dd28f6a3920bc39906c303edd217a84c694b8c4b3df0119553b180"
+            },
+            "hold_ms": null,
+            "namespace": "workflow",
+            "operations": [
+              {
+                "delta": "-1",
+                "operation_id": "op",
+                "resource_id": "credits"
+              }
+            ],
+            "transaction_id": "01a21e32-af6d-7606-91bc-391529484f20"
+          },
+          "state": {
+            "cause": {
+              "reason": "requested"
+            },
+            "status": "aborted"
+          }
+        }
+      },
+      "links": {
+        "abort": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20/abort",
+        "commit": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20/commit",
+        "self": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20"
+      },
+      "metadata": {
+        "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+        "deployment_cell": "test",
+        "durability_profile": "simulation",
+        "request_id": "01a21e32-af79-7afc-852c-697e99a40ed0",
+        "serving_region": "local"
+      }
+    },
+    "status": 200
+  },
+  {
+    "headers": {
+      "authority-generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+      "content-length": "1693",
+      "content-type": "application/json",
+      "date": "Fri, 27 Nov 2026 18:09:27 GMT",
+      "durability-profile": "simulation",
+      "location": "/v1/transactions",
+      "x-request-id": "01a21e32-af84-754a-ace8-7685a8433725"
+    },
+    "operation": "list_transactions",
+    "request": null,
+    "response": {
+      "data": {
+        "items": [
+          {
+            "actuals_digest": null,
+            "consistency": "authoritative",
+            "materialization": "complete",
+            "processing": false,
+            "request_digest": "sha256:62c583d6ef036b46f041557cd2a6f5aa5bac88e3a079ea6bbd029a418caf66a9",
+            "transaction": {
+              "expires_at_ms": null,
+              "request": {
+                "authorization": {
+                  "credential_id": "e4d395cd1c0db085bdde200664db772c9b9916e6e75f3653288df5750f6d8a8a",
+                  "policy_digest": "a45415154c87fe4ecbad26f09885acab53b0c95392e826491dfb03b1783125cd",
+                  "principal_id": "971963bc45dd28f6a3920bc39906c303edd217a84c694b8c4b3df0119553b180"
+                },
+                "hold_ms": null,
+                "namespace": "workflow",
+                "operations": [
+                  {
+                    "delta": "-40",
+                    "operation_id": "op",
+                    "resource_id": "credits"
+                  }
+                ],
+                "transaction_id": "01a21e32-af62-7544-b644-5a5c4ffaf349"
+              },
+              "state": {
+                "capacity": {
+                  "available": "35",
+                  "requested_delta": "-40",
+                  "resource_id": "credits"
+                },
+                "cause": {
+                  "reason": "rejected",
+                  "rejection": "capacity"
+                },
+                "status": "aborted"
+              }
+            }
+          }
+        ],
+        "next_cursor": "eyJzY29wZSI6InNoYTI1NjphNzExOTU3NDEyMGU3ZGI1NDU0YjcyNWQwOWJjYzk4NzA1ZWIwNmY0NTZhYWZjYTBhMGUxNzM2YjcxYjM2YTM3IiwiYWZ0ZXIiOiIwMWEyMWUzMi1hZjYyLTc1NDQtYjY0NC01YTVjNGZmYWYzNDkiLCJleHBpcmVzX2F0X21zIjoxNzk1ODAzODY3OTUwfQ.q6MZO-qW_iDIxgQpmoiWRClfbME_4QwacpK1v5xZ0fE"
+      },
+      "links": {
+        "next": "/v1/transactions?cursor=eyJzY29wZSI6InNoYTI1NjphNzExOTU3NDEyMGU3ZGI1NDU0YjcyNWQwOWJjYzk4NzA1ZWIwNmY0NTZhYWZjYTBhMGUxNzM2YjcxYjM2YTM3IiwiYWZ0ZXIiOiIwMWEyMWUzMi1hZjYyLTc1NDQtYjY0NC01YTVjNGZmYWYzNDkiLCJleHBpcmVzX2F0X21zIjoxNzk1ODAzODY3OTUwfQ.q6MZO-qW_iDIxgQpmoiWRClfbME_4QwacpK1v5xZ0fE&limit=1&state=aborted",
+        "self": "/v1/transactions"
+      },
+      "metadata": {
+        "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+        "deployment_cell": "test",
+        "durability_profile": "simulation",
+        "request_id": "01a21e32-af84-754a-ace8-7685a8433725",
+        "serving_region": "local"
+      }
+    },
+    "status": 200
+  },
+  {
+    "headers": {
+      "authority-generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
+      "content-length": "257",
+      "content-type": "application/problem+json",
+      "date": "Fri, 27 Nov 2026 18:09:27 GMT",
+      "durability-profile": "simulation",
+      "www-authenticate": "Bearer",
+      "x-request-id": "01a21e32-af90-7393-a34b-41a906167d4e"
+    },
+    "operation": "get_resource",
+    "request": null,
+    "response": {
+      "category": "authentication",
+      "code": "unauthenticated",
+      "detail": "a valid workload bearer token is required",
+      "request_id": "01a21e32-af90-7393-a34b-41a906167d4e",
+      "retryable": false,
+      "status": 401,
+      "transaction_id": null,
+      "type": "urn:rescrow:problem:unauthenticated"
+    },
+    "status": 401
+  }
+]

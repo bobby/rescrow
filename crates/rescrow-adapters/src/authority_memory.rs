@@ -22,18 +22,27 @@ struct Tenant {
 }
 #[derive(Default)]
 struct State {
-    initialized: bool,
+    generation: Option<String>,
     tenants: BTreeMap<TenantId, Tenant>,
 }
 #[derive(Clone, Default)]
 pub struct MemoryAuthority(Arc<Mutex<State>>);
 impl TransactionalStore for MemoryAuthority {
+    fn identity(&self) -> Result<String, StoreError> {
+        self.0
+            .lock()
+            .unwrap()
+            .generation
+            .clone()
+            .ok_or(StoreError::Missing)
+    }
     fn initialize(&self) -> Result<(), StoreError> {
         let mut state = self.0.lock().unwrap();
-        if state.initialized {
+        if state.generation.is_some() {
             return Err(StoreError::Exists);
         }
-        state.initialized = true;
+        state.generation =
+            Some(rescrow_application::new_id().map_err(|e| StoreError::Io(e.message))?);
         Ok(())
     }
     fn read(
@@ -43,7 +52,7 @@ impl TransactionalStore for MemoryAuthority {
         terminal_since_ms: u64,
     ) -> Result<Read, StoreError> {
         let state = self.0.lock().unwrap();
-        if !state.initialized {
+        if state.generation.is_none() {
             return Err(StoreError::Missing);
         }
         let records = state.tenants.get(tenant).map(|t| &t.records);
@@ -76,7 +85,7 @@ impl TransactionalStore for MemoryAuthority {
     }
     fn scan(&self, tenant: &TenantId) -> Result<Inspection, StoreError> {
         let state = self.0.lock().unwrap();
-        if !state.initialized {
+        if state.generation.is_none() {
             return Err(StoreError::Missing);
         }
         let tenant = state.tenants.get(tenant);
@@ -107,7 +116,7 @@ impl TransactionalStore for MemoryAuthority {
 
     fn commit(&self, commit: &Commit) -> Result<CommitOutcome, StoreError> {
         let mut state = self.0.lock().unwrap();
-        if !state.initialized {
+        if state.generation.is_none() {
             return Err(StoreError::Missing);
         }
         if commit.history().records.is_empty() || commit.replacements().is_empty() {
@@ -191,7 +200,7 @@ impl TransactionalStore for MemoryAuthority {
         transition: &TransitionId,
     ) -> Result<Resolution, StoreError> {
         let mut state = self.0.lock().unwrap();
-        if !state.initialized {
+        if state.generation.is_none() {
             return Err(StoreError::Missing);
         }
         let tenant = state.tenants.entry(tenant.clone()).or_default();
@@ -208,7 +217,7 @@ impl TransactionalStore for MemoryAuthority {
 
     fn history(&self, tenant: &TenantId) -> Result<Vec<HistoryRecord>, StoreError> {
         let state = self.0.lock().unwrap();
-        if !state.initialized {
+        if state.generation.is_none() {
             return Err(StoreError::Missing);
         }
         Ok(state
@@ -225,7 +234,7 @@ impl TransactionalStore for MemoryAuthority {
 }
 impl Readiness for MemoryAuthority {
     fn readiness(&self) -> Result<Capabilities, StoreError> {
-        if !self.0.lock().unwrap().initialized {
+        if self.0.lock().unwrap().generation.is_none() {
             return Err(StoreError::Missing);
         }
         Ok(Capabilities {

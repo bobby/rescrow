@@ -1,2 +1,7 @@
 /target/
 /.rescrow/
+
+__pycache__/
+node_modules/
+/.rescrow-http-dev/
+/.venv-contract/

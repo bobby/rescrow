@@ -47,6 +47,8 @@ impl Command {
         match self {
             Self::Create(id, spec) => dto::Command::CreateResource(spec.dto(*id)),
             Self::Prepare(id, ops, hold) => dto::Command::Prepare(dto::Prepare {
+                context: Default::default(),
+                authorization: None,
                 namespace: None,
                 transaction_id: tx_id(*id),
                 operations: ops

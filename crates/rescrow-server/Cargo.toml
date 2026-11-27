@@ -6,7 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 rescrow-application.workspace = true
-tokio = { version = "1.54", features = ["rt", "sync"] }
+tokio = { version = "1.54", features = ["rt", "sync", "time"] }
 
 [dev-dependencies]
 rescrow-adapters.workspace = true
