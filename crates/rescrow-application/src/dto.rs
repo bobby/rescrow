@@ -26,6 +26,9 @@ pub struct Prepare {
     /// A UUIDv7, in canonical lowercase form, for a new prepare. Its timestamp
     /// is when the client first created the request; every retry repeats it.
     pub transaction_id: String,
+    /// An authorized idempotency namespace; absent for the implicit local namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     pub operations: Vec<Operation>,
     /// How long the hold may last before it lapses, from 1 ms to 30 days, or
     /// `null` for no automatic expiry. Part of the request: a retry repeats it.
@@ -67,6 +70,8 @@ pub enum Command {
 pub struct Hold {
     pub transaction_id: String,
     pub delta: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -199,6 +204,9 @@ pub enum Record {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
+    /// Atomic publication identity; absent only in legacy/test log entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_id: Option<String>,
     /// Zero-based log position; also the position a conditional append expects.
     pub sequence: u64,
     /// When the Application recorded it, in milliseconds since the Unix epoch.
@@ -287,7 +295,7 @@ impl TryFrom<Prepare> for d::Request {
     type Error = d::Error;
     fn try_from(v: Prepare) -> Result<Self, Self::Error> {
         Self::new(
-            id(v.transaction_id)?,
+            transaction_id(v.namespace, v.transaction_id)?,
             v.operations
                 .into_iter()
                 .map(d::Operation::try_from)
@@ -300,6 +308,7 @@ impl From<&d::Request> for Prepare {
     fn from(v: &d::Request) -> Self {
         Self {
             transaction_id: v.id().as_str().into(),
+            namespace: v.id().namespace().map(str::to_owned),
             operations: v.operations().iter().map(Operation::from).collect(),
             hold_ms: v.hold_ms(),
         }
@@ -313,7 +322,12 @@ impl TryFrom<Resource> for d::Resource {
             decimal(&v.quantity)?,
             v.holds
                 .into_iter()
-                .map(|h| Ok((id(h.transaction_id)?, decimal(&h.delta)?)))
+                .map(|h| {
+                    Ok((
+                        transaction_id(h.namespace, h.transaction_id)?,
+                        decimal(&h.delta)?,
+                    ))
+                })
                 .collect::<Result<_, d::Error>>()?,
         )?;
         let a = r.availability();
@@ -339,6 +353,7 @@ impl From<&d::Resource> for Resource {
                 .iter()
                 .map(|(id, delta)| Hold {
                     transaction_id: id.as_str().into(),
+                    namespace: id.namespace().map(str::to_owned),
                     delta: delta.to_string(),
                 })
                 .collect(),
@@ -438,5 +453,13 @@ impl TryFrom<Snapshot> for d::Ledger {
                 .map(d::Transaction::try_from)
                 .collect::<Result<_, _>>()?,
         )
+    }
+}
+
+fn transaction_id(namespace: Option<String>, value: String) -> Result<d::Id, d::Error> {
+    let value = id(value)?;
+    match namespace {
+        None => Ok(value),
+        Some(namespace) => d::Id::qualified(id(namespace)?, value),
     }
 }

@@ -31,6 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         u128::from(std::process::id()) << 32 | u128::from(nanos),
     );
     app.prepare(Prepare {
+        namespace: None,
         transaction_id: work.clone(),
         operations: vec![Operation {
             operation_id: "spend".into(),

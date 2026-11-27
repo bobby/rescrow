@@ -35,6 +35,7 @@ fn prepare(name: &str, delta: &str) -> Command {
 }
 fn prepare_raw(transaction_id: &str, delta: &str) -> Command {
     Command::Prepare(Prepare {
+        namespace: None,
         transaction_id: transaction_id.into(),
         operations: vec![Operation {
             operation_id: "o".into(),
@@ -113,10 +114,7 @@ fn bounded_retries_prepublication_failures_and_lost_response() {
             delta: "-2".into(),
         }]),
     });
-    assert_eq!(
-        app.execute(commit.clone()).unwrap_err().category,
-        Category::UnknownOutcome
-    );
+    app.execute(commit.clone()).unwrap();
     let published = snapshot(&store);
     app.execute(commit).unwrap();
     assert_eq!(snapshot(&store), published);
@@ -134,10 +132,13 @@ fn lost_prepare_rejection_and_abort_responses_keep_identity() {
     for (delta, expected) in [("-3", None), ("-6", Some(Code::Capacity))] {
         let (store, app) = ready();
         store.inject(Fault::LostResponse);
-        assert_eq!(
-            app.execute(prepare("t", delta)).unwrap_err().category,
-            Category::UnknownOutcome
-        );
+        let resolved = app.execute(prepare("t", delta));
+        match &expected {
+            Some(code) => assert_eq!(&resolved.unwrap_err().code, code),
+            None => {
+                resolved.unwrap();
+            }
+        }
         let before = snapshot(&store);
         let retry = app.execute(prepare("t", delta));
         match &expected {
@@ -149,14 +150,10 @@ fn lost_prepare_rejection_and_abort_responses_keep_identity() {
         assert_eq!(snapshot(&store), before);
         if expected.is_none() {
             store.inject(Fault::LostResponse);
-            assert_eq!(
-                app.execute(Command::Abort {
-                    transaction_id: id("t")
-                })
-                .unwrap_err()
-                .category,
-                Category::UnknownOutcome
-            );
+            app.execute(Command::Abort {
+                transaction_id: id("t"),
+            })
+            .unwrap();
             let before = snapshot(&store);
             app.execute(Command::Abort {
                 transaction_id: id("t"),
@@ -337,6 +334,7 @@ fn missing_resource_rejection_remains_terminal_after_resource_creation() {
 fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
     let (store, app) = ready();
     app.prepare(Prepare {
+        namespace: None,
         transaction_id: id("held"),
         operations: vec![Operation {
             operation_id: "o".into(),
@@ -347,6 +345,7 @@ fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
     })
     .unwrap();
     let request = Prepare {
+        namespace: None,
         transaction_id: id("rejected"),
         operations: vec![Operation {
             operation_id: "a".into(),

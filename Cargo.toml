@@ -8,6 +8,7 @@ edition = "2024"
 rust-version = "1.96"
 
 [workspace.dependencies]
+rescrow-test-support = { path = "crates/rescrow-test-support" }
 rescrow-domain = { path = "crates/rescrow-domain" }
 rescrow-application = { path = "crates/rescrow-application" }
 rescrow-adapters = { path = "crates/rescrow-adapters" }

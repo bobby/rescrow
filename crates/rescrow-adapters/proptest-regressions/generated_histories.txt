@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e57a04c722406f0894ec95e8f02720a2ebb21264bc0ba493e9b05f486194a2a1 # shrinks to initial = [Spec { lower: 0, upper: None, initial: 0, unit: 0, scale: 0 }, Spec { lower: 0, upper: None, initial: 0, unit: 0, scale: 0 }], steps = [Step { action: Recreate(2), effect: Conflicts, reload: false }, Step { action: Prepare { fresh: false, slot: 0, operations: [Op { id: 0, resource: 0, delta: -2 }], hold: None }, effect: Clean, reload: false }]

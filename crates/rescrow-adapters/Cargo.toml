@@ -10,4 +10,5 @@ serde_json.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
-proptest = { version = "1.12", default-features = false, features = ["std", "handle-panics"] }
+rescrow-test-support.workspace = true
+rescrow-domain.workspace = true

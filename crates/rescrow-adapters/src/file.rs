@@ -80,6 +80,15 @@ struct Index {
     /// The segment's length when sealed; it never changes afterwards.
     length: u64,
     entries: Vec<IndexEntry>,
+    #[serde(default)]
+    publications: Vec<PublicationIndex>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationIndex {
+    publication_id: String,
+    sequence: u64,
+    offset: u64,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,6 +96,23 @@ struct IndexEntry {
     transaction_id: String,
     sequence: u64,
     offset: u64,
+}
+
+/// One checksummed frame is one atomic publication. Legacy single-entry
+/// frames remain readable; an array can never expose a prefix of a batch.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum LogFrame {
+    Single(Entry),
+    Batch(Vec<Entry>),
+}
+impl LogFrame {
+    fn entries(self) -> Vec<Entry> {
+        match self {
+            Self::Single(e) => vec![e],
+            Self::Batch(es) => es,
+        }
+    }
 }
 
 /// Records decoded from one segment.
@@ -108,6 +134,7 @@ struct Tail {
     files: Vec<File>,
 }
 
+#[derive(Clone)]
 pub struct FileStore {
     directory: PathBuf,
     timeout: Duration,
@@ -219,6 +246,9 @@ impl FileStore {
         let bytes = self.read_bounded(&mut file)?;
         let live: LiveFile =
             serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        if live.checkpoint.schema_version != rescrow_application::SCHEMA_VERSION {
+            return Err(StoreError::Unsupported(live.checkpoint.schema_version));
+        }
         Ok((live, file))
     }
     fn read_bounded(&self, file: &mut File) -> Result<Vec<u8>, StoreError> {
@@ -297,7 +327,11 @@ impl FileStore {
             .entries
             .windows(2)
             .all(|w| w[0].transaction_id < w[1].transaction_id);
-        if index.segment != first || !sorted {
+        let publications_sorted = index
+            .publications
+            .windows(2)
+            .all(|w| w[0].publication_id < w[1].publication_id);
+        if index.segment != first || !sorted || !publications_sorted {
             return Err(StoreError::Corrupt(format!(
                 "invalid index for segment {first}"
             )));
@@ -338,8 +372,8 @@ impl FileStore {
             let complete = len.is_some_and(|len| rest.len() >= HEADER + len);
             let decoded = len
                 .filter(|len| complete && *len > 0 && *len as u64 <= self.max_bytes)
-                .and_then(|len| decode_frame::<Entry>(&rest[..HEADER + len], self.max_bytes));
-            let Some(entry) = decoded else {
+                .and_then(|len| decode_frame::<LogFrame>(&rest[..HEADER + len], self.max_bytes));
+            let Some(frame) = decoded else {
                 // Only the final record of the active segment can be a torn append,
                 // and only if its length is one a writer could have produced.
                 let plausible = len.is_none_or(|len| len > 0 && len as u64 <= self.max_bytes);
@@ -352,16 +386,36 @@ impl FileStore {
                     "invalid log record at byte {start}"
                 )));
             };
-            let expected = sequence + scan.entries.len() as u64;
-            if entry.sequence != expected {
-                return Err(StoreError::Corrupt(format!(
-                    "log record {} found where {expected} was expected",
-                    entry.sequence
-                )));
+            let entries = frame.entries();
+            let identity = entries.first().and_then(|e| e.publication_id.as_deref());
+            if identity.is_some_and(|id| {
+                rescrow_application::uuid_v7_millis(id) != entries.first().map(|e| e.recorded_at_ms)
+            }) || entries
+                .iter()
+                .any(|e| e.publication_id.as_deref() != identity)
+            {
+                return Err(StoreError::Corrupt(
+                    "invalid atomic publication identity".into(),
+                ));
+            }
+
+            if entries.is_empty() {
+                return Err(StoreError::Corrupt("empty publication frame".into()));
             }
             at += HEADER + len.unwrap_or_default();
             scan.valid_end = offset + at as u64;
-            scan.entries.push((entry, start, scan.valid_end));
+            for entry in entries {
+                let expected = sequence
+                    .checked_add(scan.entries.len() as u64)
+                    .ok_or(StoreError::RevisionExhausted)?;
+                if entry.sequence != expected {
+                    return Err(StoreError::Corrupt(format!(
+                        "log record {} found where {expected} was expected",
+                        entry.sequence
+                    )));
+                }
+                scan.entries.push((entry, start, scan.valid_end));
+            }
         }
         Ok(scan)
     }
@@ -516,6 +570,16 @@ impl FileStore {
             // A previous writer's append may not have reached the disk; the
             // segment must before anything is appended after it.
             file.sync_all().map_err(io)?;
+            let mut publications = std::collections::BTreeMap::new();
+            for (entry, start, _) in &scan.entries {
+                if let Some(id) = &entry.publication_id {
+                    publications.entry(id.clone()).or_insert(PublicationIndex {
+                        publication_id: id.clone(),
+                        sequence: entry.sequence,
+                        offset: *start,
+                    });
+                }
+            }
             let mut entries: Vec<IndexEntry> = scan
                 .entries
                 .into_iter()
@@ -535,6 +599,7 @@ impl FileStore {
                 segment: tail.active,
                 length: scan.valid_end,
                 entries,
+                publications: publications.into_values().collect(),
             };
             self.publish(&self.index_path(tail.active), &encode_frame(&index)?, &log)
                 .map_err(|e| match e {
@@ -554,7 +619,7 @@ impl FileStore {
             .map_err(io)?;
         log.sync_all().map_err(io)
     }
-    fn read_record(&self, first: u64, offset: u64) -> Result<Entry, StoreError> {
+    fn read_record(&self, first: u64, offset: u64) -> Result<Vec<Entry>, StoreError> {
         let mut file = self.open_segment(first, false)?;
         file.seek(SeekFrom::Start(offset)).map_err(io)?;
         let mut header = [0; HEADER];
@@ -567,9 +632,12 @@ impl FileStore {
         }
         let mut frame = header.to_vec();
         file.take(len).read_to_end(&mut frame).map_err(io)?;
-        decode_frame(&frame, self.max_bytes).ok_or_else(|| {
-            StoreError::Corrupt(format!("indexed record in segment {first} is invalid"))
-        })
+        decode_frame::<LogFrame>(&frame, self.max_bytes)
+            .map(LogFrame::entries)
+            .filter(|entries| !entries.is_empty())
+            .ok_or_else(|| {
+                StoreError::Corrupt(format!("indexed record in segment {first} is invalid"))
+            })
     }
 }
 impl LogStore for FileStore {
@@ -654,18 +722,35 @@ impl LogStore for FileStore {
         self.directory_file()?;
         let (_lock, _) = self.lock(true, false)?;
         let (live, _, tail) = self.read_unsynced()?;
+        if let Some(identity) = &entries[0].publication_id {
+            if entries
+                .iter()
+                .any(|e| e.publication_id.as_ref() != Some(identity))
+            {
+                return Err(StoreError::Corrupt(
+                    "batch contains multiple publication identities".into(),
+                ));
+            }
+            if let Some(existing) = self.publication_unlocked(identity, &self.directory_file()?)? {
+                return if existing == entries {
+                    Ok(Publication::Applied)
+                } else {
+                    Err(StoreError::Corrupt("publication identity reused".into()))
+                };
+            }
+        }
         let first = entries[0].sequence;
         if first != live.checkpoint.position + tail.entries.len() as u64 {
             return Ok(Publication::Conflict);
         }
         // One write and one synchronization for the whole batch.
-        let mut frame = Vec::new();
-        for entry in entries {
-            let encoded = encode_frame(entry)?;
-            if encoded.len() as u64 > self.max_bytes {
-                return Err(StoreError::TooLarge);
-            }
-            frame.extend(encoded);
+        let frame = if entries.len() == 1 {
+            encode_frame(&entries[0])?
+        } else {
+            encode_frame(&entries)?
+        };
+        if frame.len() as u64 > self.max_bytes {
+            return Err(StoreError::TooLarge);
         }
         // Remove an earlier writer's unacknowledged torn append before writing after it.
         if !tail.sealed && tail.file_len > tail.valid_end {
@@ -682,10 +767,9 @@ impl LogStore for FileStore {
         let mut segment = self.open_segment(active, true)?;
         (self.hook)(Stage::BeforeAppend).map_err(io)?;
         segment.seek(SeekFrom::Start(offset)).map_err(io)?;
-        // A torn single record is never valid, so failing part-way through one
-        // appended nothing. A torn batch can leave its first records complete,
-        // as if only those writes had happened, so its outcome is unknown.
-        let partial = if entries.len() == 1 { io } else { unknown };
+        // The whole batch is one frame. A torn frame cannot expose any
+        // participant or prefix; once complete, synchronization failures are unknown.
+        let partial = io;
         let mid = frame.len() / 2;
         segment.write_all(&frame[..mid]).map_err(partial)?;
         (self.hook)(Stage::DuringAppend).map_err(partial)?;
@@ -715,6 +799,17 @@ impl LogStore for FileStore {
             .entries
             .get(covered as usize - 1)
             .ok_or_else(|| StoreError::Corrupt("checkpoint is past the end of the log".into()))?;
+        if tail
+            .entries
+            .get(covered as usize)
+            .is_some_and(|(_, next_segment, next_offset)| {
+                (*next_segment, *next_offset) == (segment, offset)
+            })
+        {
+            return Err(StoreError::Corrupt(
+                "checkpoint splits an atomic publication".into(),
+            ));
+        }
         self.publish_live(
             &LiveFile {
                 segment,
@@ -735,8 +830,86 @@ impl LogStore for FileStore {
         let directory = self.directory_file()?;
         self.unlocked(|| self.history_unlocked(&directory))
     }
+    fn publication(&self, identity: &str) -> Result<Option<Vec<Entry>>, StoreError> {
+        let directory = self.directory_file()?;
+        self.unlocked(|| self.publication_unlocked(identity, &directory))
+    }
+    fn capabilities(&self) -> rescrow_application::capabilities::Capabilities {
+        use rescrow_application::capabilities::*;
+        Capabilities {
+            durability_profile: DurabilityProfile::Local,
+            failure_domain: FailureDomain::Device,
+            max_record_bytes: Some(self.max_bytes),
+            cross_process: true,
+            reopen_after_crash: true,
+            ..Capabilities::simulation()
+        }
+    }
 }
 impl FileStore {
+    fn publication_unlocked(
+        &self,
+        identity: &str,
+        directory: &File,
+    ) -> Result<Option<Vec<Entry>>, StoreError> {
+        let since = rescrow_application::uuid_v7_millis(identity)
+            .ok_or_else(|| StoreError::Corrupt("invalid publication identity".into()))?;
+        let segments = self.segments()?;
+        let mut newer_starts = u64::MAX;
+        for (position, first) in segments.iter().enumerate().rev() {
+            if newer_starts < since {
+                break;
+            }
+            match self.read_index(*first)? {
+                None => {
+                    if position + 1 != segments.len() {
+                        return Err(StoreError::Corrupt("unsealed historical segment".into()));
+                    }
+                    let mut file = self.open_segment(*first, false)?;
+                    let scan = self.scan(&mut file, 0, *first, true)?;
+                    self.sync_read(&[&file, &open_directory(&self.log())?, directory])?;
+                    newer_starts = scan
+                        .entries
+                        .first()
+                        .map_or(newer_starts, |(e, ..)| e.recorded_at_ms);
+                    let entries: Vec<_> = scan
+                        .entries
+                        .into_iter()
+                        .map(|(e, ..)| e)
+                        .filter(|e| e.publication_id.as_deref() == Some(identity))
+                        .collect();
+                    if !entries.is_empty() {
+                        return Ok(Some(entries));
+                    }
+                }
+                Some(index) => {
+                    if index.length > 0 {
+                        newer_starts = self.read_record(*first, 0)?[0].recorded_at_ms;
+                    }
+                    if let Ok(at) = index
+                        .publications
+                        .binary_search_by(|p| p.publication_id.as_str().cmp(identity))
+                    {
+                        let indexed = &index.publications[at];
+                        let entries = self.read_record(*first, indexed.offset)?;
+                        if entries
+                            .first()
+                            .is_none_or(|e| e.sequence != indexed.sequence)
+                            || entries
+                                .iter()
+                                .any(|e| e.publication_id.as_deref() != Some(identity))
+                        {
+                            return Err(StoreError::Corrupt(
+                                "publication index disagrees with records".into(),
+                            ));
+                        }
+                        return Ok(Some(entries));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
     fn find_unlocked(
         &self,
         transaction_id: &str,
@@ -780,7 +953,7 @@ impl FileStore {
                 continue;
             };
             if index.length > 0 {
-                newer_starts_ms = self.read_record(*first, 0)?.recorded_at_ms;
+                newer_starts_ms = self.read_record(*first, 0)?[0].recorded_at_ms;
             }
             let Ok(at) = index
                 .entries
@@ -789,7 +962,15 @@ impl FileStore {
                 continue;
             };
             let indexed = &index.entries[at];
-            let entry = self.read_record(*first, indexed.offset)?;
+            let entry = self
+                .read_record(*first, indexed.offset)?
+                .into_iter()
+                .find(|e| e.sequence == indexed.sequence)
+                .ok_or_else(|| {
+                    StoreError::Corrupt(format!(
+                        "index for segment {first} disagrees with its records"
+                    ))
+                })?;
             if entry.sequence != indexed.sequence || !terminal(&entry) {
                 return Err(StoreError::Corrupt(format!(
                     "index for segment {first} disagrees with its records"

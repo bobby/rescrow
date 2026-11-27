@@ -1,0 +1,12 @@
+[package]
+name = "rescrow-test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+rescrow-application.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+proptest = { version = "1.12", default-features = false, features = ["std", "handle-panics"] }

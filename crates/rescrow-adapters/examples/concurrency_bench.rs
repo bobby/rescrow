@@ -34,6 +34,7 @@ fn app(path: &Path) -> Application<FileStore> {
 }
 fn prepare(id: &str) -> Command {
     Command::Prepare(Prepare {
+        namespace: None,
         transaction_id: id.into(),
         operations: vec![Operation {
             operation_id: "o".into(),

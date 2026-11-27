@@ -167,3 +167,34 @@ fn holds_without_a_deadline_never_lapse() {
         Error::InvalidLedger
     );
 }
+
+#[test]
+fn identical_transaction_ids_in_different_namespaces_share_capacity_safely() {
+    use rescrow_domain as d;
+    use std::collections::BTreeMap;
+    let plain = |s: &str| d::Id::new(s.into()).unwrap();
+    let spec = d::ResourceSpec::new(plain("r"), 0, Some(10), 10, "units".into(), 0).unwrap();
+    let resource = d::Resource::restore(spec, 10, vec![]).unwrap();
+    let mut resources = BTreeMap::from([(plain("r"), resource)]);
+    let request = |namespace| {
+        d::Request::new(
+            d::Id::qualified(plain(namespace), plain("same")).unwrap(),
+            vec![d::Operation::new(plain("op"), plain("r"), -4).unwrap()],
+        )
+        .unwrap()
+    };
+    let a = request("a");
+    let b = request("b");
+    assert_ne!(a.id(), b.id());
+    let first = d::transition::prepare(a, None, &resources, 0).unwrap();
+    resources.insert(plain("r"), first.resources()[0].clone());
+    let second = d::transition::prepare(b, None, &resources, 0).unwrap();
+    resources.insert(plain("r"), second.resources()[0].clone());
+    assert_eq!(resources[&plain("r")].holds().len(), 2);
+    assert_eq!(resources[&plain("r")].availability().available_down(), 2);
+    let commit = d::transition::commit(first.transaction().unwrap(), None, &resources).unwrap();
+    resources.insert(plain("r"), commit.resources()[0].clone());
+    let abort = d::transition::abort(second.transaction().unwrap(), &resources).unwrap();
+    assert_eq!(abort.resources()[0].quantity(), 6);
+    assert!(abort.resources()[0].holds().is_empty());
+}

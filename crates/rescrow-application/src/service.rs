@@ -16,9 +16,10 @@
 //! safe, because appends are still conditional, but reads here can lag their
 //! writes until this service next writes.
 use crate::{
-    Application, Error, LogStore, StoreError, View, Write,
+    Application, Error, StoreError, Write,
+    authority::TransactionalStore,
     dto::{self, Command, Output},
-    resource_in,
+    transactional::{View, resource_in},
 };
 use arc_swap::ArcSwap;
 use std::{
@@ -56,7 +57,7 @@ pub struct Service<S> {
     writer: Option<thread::JoinHandle<()>>,
     stats: Arc<Stats>,
 }
-impl<S: LogStore + Send + Sync + 'static> Service<S> {
+impl<S: TransactionalStore + Send + Sync + 'static> Service<S> {
     /// Load the store and start the writer thread.
     pub fn start(app: Application<S>) -> Result<Self, Error> {
         let view = app.view()?;
@@ -131,7 +132,7 @@ impl<S: LogStore + Send + Sync + 'static> Service<S> {
     fn write(&self, write: Result<Write, Error>) -> Result<Output, Error> {
         let (reply, response) = mpsc::sync_channel(1);
         let job = Job {
-            write: write?,
+            write: self.app.qualify(write?)?,
             reply: Some(reply),
         };
         let stopped = || Error::from(StoreError::Io("the service's writer has stopped".into()));
@@ -154,7 +155,7 @@ impl<S> Drop for Service<S> {
 /// The writer thread. It owns the latest durable state, or none after an
 /// unknown outcome, when the next batch reloads it. Until then it keeps the
 /// last known deadline.
-fn run<S: LogStore>(
+fn run<S: TransactionalStore>(
     app: &Application<S>,
     current: &ArcSwap<View>,
     stats: &Stats,

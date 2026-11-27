@@ -14,3 +14,15 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo build -p rescrow-cli --locked
       - run: cargo tree --workspace --locked
+      - name: Verify local dependency boundaries
+        run: |
+          python3 - <<'PYCODE'
+          import subprocess
+          def packages(package):
+              output = subprocess.check_output(["cargo", "tree", "-p", package, "--edges", "normal", "--locked", "--prefix", "none", "--format", "{p}"], text=True)
+              return {line.split()[0] for line in output.splitlines()}
+          local = packages("rescrow-cli")
+          assert not local & {"tokio", "axum", "proptest"}, local
+          assert not any(name.startswith("aws-") for name in local), local
+          assert packages("rescrow-domain") == {"rescrow-domain"}
+          PYCODE

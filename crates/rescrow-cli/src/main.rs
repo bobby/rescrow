@@ -161,6 +161,7 @@ fn run(cli: &Cli) -> Result<Output, Error> {
                 operations,
                 hold,
             } => Command::Prepare(Prepare {
+                namespace: None,
                 transaction_id: id.clone(),
                 operations: read_json(operations)?,
                 hold_ms: *hold,

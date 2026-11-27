@@ -1,14 +1,19 @@
-//! Synchronous use cases over an append-only log, with a validated transfer
-//! boundary, independent of adapters.
+//! Typed synchronous use cases over a transactional authority, with a validated
+//! transfer boundary independent of adapters.
+pub mod authority;
+pub mod capabilities;
 pub mod dto;
+mod log_authority;
 pub mod service;
-use dto::{Command, Output, Snapshot};
+pub mod transactional;
+use dto::{Output, Snapshot};
 use rescrow_domain::{self as d, transition};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+pub use transactional::Application;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +116,7 @@ pub enum StoreError {
     Unsupported(u32),
     Io(String),
     TooLarge,
+    RevisionExhausted,
     /// Publication may have happened. Never interpret this as a rollback.
     Unknown(String),
 }
@@ -130,6 +136,7 @@ impl std::fmt::Display for StoreError {
             }
             Self::Io(detail) => write!(f, "storage I/O failed: {detail}"),
             Self::TooLarge => f.write_str("a stored record exceeds the adapter's size limit"),
+            Self::RevisionExhausted => f.write_str("log position exhausted"),
             Self::Unknown(detail) => write!(
                 f,
                 "publication outcome uncertain: {detail}; inspect/retry the same identity and request"
@@ -148,6 +155,7 @@ impl From<StoreError> for Error {
             StoreError::Unsupported(_) => (Category::StoredState, Code::UnsupportedSchema),
             StoreError::Io(_) => (Category::Storage, Code::Io),
             StoreError::TooLarge => (Category::Storage, Code::TooLarge),
+            StoreError::RevisionExhausted => (Category::Storage, Code::RevisionExhausted),
             StoreError::Unknown(_) => (Category::UnknownOutcome, Code::UnknownOutcome),
         };
         Self {
@@ -166,7 +174,7 @@ pub enum Publication {
 }
 
 /// Schema version of checkpoints written by this Application.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Decoded storage contents. The Application validates every part: the
 /// checkpoint through `TryFrom`, and each tail entry by replaying its transition.
@@ -189,9 +197,9 @@ pub trait LogStore {
     fn initialize(&self, empty: &dto::Checkpoint) -> Result<(), StoreError>;
     fn load(&self) -> Result<Loaded, StoreError>;
     /// Append consecutive entries only if the log holds exactly
-    /// `entries[0].sequence` entries. Entries are never empty. A failure may
-    /// leave a prefix of them appended, which is the same as only the first
-    /// writes having happened; report `Unknown` whenever that is possible.
+    /// `entries[0].sequence` entries. Entries are never empty. The entire batch is one
+    /// atomic publication, including its history identity. Report `Unknown`
+    /// whenever the complete batch may have been published.
     fn append(&self, entries: &[dto::Entry]) -> Result<Publication, StoreError>;
     /// Replace the checkpoint when this one is at a later position; otherwise do nothing.
     fn checkpoint(&self, checkpoint: &dto::Checkpoint) -> Result<(), StoreError>;
@@ -200,6 +208,21 @@ pub trait LogStore {
     fn find(&self, transaction_id: &str, since_ms: u64) -> Result<Option<dto::Entry>, StoreError>;
     /// Every entry from position zero, in order.
     fn history(&self) -> Result<Vec<dto::Entry>, StoreError>;
+    /// All entries of one atomic publication, or absence. Implementations may
+    /// bound the search by the publication UUID's recording timestamp.
+    fn publication(&self, identity: &str) -> Result<Option<Vec<dto::Entry>>, StoreError> {
+        let entries: Vec<_> = self
+            .history()?
+            .into_iter()
+            .filter(|e| e.publication_id.as_deref() == Some(identity))
+            .collect();
+        Ok((!entries.is_empty()).then_some(entries))
+    }
+
+    /// Actual backend capabilities, verified by `load` at readiness.
+    fn capabilities(&self) -> capabilities::Capabilities {
+        capabilities::Capabilities::simulation()
+    }
 }
 
 /// Validate a whole-ledger snapshot, as `Application::snapshot` returns it.
@@ -213,57 +236,14 @@ pub fn validated_snapshot(snapshot: Snapshot) -> Result<d::Ledger, Error> {
 /// Validated live state at a log position, plus terminal transactions found
 /// in the tail after the checkpoint, each with its recording time.
 #[derive(Clone)]
-pub(crate) struct View {
+struct LogView {
     position: u64,
     /// When the last entry was recorded.
     recorded_at_ms: u64,
     live: d::Live,
     terminal: BTreeMap<d::Id, (u64, d::Transaction)>,
     tail: usize,
-    /// The time a new entry would be recorded: the clock, but never earlier
-    /// than the last entry.
-    now_ms: u64,
 }
-impl View {
-    /// The state after appending one entry of `changes`, recorded at `now_ms`.
-    fn advance(&mut self, changes: &transition::Changes) -> Result<(), Error> {
-        self.position = self.position.checked_add(1).ok_or_else(|| Error {
-            category: Category::Storage,
-            code: Code::RevisionExhausted,
-            message: "log position exhausted".into(),
-            transaction_id: None,
-            capacity: None,
-        })?;
-        self.live = self.live.apply(changes);
-        self.recorded_at_ms = self.now_ms;
-        self.tail += 1;
-        if let Some(tx) = changes.transaction()
-            && *tx.state() != d::State::Prepared
-        {
-            self.terminal
-                .insert(tx.request().id().clone(), (self.now_ms, tx.clone()));
-        }
-        Ok(())
-    }
-    /// A checkpoint now covers every entry. Terminal transactions it dropped
-    /// are found through the store instead.
-    fn checkpointed(&mut self) {
-        self.tail = 0;
-        self.terminal.clear();
-    }
-    pub(crate) fn live(&self) -> &d::Live {
-        &self.live
-    }
-}
-pub(crate) fn resource_in(view: &View, id: &str) -> Result<dto::Resource, Error> {
-    let id = d::Id::new(id.into()).map_err(input)?;
-    view.live
-        .resources()
-        .get(&id)
-        .map(Into::into)
-        .ok_or_else(|| Error::domain(d::Error::NotFound))
-}
-
 /// A validated write command.
 pub(crate) enum Write {
     Create(d::ResourceSpec),
@@ -302,7 +282,6 @@ impl Write {
     }
 }
 /// A write's changes, and its result once they are durable.
-type Evaluation = (transition::Changes, Result<Output, Error>);
 fn transaction_output(output: Output) -> dto::Transaction {
     match output {
         Output::Transaction(tx) => tx,
@@ -326,7 +305,6 @@ impl Default for RetryWindow {
     }
 }
 
-type Clock = Box<dyn Fn() -> u64 + Send + Sync>;
 /// Milliseconds since the Unix epoch, from the system clock.
 pub fn system_clock() -> u64 {
     SystemTime::now()
@@ -334,118 +312,16 @@ pub fn system_clock() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-/// Synchronous typed use cases shared by CLI and embedded Rust callers.
-pub struct Application<S> {
+/// Pure validation/replay of the local log representation. This is an adapter
+/// codec helper, not a second Application or business write path.
+struct LogReader<S> {
     store: S,
-    attempts: usize,
-    checkpoint_interval: usize,
-    window: RetryWindow,
-    clock: Clock,
 }
-impl<S: LogStore> Application<S> {
-    pub fn new(store: S) -> Self {
-        Self {
-            store,
-            attempts: 32,
-            checkpoint_interval: 64,
-            window: RetryWindow::default(),
-            clock: Box::new(system_clock),
-        }
+impl<S: LogStore> LogReader<S> {
+    fn new(store: S) -> Self {
+        Self { store }
     }
-    /// Write a checkpoint once at least this many entries follow the current one.
-    pub fn with_checkpoint_interval(mut self, entries: usize) -> Self {
-        self.checkpoint_interval = entries.max(1);
-        self
-    }
-    pub fn with_retry_window(mut self, window: RetryWindow) -> Self {
-        self.window = window;
-        self
-    }
-    /// Replace the source of milliseconds since the Unix epoch.
-    pub fn with_clock(mut self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
-        self.clock = Box::new(clock);
-        self
-    }
-    pub fn initialize(&self) -> Result<(), Error> {
-        self.store
-            .initialize(&checkpoint_dto(&d::Live::default(), 0, 0))?;
-        Ok(())
-    }
-    /// Transport dispatcher; Rust callers may use the specific methods below.
-    pub fn execute(&self, command: Command) -> Result<Output, Error> {
-        match command {
-            Command::CreateResource(v) => self.create_resource(v).map(Output::Resource),
-            Command::Prepare(v) => self.prepare(v).map(Output::Transaction),
-            Command::Commit(v) => self.commit(v).map(Output::Transaction),
-            Command::Abort { transaction_id } => {
-                self.abort(&transaction_id).map(Output::Transaction)
-            }
-            Command::ShowResource { resource_id } => {
-                self.resource(&resource_id).map(Output::Resource)
-            }
-            Command::ListResources => self.resources().map(Output::Resources),
-            Command::ShowTransaction { transaction_id } => {
-                self.transaction(&transaction_id).map(Output::Transaction)
-            }
-            Command::ListTransactions => self.transactions().map(Output::Transactions),
-        }
-    }
-    pub fn create_resource(&self, spec: dto::ResourceSpec) -> Result<dto::Resource, Error> {
-        match self.write(&Write::create(spec)?)? {
-            Output::Resource(resource) => Ok(resource),
-            _ => unreachable!("resource creation outputs a resource"),
-        }
-    }
-    /// Admit a frozen request; business rejections are persisted before returning an error.
-    pub fn prepare(&self, request: dto::Prepare) -> Result<dto::Transaction, Error> {
-        let id = request.transaction_id.clone();
-        Write::prepare(request)
-            .and_then(|w| self.write(&w))
-            .map(transaction_output)
-            .map_err(|e| e.with_transaction(&id))
-    }
-    /// Settle full or explicit actual usage; terminal retries must select the same actuals.
-    pub fn commit(&self, command: dto::Commit) -> Result<dto::Transaction, Error> {
-        let id = command.transaction_id.clone();
-        Write::commit(command)
-            .and_then(|w| self.write(&w))
-            .map(transaction_output)
-            .map_err(|e| e.with_transaction(&id))
-    }
-    /// Release a prepared hold. An existing committed decision conflicts.
-    pub fn abort(&self, id: &str) -> Result<dto::Transaction, Error> {
-        Write::abort(id)
-            .and_then(|w| self.write(&w))
-            .map(transaction_output)
-            .map_err(|e| e.with_transaction(id))
-    }
-    pub fn resource(&self, id: &str) -> Result<dto::Resource, Error> {
-        resource_in(&self.view()?, id)
-    }
-    pub fn resources(&self) -> Result<Vec<dto::Resource>, Error> {
-        Ok(self.snapshot()?.resources)
-    }
-    pub fn transaction(&self, id: &str) -> Result<dto::Transaction, Error> {
-        self.view()
-            .and_then(|view| self.transaction_in(&view, id))
-            .map_err(|e| e.with_transaction(id))
-    }
-    /// A transaction in `view`, or a terminal one anywhere in history.
-    pub(crate) fn transaction_in(&self, view: &View, id: &str) -> Result<dto::Transaction, Error> {
-        let transaction = d::Id::new(id.into()).map_err(input)?;
-        self.lookup(view, &transaction, 0)?
-            .as_ref()
-            .map(Into::into)
-            .ok_or_else(|| Error::domain(d::Error::NotFound))
-            .map_err(|e| e.with_transaction(id))
-    }
-    pub fn transactions(&self) -> Result<Vec<dto::Transaction>, Error> {
-        Ok(self.snapshot()?.transactions)
-    }
-    /// Validate the whole ledger and return it, with `revision` set to the log
-    /// position. Reads every entry; balances are reconstructed from history.
-    pub fn snapshot(&self) -> Result<Snapshot, Error> {
-        let view = self.view()?;
+    pub(crate) fn snapshot_at(&self, view: LogView) -> Result<Snapshot, Error> {
         let mut history = self.store.history()?;
         if (history.len() as u64) < view.position {
             return Err(corrupt("log is shorter than its checkpoint"));
@@ -512,274 +388,42 @@ impl<S: LogStore> Application<S> {
         .map_err(corrupt)?;
         Ok(Snapshot::from_ledger(&ledger, view.position))
     }
-    pub(crate) fn view(&self) -> Result<View, Error> {
+    pub(crate) fn view(&self) -> Result<LogView, StoreError> {
         let loaded = self.store.load()?;
-        let (position, recorded_at_ms, live) = live_from(loaded.checkpoint)?;
-        let mut view = View {
+        if loaded.checkpoint.schema_version != SCHEMA_VERSION {
+            return Err(StoreError::Unsupported(loaded.checkpoint.schema_version));
+        }
+        let (position, recorded_at_ms, live) =
+            live_from(loaded.checkpoint).map_err(log_authority::storage)?;
+        let mut view = LogView {
             position,
             recorded_at_ms,
             live,
             terminal: BTreeMap::new(),
             tail: loaded.tail.len(),
-            now_ms: 0,
         };
         for entry in loaded.tail {
             if entry.sequence != view.position {
-                return Err(corrupt("log sequence gap"));
+                return Err(StoreError::Corrupt("log sequence gap".into()));
             }
             if entry.recorded_at_ms < view.recorded_at_ms {
-                return Err(corrupt("log entry recorded before its predecessor"));
+                return Err(StoreError::Corrupt(
+                    "log entry recorded before its predecessor".into(),
+                ));
             }
             view.recorded_at_ms = entry.recorded_at_ms;
-            replay(&mut view, entry.record)?;
+            replay(&mut view, entry.record).map_err(log_authority::storage)?;
             view.position = view
                 .position
                 .checked_add(1)
-                .ok_or_else(|| corrupt("log position overflow"))?;
+                .ok_or(StoreError::RevisionExhausted)?;
         }
-        view.now_ms = (self.clock)().max(view.recorded_at_ms);
         Ok(view)
-    }
-    /// Admit a prepare not found in live state: its ID must be a UUIDv7 whose
-    /// time is in the retry window. Every record of a request created at `c`
-    /// is recorded no earlier than `c - skew`, so that bounds the search for it.
-    fn admit(&self, view: &View, request: &d::Request) -> Result<u64, Error> {
-        let created = uuid_v7_millis(request.id().as_str()).ok_or_else(|| {
-            Error::input("a new transaction ID must be a UUIDv7 in canonical lowercase form")
-        })?;
-        let skew = millis(self.window.skew);
-        if created < view.now_ms.saturating_sub(millis(self.window.max_age)) {
-            return Err(Error {
-                category: Category::Input,
-                code: Code::Expired,
-                message: format!(
-                    "transaction ID was created at {created} ms, older than the {:?} retry \
-                     window; an earlier attempt may have been admitted, but it can no longer \
-                     be replayed",
-                    self.window.max_age
-                ),
-                transaction_id: None,
-                capacity: None,
-            });
-        }
-        if created > view.now_ms.saturating_add(skew) {
-            return Err(Error::input(format!(
-                "transaction ID was created at {created} ms, more than {:?} ahead of the \
-                 store's clock",
-                self.window.skew
-            )));
-        }
-        Ok(created.saturating_sub(skew))
-    }
-    /// The earliest recording time a retried decision is searched from.
-    fn decided_since(&self, view: &View) -> u64 {
-        view.now_ms
-            .saturating_sub(millis(self.window.max_age))
-            .saturating_sub(millis(self.window.skew))
-    }
-    /// A prepared transaction, or the latest terminal one recorded at or after `since_ms`.
-    pub(crate) fn lookup(
-        &self,
-        view: &View,
-        id: &d::Id,
-        since_ms: u64,
-    ) -> Result<Option<d::Transaction>, Error> {
-        if let Some(tx) = view.live.prepared().get(id) {
-            return Ok(Some(tx.clone()));
-        }
-        if let Some((recorded, tx)) = view.terminal.get(id) {
-            return Ok((*recorded >= since_ms).then(|| tx.clone()));
-        }
-        let Some(entry) = self.store.find(id.as_str(), since_ms)? else {
-            return Ok(None);
-        };
-        let dto::Record::Transaction(tx) = entry.record else {
-            return Err(corrupt("terminal lookup returned a resource record"));
-        };
-        let tx = d::Transaction::try_from(tx).map_err(corrupt)?;
-        if tx.request().id() != id
-            || *tx.state() == d::State::Prepared
-            || entry.recorded_at_ms < since_ms
-        {
-            return Err(corrupt("terminal lookup returned the wrong transaction"));
-        }
-        Ok(Some(tx))
-    }
-    /// One write, evaluated against freshly loaded state and appended alone.
-    fn write(&self, write: &Write) -> Result<Output, Error> {
-        let (_, mut outputs) = self.commit_batch(self.view()?, &[write]);
-        outputs.pop().expect("one output per write")
-    }
-    /// Evaluate writes in order, each against the state the previous ones
-    /// leave, and append all their records together. A lost race reloads and
-    /// evaluates them again, so every output describes durable state. Returns
-    /// the state after the batch, or `None` if it is unknown.
-    pub(crate) fn commit_batch(
-        &self,
-        mut view: View,
-        writes: &[&Write],
-    ) -> (Option<View>, Vec<Result<Output, Error>>) {
-        for _ in 0..self.attempts {
-            view.now_ms = (self.clock)().max(view.recorded_at_ms);
-            // A lost race reloads, so evaluation can advance this state in place.
-            let mut entries = Vec::new();
-            let mut outputs = Vec::with_capacity(writes.len());
-            for write in writes {
-                outputs.push(lapse_due(&mut view, write, &mut entries).and_then(
-                    |lapsed| match write {
-                        Write::Lapse => Ok(Output::Transactions(
-                            lapsed.iter().map(Into::into).collect(),
-                        )),
-                        _ => self.evaluate(&view, write).and_then(|(changes, output)| {
-                            push(&mut view, &changes, &mut entries)?;
-                            output
-                        }),
-                    },
-                ));
-            }
-            if entries.is_empty() {
-                return (Some(view), outputs);
-            }
-            match self.store.append(&entries) {
-                Ok(Publication::Applied) => {
-                    if view.tail >= self.checkpoint_interval {
-                        // Checkpoints only shorten later replay. A failure leaves a
-                        // longer tail for the next writer, never a wrong answer.
-                        let checkpoint = checkpoint_dto(&view.live, view.position, view.now_ms);
-                        if self.store.checkpoint(&checkpoint).is_ok() {
-                            view.checkpointed();
-                        }
-                    }
-                    return (Some(view), outputs);
-                }
-                Ok(Publication::Conflict) => match self.view() {
-                    Ok(fresh) => view = fresh,
-                    Err(e) => return (None, writes.iter().map(|_| Err(e.clone())).collect()),
-                },
-                Err(e) => {
-                    let e = Error::from(e);
-                    return (None, writes.iter().map(|_| Err(e.clone())).collect());
-                }
-            }
-        }
-        let e = Error::from(StoreError::Contention);
-        (Some(view), writes.iter().map(|_| Err(e.clone())).collect())
-    }
-    /// The changes a write makes to `view` and its result. Rejections the
-    /// domain records are changes with an error result.
-    fn evaluate(&self, view: &View, write: &Write) -> Result<Evaluation, Error> {
-        match write {
-            Write::Create(spec) => {
-                let changes =
-                    transition::create(spec.clone(), view.live.resources().get(spec.id()))
-                        .map_err(Error::domain)?;
-                let next = view.live.apply(&changes);
-                let resource = (&next.resources()[spec.id()]).into();
-                Ok((changes, Ok(Output::Resource(resource))))
-            }
-            Write::Prepare(request) => {
-                let existing = match view.live.prepared().get(request.id()) {
-                    Some(prepared) => Some(prepared.clone()),
-                    None => self.lookup(view, request.id(), self.admit(view, request)?)?,
-                };
-                let changes = transition::prepare(
-                    request.clone(),
-                    existing.as_ref(),
-                    view.live.resources(),
-                    view.now_ms,
-                )
-                .map_err(Error::domain)?;
-                let tx = changes
-                    .transaction()
-                    .or(existing.as_ref())
-                    .ok_or(Error::domain(d::Error::InvalidLedger))?;
-                let output = match tx.rejection() {
-                    Some(reason) => Err(Error::rejection(reason)),
-                    None => Ok(Output::Transaction(tx.into())),
-                };
-                Ok((changes, output))
-            }
-            Write::Commit { id, actuals } => {
-                let tx = self
-                    .lookup(view, id, self.decided_since(view))?
-                    .ok_or(Error::domain(d::Error::NotFound))?;
-                let changes = transition::commit(&tx, actuals.clone(), view.live.resources())
-                    .map_err(Error::domain)?;
-                let output = changes.transaction().unwrap_or(&tx).into();
-                Ok((changes, Ok(Output::Transaction(output))))
-            }
-            Write::Abort(id) => {
-                let tx = self
-                    .lookup(view, id, self.decided_since(view))?
-                    .ok_or(Error::domain(d::Error::NotFound))?;
-                let changes =
-                    transition::abort(&tx, view.live.resources()).map_err(Error::domain)?;
-                let output = changes.transaction().unwrap_or(&tx).into();
-                Ok((changes, Ok(Output::Transaction(output))))
-            }
-            // Its lapses are all it changes, and `lapse_due` records them.
-            Write::Lapse => Ok((
-                transition::Changes::default(),
-                Ok(Output::Transactions(vec![])),
-            )),
-        }
     }
 }
 
-/// Advance `view` by a write's changes, recording them as the next entry.
-fn push(
-    view: &mut View,
-    changes: &transition::Changes,
-    entries: &mut Vec<dto::Entry>,
-) -> Result<(), Error> {
-    if changes.is_empty() {
-        return Ok(());
-    }
-    let sequence = view.position;
-    view.advance(changes)?;
-    entries.push(dto::Entry {
-        sequence,
-        recorded_at_ms: view.now_ms,
-        record: record(changes),
-    });
-    Ok(())
-}
-/// Lapse the overdue holds on the resources a write could reserve or
-/// release, recording each lapse ahead of the write, and return the lapsed
-/// transactions. Capacity returns only through these durable decisions,
-/// exactly when a write may need it. A lapse write covers every resource.
-fn lapse_due(
-    view: &mut View,
-    write: &Write,
-    entries: &mut Vec<dto::Entry>,
-) -> Result<Vec<d::Transaction>, Error> {
-    let (live, now) = (&view.live, view.now_ms);
-    let on = |request: &d::Request| {
-        live.due(request.operations().iter().map(d::Operation::resource), now)
-    };
-    let due: Vec<d::Transaction> = match write {
-        Write::Create(_) => vec![],
-        Write::Lapse => live.due(live.resources().keys(), now),
-        Write::Prepare(request) => on(request),
-        Write::Commit { id, .. } | Write::Abort(id) => live
-            .prepared()
-            .get(id)
-            .map(|tx| on(tx.request()))
-            .unwrap_or_default(),
-    }
-    .into_iter()
-    .cloned()
-    .collect();
-    let mut lapsed = Vec::with_capacity(due.len());
-    for tx in due {
-        let changes = transition::lapse(&tx, view.live.resources(), now).map_err(Error::domain)?;
-        push(view, &changes, entries)?;
-        lapsed.extend(changes.transaction().cloned());
-    }
-    Ok(lapsed)
-}
 /// Re-run the recorded transition and require that it reproduces the record.
-fn replay(view: &mut View, record: dto::Record) -> Result<(), Error> {
+fn replay(view: &mut LogView, record: dto::Record) -> Result<(), Error> {
     let changes = match record {
         dto::Record::ResourceCreated(spec) => {
             let spec = d::ResourceSpec::try_from(spec).map_err(corrupt)?;
@@ -834,12 +478,6 @@ fn replay(view: &mut View, record: dto::Record) -> Result<(), Error> {
     };
     view.live = view.live.apply(&changes);
     Ok(())
-}
-fn record(changes: &transition::Changes) -> dto::Record {
-    match changes.transaction() {
-        Some(tx) => dto::Record::Transaction(tx.into()),
-        None => dto::Record::ResourceCreated(changes.resources()[0].spec().into()),
-    }
 }
 fn live_from(checkpoint: dto::Checkpoint) -> Result<(u64, u64, d::Live), Error> {
     if checkpoint.schema_version != SCHEMA_VERSION {
@@ -912,4 +550,31 @@ fn millis(duration: Duration) -> u64 {
 }
 fn input(error: d::Error) -> Error {
     Error::input(error.to_string())
+}
+
+impl<S: LogStore + ?Sized> LogStore for &S {
+    fn initialize(&self, empty: &dto::Checkpoint) -> Result<(), StoreError> {
+        (**self).initialize(empty)
+    }
+    fn load(&self) -> Result<Loaded, StoreError> {
+        (**self).load()
+    }
+    fn append(&self, entries: &[dto::Entry]) -> Result<Publication, StoreError> {
+        (**self).append(entries)
+    }
+    fn checkpoint(&self, checkpoint: &dto::Checkpoint) -> Result<(), StoreError> {
+        (**self).checkpoint(checkpoint)
+    }
+    fn find(&self, id: &str, since: u64) -> Result<Option<dto::Entry>, StoreError> {
+        (**self).find(id, since)
+    }
+    fn history(&self) -> Result<Vec<dto::Entry>, StoreError> {
+        (**self).history()
+    }
+    fn publication(&self, identity: &str) -> Result<Option<Vec<dto::Entry>>, StoreError> {
+        (**self).publication(identity)
+    }
+    fn capabilities(&self) -> capabilities::Capabilities {
+        (**self).capabilities()
+    }
 }

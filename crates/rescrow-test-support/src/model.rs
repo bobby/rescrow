@@ -47,6 +47,7 @@ impl Command {
         match self {
             Self::Create(id, spec) => dto::Command::CreateResource(spec.dto(*id)),
             Self::Prepare(id, ops, hold) => dto::Command::Prepare(dto::Prepare {
+                namespace: None,
                 transaction_id: tx_id(*id),
                 operations: ops
                     .iter()
@@ -366,6 +367,7 @@ impl Model {
                             .flat_map(|(tid, tx)| {
                                 tx.operations.iter().filter(|op| op.resource == *id).map(
                                     move |op| dto::Hold {
+                                        namespace: None,
                                         transaction_id: tx_id(*tid),
                                         delta: op.delta.to_string(),
                                     },
