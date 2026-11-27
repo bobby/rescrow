@@ -31,6 +31,10 @@ jobs:
           RESCROW_LANGUAGE_SMOKE=1 \
           RESCROW_CONTRACT_CAPTURE="$RUNNER_TEMP/rescrow-contract-http.json" \
           cargo test --workspace --all-features --locked
+      - name: Existing CLI scenarios over HTTP
+        run: |
+          RESCROW_CLI_TEST_SERVER="$GITHUB_WORKSPACE/target/debug/rescrow-http" \
+          cargo test -p rescrow-cli --features remote --test cli --locked
       - name: Validate OpenAPI and actual HTTP contract captures
         run: python3 tools/check-contract.py "$RUNNER_TEMP/rescrow-contract-http.json"
       - run: cargo build -p rescrow-cli --locked

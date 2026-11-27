@@ -142,7 +142,9 @@ RESCROW_LANGUAGE_SMOKE=1 \
 RESCROW_REMOTE_CLI="$PWD/target/debug/rescrow" \
 RESCROW_CONTRACT_CAPTURE=/tmp/rescrow-http-contract.json \
 cargo test --workspace --all-features --locked
+RESCROW_CLI_TEST_SERVER="$PWD/target/debug/rescrow-http" \
+cargo test -p rescrow-cli --features remote --test cli --locked
 .venv-contract/bin/python tools/check-contract.py /tmp/rescrow-http-contract.json
 ```
 
-Language smokes require Python 3.11+ and Node 24+; they execute against the real memory HTTP harness. The generator uses only Python's standard library and reads the checked-in OpenAPI schemas/operations; transport implementations are reviewed separately. The [Python](clients/python/smoke.py) and [TypeScript](clients/typescript/smoke.ts) smokes also show stable-key retry usage. Generated clients require no runtime package installation. CI checks regeneration, TypeScript types, real socket conformance, remote CLI commands, lost responses, authority mismatch, scopes, quotas, lane saturation and shutdown with cancelled writes, together with the existing local safety suite.
+Language smokes require Python 3.11+ and Node 24+; they execute against the real memory HTTP harness. The generator uses only Python's standard library and reads the checked-in OpenAPI schemas/operations; transport implementations are reviewed separately. The [Python](clients/python/smoke.py) and [TypeScript](clients/typescript/smoke.ts) smokes also show stable-key retry usage. Generated clients require no runtime package installation. CI also runs the seven existing CLI scenarios against the file-backed HTTP executable, covering multi-resource partial commit/abort/replay, competing independent processes, identical retries, commit/abort races, new IDs, exact large signed values and machine errors, and hold expiration. File initialization and uninitialized-store checks remain local composition; business commands use HTTP. CI checks regeneration, TypeScript types, real socket conformance, remote CLI commands, lost responses, authority mismatch, scopes, quotas, lane saturation and shutdown with cancelled writes, together with the existing local safety suite.
