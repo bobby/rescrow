@@ -243,6 +243,19 @@ Local use is first-class and requires no cloud account or HTTP server. The first
 
 All shapes preserve escrow bounds, durable decisions, retry identity, and safe settlement/refund rules. A backend must meet the selected profile; selecting local operation cannot silently weaken an enterprise namespace.
 
+## Roadmap
+
+Server work is tracked as GitHub milestones, roughly in order. Each builds on the earlier ones, although work in M3–M5 can overlap.
+
+1. [M1 · Server foundation](https://github.com/bobby/rescrow/milestone/1): a transactional storage port, an async boundary, tenants, durability profiles, and an adapter conformance suite.
+2. [M2 · HTTP API v1](https://github.com/bobby/rescrow/milestone/2): the `/v1` resources of DESIGN.md §8, with idempotency, errors, authentication, limits, and clients.
+3. [M3 · Regional backends](https://github.com/bobby/rescrow/milestone/3): PostgreSQL/Aurora and SlateDB on S3.
+4. [M4 · Operability](https://github.com/bobby/rescrow/milestone/4): telemetry, health, configuration, releases, background work, SLOs, and scaling signals, without assuming a platform.
+5. [M5 · Hot resources and throughput](https://github.com/bobby/rescrow/milestone/5): rights shards, batching, rebalancing, and the DESIGN.md §9.3 gates.
+6. [M6 · Multi-Region on Aurora DSQL](https://github.com/bobby/rescrow/milestone/6): the enterprise profile, with regional failover and drills.
+7. [M7 · Agents and long-lived work](https://github.com/bobby/rescrow/milestone/7): renewal, execution claims, receipts, events, and hierarchical budgets.
+8. [M8 · Security, audit and GA readiness](https://github.com/bobby/rescrow/milestone/8): audit export, a formal model, restore qualification, and review.
+
 ## Contributing
 
 The following instructions apply to all contributors, human and agent, throughout this repository. Read [DESIGN.md](DESIGN.md) for the current technical proposal. Agent contributors must also read [AGENTS.md](AGENTS.md) for agent-specific instructions. Keep shared contributor guidance here and reserve AGENTS.md for instructions specific to agents.
