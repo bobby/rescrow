@@ -47,6 +47,14 @@ impl MemoryStore {
 }
 impl LogStore for MemoryStore {
     fn initialize(&self, empty: &Checkpoint) -> Result<(), StoreError> {
+        if empty.schema_version != rescrow_application::SCHEMA_VERSION {
+            return Err(StoreError::Unsupported(empty.schema_version));
+        }
+        if rescrow_application::uuid_v7_millis(&empty.authority_generation).is_none() {
+            return Err(StoreError::Corrupt(
+                "initial authority generation must be a UUIDv7".into(),
+            ));
+        }
         if empty.position != 0
             || empty.recorded_at_ms != 0
             || !empty.resources.is_empty()

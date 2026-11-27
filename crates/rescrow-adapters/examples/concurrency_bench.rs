@@ -34,6 +34,8 @@ fn app(path: &Path) -> Application<FileStore> {
 }
 fn prepare(id: &str) -> Command {
     Command::Prepare(Prepare {
+        context: Default::default(),
+        authorization: None,
         namespace: None,
         transaction_id: id.into(),
         operations: vec![Operation {

@@ -7,13 +7,30 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
 };
+#[cfg(feature = "remote")]
+mod remote;
 
 #[derive(Parser)]
 #[command(name = "rescrow", version, about = "Cooperative local escrow budgets")]
 struct Cli {
     /// The store directory; required by every command except `new-id`.
     #[arg(long)]
+    #[cfg_attr(feature = "remote", arg(conflicts_with = "endpoint"))]
     store: Option<PathBuf>,
+    /// Explicit HTTP origins; alternate endpoints require --authority-generation.
+    #[cfg(feature = "remote")]
+    #[arg(long, action = clap::ArgAction::Append)]
+    endpoint: Vec<String>,
+    /// Read the bearer token from a file (otherwise RESCROW_TOKEN).
+    #[cfg(feature = "remote")]
+    #[arg(long, requires = "endpoint")]
+    token_file: Option<PathBuf>,
+    #[cfg(feature = "remote")]
+    #[arg(long, requires = "endpoint")]
+    authority_generation: Option<String>,
+    #[cfg(feature = "remote")]
+    #[arg(long, requires = "endpoint", value_parser = ["simulation", "local", "regional", "enterprise-mr"])]
+    require_profile: Option<String>,
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -161,6 +178,8 @@ fn run(cli: &Cli) -> Result<Output, Error> {
                 operations,
                 hold,
             } => Command::Prepare(Prepare {
+                context: Default::default(),
+                authorization: None,
                 namespace: None,
                 transaction_id: id.clone(),
                 operations: read_json(operations)?,
@@ -179,6 +198,10 @@ fn run(cli: &Cli) -> Result<Output, Error> {
             },
         }),
     };
+    #[cfg(feature = "remote")]
+    if !cli.endpoint.is_empty() {
+        return remote::run(cli, command.ok_or_else(|| Error::input("remote initialization is owned by server configuration; initialize a file store locally before serving it"))?);
+    }
     let store = cli
         .store
         .as_ref()
@@ -228,7 +251,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Error> {
     if bytes.len() as u64 > MAX_RECORD_BYTES {
         return Err(Error::input("input JSON exceeds 16 MiB"));
     }
-    serde_json::from_slice(&bytes).map_err(|e| Error::input(format!("{}: {e}", path.display())))
+    rescrow_application::canonical::decode(&bytes)
 }
 fn human(output: &Output) -> String {
     match output {
@@ -299,7 +322,12 @@ fn transaction_text(t: &Transaction) -> String {
 }
 fn exit_code(error: &Error) -> u8 {
     match error.code {
-        Code::InvalidInput => 2,
+        Code::InvalidInput
+        | Code::LimitExceeded
+        | Code::MethodNotAllowed
+        | Code::UnsupportedMediaType
+        | Code::Unauthenticated
+        | Code::Forbidden => 2,
         Code::Capacity | Code::Overflow => {
             if error.category == Category::Input {
                 2
@@ -308,8 +336,8 @@ fn exit_code(error: &Error) -> u8 {
             }
         }
         Code::Conflict | Code::NotFound | Code::AlreadyInitialized | Code::Expired => 4,
-        Code::Contention => 5,
-        Code::UnknownOutcome => 7,
+        Code::Contention | Code::Throttled => 5,
+        Code::UnknownOutcome | Code::DeadlineExceeded => 7,
         _ => 6,
     }
 }

@@ -11,6 +11,17 @@ pub enum DurabilityProfile {
     Regional,
     EnterpriseMr,
 }
+impl DurabilityProfile {
+    pub fn satisfies(self, required: Self) -> bool {
+        use DurabilityProfile::*;
+        match required {
+            Simulation => true,
+            Local => self != Simulation,
+            Regional => matches!(self, Regional | EnterpriseMr),
+            EnterpriseMr => self == EnterpriseMr,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Consistency {
@@ -84,12 +95,7 @@ impl Capabilities {
                             .is_some_and(|w| !self.active_regions.contains(w))
                 }
             };
-        let meets = match required {
-            Simulation => true,
-            Local => self.durability_profile != Simulation,
-            Regional => matches!(self.durability_profile, Regional | EnterpriseMr),
-            EnterpriseMr => self.durability_profile == EnterpriseMr,
-        };
+        let meets = self.durability_profile.satisfies(required);
         if valid && meets {
             Ok(())
         } else {

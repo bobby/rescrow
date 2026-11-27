@@ -66,7 +66,7 @@ pub fn prepare(
     now_ms: u64,
 ) -> Result<Changes, Error> {
     if let Some(tx) = existing {
-        if tx.request != request {
+        if !tx.request.same_intent(&request) {
             return Err(Error::Conflict);
         }
         validate_participants(tx, resources)?;

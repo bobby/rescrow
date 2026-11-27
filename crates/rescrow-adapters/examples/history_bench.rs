@@ -23,6 +23,8 @@ fn median(mut samples: Vec<u128>) -> u128 {
 }
 fn prepare(id: &str) -> Command {
     Command::Prepare(Prepare {
+        context: Default::default(),
+        authorization: None,
         namespace: None,
         transaction_id: id.into(),
         operations: vec![Operation {

@@ -9,9 +9,34 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: python3 -m pip install -r tools/requirements-contract.txt
+      - run: npm ci --prefix clients/typescript --ignore-scripts
+      - run: npm run check --prefix clients/typescript
+      - name: Verify generated clients match OpenAPI
+        run: |
+          python3 tools/generate-clients.py
+          git diff --exit-code -- clients/python/rescrow_client.py clients/typescript/rescrow_client.ts
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo build -p rescrow-cli --features remote --locked
+      - name: Rust, socket, remote CLI, and generated client tests
+        run: |
+          RESCROW_REMOTE_CLI="$GITHUB_WORKSPACE/target/debug/rescrow" \
+          RESCROW_LANGUAGE_SMOKE=1 \
+          RESCROW_CONTRACT_CAPTURE="$RUNNER_TEMP/rescrow-contract-http.json" \
+          cargo test --workspace --all-features --locked
+      - name: Existing CLI scenarios over HTTP
+        run: |
+          RESCROW_CLI_TEST_SERVER="$GITHUB_WORKSPACE/target/debug/rescrow-http" \
+          cargo test -p rescrow-cli --features remote --test cli --locked
+      - name: Validate OpenAPI and actual HTTP contract captures
+        run: python3 tools/check-contract.py "$RUNNER_TEMP/rescrow-contract-http.json"
       - run: cargo build -p rescrow-cli --locked
       - run: cargo tree --workspace --locked
       - name: Verify local dependency boundaries
@@ -22,7 +47,7 @@ jobs:
               output = subprocess.check_output(["cargo", "tree", "-p", package, "--edges", "normal", "--locked", "--prefix", "none", "--format", "{p}"], text=True)
               return {line.split()[0] for line in output.splitlines()}
           local = packages("rescrow-cli")
-          assert not local & {"tokio", "axum", "proptest"}, local
+          assert not local & {"tokio", "axum", "reqwest", "hyper", "rescrow-http", "rescrow-client", "proptest"}, local
           assert not any(name.startswith("aws-") for name in local), local
           assert packages("rescrow-domain") == {"rescrow-domain"}
           PYCODE

@@ -279,6 +279,8 @@ fn application_preserves_replays_lapses_and_namespace_boundaries() {
         .unwrap();
     let txid = uuid_v7(1000, 42);
     let request = dto::Prepare {
+        context: Default::default(),
+        authorization: None,
         transaction_id: txid.clone(),
         namespace: None,
         operations: vec![dto::Operation {
@@ -384,6 +386,8 @@ fn unresolved_publication_is_not_retried_and_absent_resolution_fences_delayed_wr
     app.create_resource(dto::ResourceSpec::from(&spec("r")))
         .unwrap();
     let request = dto::Prepare {
+        context: Default::default(),
+        authorization: None,
         transaction_id: uuid_v7(1000, 12),
         namespace: None,
         hold_ms: None,

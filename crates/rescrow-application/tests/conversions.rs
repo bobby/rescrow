@@ -13,6 +13,8 @@ fn sample() -> Snapshot {
         .create(spec.try_into().unwrap())
         .unwrap();
     let request: d::Request = Prepare {
+        context: Default::default(),
+        authorization: None,
         namespace: None,
         transaction_id: "t".into(),
         operations: vec![Operation {
@@ -96,6 +98,8 @@ fn round_trips_every_lifecycle() {
     let rejected = prepared
         .prepare(
             Prepare {
+                context: Default::default(),
+                authorization: None,
                 namespace: None,
                 transaction_id: "reject".into(),
                 operations: vec![Operation {
@@ -172,6 +176,8 @@ fn documented_json_examples_use_the_validated_contract() {
     let operations: Vec<Operation> =
         serde_json::from_str(include_str!("../../../examples/operations.json")).unwrap();
     let request: d::Request = Prepare {
+        context: Default::default(),
+        authorization: None,
         namespace: None,
         transaction_id: "work".into(),
         operations,
@@ -197,6 +203,8 @@ fn documented_json_examples_use_the_validated_contract() {
     let credit: Vec<Operation> =
         serde_json::from_str(include_str!("../../../examples/credit.json")).unwrap();
     let _: d::Request = Prepare {
+        context: Default::default(),
+        authorization: None,
         namespace: None,
         transaction_id: "credit".into(),
         operations: credit,
@@ -222,6 +230,8 @@ fn capacity_details_are_required_and_validated() {
     let rejected = prepared
         .prepare(
             Prepare {
+                context: Default::default(),
+                authorization: None,
                 namespace: None,
                 transaction_id: "reject".into(),
                 operations: vec![Operation {
@@ -260,6 +270,8 @@ fn capacity_details_are_required_and_validated() {
 fn qualified_identities_round_trip_without_string_joining() {
     let decode = |namespace: &str| {
         let request: d::Request = Prepare {
+            context: Default::default(),
+            authorization: None,
             transaction_id: "same".into(),
             namespace: Some(namespace.into()),
             operations: vec![Operation {

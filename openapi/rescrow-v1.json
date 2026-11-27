@@ -1,0 +1,2057 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Rescrow HTTP API",
+    "version": "1.0.0",
+    "description": "M2 API. Quantities are canonical signed decimal strings; UTC timestamps are epoch milliseconds. Resources are tenant-scoped and transactions are tenant+authorized-namespace scoped. Unknown outcomes may have applied: never replace their transaction identity. Atomic memory and local file adapters only; no regional or enterprise qualification."
+  },
+  "security": [
+    {
+      "workloadBearer": []
+    }
+  ],
+  "paths": {
+    "/v1/resources": {
+      "get": {
+        "operationId": "list_resources",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/X-Request-ID"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Durability-Profile"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Authority-Generation"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          },
+          {
+            "$ref": "#/components/parameters/cursor"
+          },
+          {
+            "$ref": "#/components/parameters/prefix"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authoritative replay/decision, sampled resource, or list.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/transaction status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourcePageEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-response-schema": "ResourcePageEnvelope",
+        "x-scope": "read"
+      }
+    },
+    "/v1/resources/{id}": {
+      "get": {
+        "operationId": "get_resource",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/X-Request-ID"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Durability-Profile"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Authority-Generation"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authoritative replay/decision, sampled resource, or list.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/transaction status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-response-schema": "ResourceEnvelope",
+        "x-scope": "read"
+      },
+      "put": {
+        "operationId": "create_resource",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/X-Request-ID"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Durability-Profile"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Authority-Generation"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authoritative replay/decision, sampled resource, or list.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/transaction status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceEnvelope"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "New resource or durable preparation.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/transaction status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResourceEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-response-schema": "ResourceEnvelope",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResourceCreate"
+              }
+            }
+          }
+        },
+        "x-scope": "resource:create"
+      }
+    },
+    "/v1/transactions": {
+      "get": {
+        "operationId": "list_transactions",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/X-Request-ID"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Durability-Profile"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Authority-Generation"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          },
+          {
+            "$ref": "#/components/parameters/cursor"
+          },
+          {
+            "$ref": "#/components/parameters/prefix"
+          },
+          {
+            "$ref": "#/components/parameters/state"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authoritative replay/decision, sampled resource, or list.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/transaction status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransactionPageEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-response-schema": "TransactionPageEnvelope",
+        "x-scope": "read"
+      },
+      "post": {
+        "operationId": "prepare",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/X-Request-ID"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Durability-Profile"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Authority-Generation"
+          },
+          {
+            "$ref": "#/components/parameters/Idempotency-Key"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authoritative replay/decision, sampled resource, or list.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/transaction status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransactionEnvelope"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "New resource or durable preparation.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/transaction status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransactionEnvelope"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Exact durable matching preparation confirmed while the original operation is still pending; Location and Retry-After are present.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/transaction status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransactionEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-response-schema": "TransactionEnvelope",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Prepare"
+              }
+            }
+          }
+        },
+        "x-scope": "transaction:prepare"
+      }
+    },
+    "/v1/transactions/{id}": {
+      "get": {
+        "operationId": "get_transaction",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/X-Request-ID"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Durability-Profile"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Authority-Generation"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authoritative replay/decision, sampled resource, or list.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/transaction status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransactionEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-response-schema": "TransactionEnvelope",
+        "x-scope": "read"
+      }
+    },
+    "/v1/transactions/{id}/commit": {
+      "post": {
+        "operationId": "commit",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/X-Request-ID"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Durability-Profile"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Authority-Generation"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authoritative replay/decision, sampled resource, or list.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/transaction status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransactionEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-response-schema": "TransactionEnvelope",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Commit"
+              }
+            }
+          }
+        },
+        "x-scope": "transaction:commit"
+      }
+    },
+    "/v1/transactions/{id}/abort": {
+      "post": {
+        "operationId": "abort",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/X-Request-ID"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Durability-Profile"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Authority-Generation"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authoritative replay/decision, sampled resource, or list.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/transaction status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransactionEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-response-schema": "TransactionEnvelope",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Empty"
+              }
+            }
+          }
+        },
+        "x-scope": "transaction:abort"
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "workloadBearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "Pinned RS256, ES256 or EdDSA public keys from configured issuers/audiences. Verified exp, optional nbf, tenant, namespace, credential_id, scopes, resource grants. No token-selected key URL retrieval."
+      }
+    },
+    "parameters": {
+      "X-Request-ID": {
+        "name": "X-Request-ID",
+        "in": "header",
+        "required": false,
+        "schema": {
+          "$ref": "#/components/schemas/Id"
+        },
+        "description": "Optional validated correlation identity."
+      },
+      "Require-Durability-Profile": {
+        "name": "Require-Durability-Profile",
+        "in": "header",
+        "required": false,
+        "schema": {
+          "$ref": "#/components/schemas/Profile"
+        },
+        "description": "Minimum profile, verified against actual authority capabilities."
+      },
+      "Require-Authority-Generation": {
+        "name": "Require-Authority-Generation",
+        "in": "header",
+        "required": false,
+        "schema": {
+          "$ref": "#/components/schemas/UuidV7"
+        },
+        "description": "Expected stable authority identity. Mandatory in clients configured for alternate endpoint fallback."
+      },
+      "Idempotency-Key": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/UuidV7"
+        },
+        "description": "Generate once before the first attempt; preserve the identity and exact intent on every retry. Timestamp: 24-hour replay window, at most 5-minute future skew. Prepared requests remain replayable beyond the window."
+      },
+      "id": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "description": "Domain ID; dot-only IDs use ~Lg for . and ~Li4 for .. to avoid URL normalization. All other legal IDs use their literal URL-safe form."
+      },
+      "limit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 100
+        },
+        "description": "Page length, at most configured page_size (default 100)."
+      },
+      "cursor": {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "maxLength": 2048
+        },
+        "description": "Opaque signed keyset cursor, valid for 15 minutes and bound to authority, tenant, namespace, current policy, endpoint and filters. Lists are not a snapshot across pages."
+      },
+      "prefix": {
+        "name": "prefix",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "$ref": "#/components/schemas/Id"
+        },
+        "description": "Literal ID prefix."
+      },
+      "state": {
+        "name": "state",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "enum": [
+            "prepared",
+            "committed",
+            "aborted"
+          ]
+        },
+        "description": "Transaction state filter."
+      }
+    },
+    "schemas": {
+      "Id": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9._-]{1,128}$"
+      },
+      "UuidV7": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      },
+      "Decimal": {
+        "type": "string",
+        "pattern": "^(0|-?[1-9][0-9]*)$",
+        "maxLength": 40,
+        "description": "Canonical signed i128 decimal string. Range -170141183460469231731687303715884105728 through 170141183460469231731687303715884105727. Reservations cannot be zero or the signed minimum; actuals may be zero. No float conversion."
+      },
+      "TimestampMs": {
+        "type": "integer",
+        "minimum": 0,
+        "format": "int64",
+        "description": "Milliseconds since Unix epoch, UTC. No second timestamp representation."
+      },
+      "Digest": {
+        "type": "string",
+        "pattern": "^sha256:[0-9a-f]{64}$"
+      },
+      "Fingerprint": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      },
+      "Profile": {
+        "type": "string",
+        "enum": [
+          "simulation",
+          "local",
+          "regional",
+          "enterprise-mr"
+        ]
+      },
+      "Operation": {
+        "type": "object",
+        "properties": {
+          "operation_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "resource_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "delta": {
+            "$ref": "#/components/schemas/Decimal"
+          }
+        },
+        "required": [
+          "operation_id",
+          "resource_id",
+          "delta"
+        ],
+        "additionalProperties": false
+      },
+      "Actual": {
+        "type": "object",
+        "properties": {
+          "operation_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "delta": {
+            "$ref": "#/components/schemas/Decimal"
+          }
+        },
+        "required": [
+          "operation_id",
+          "delta"
+        ],
+        "additionalProperties": false
+      },
+      "Context": {
+        "type": "object",
+        "maxProperties": 32,
+        "propertyNames": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]{1,64}$"
+        },
+        "additionalProperties": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "description": "At most 4096 UTF-8 bytes across keys and values; each value at most 1024 UTF-8 bytes. Duplicate JSON object keys are rejected recursively."
+      },
+      "Prepare": {
+        "type": "object",
+        "properties": {
+          "operations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Operation"
+            },
+            "minItems": 1,
+            "maxItems": 1024
+          },
+          "hold_ms": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2592000000
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "context": {
+            "$ref": "#/components/schemas/Context"
+          },
+          "namespace": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "operations"
+        ],
+        "additionalProperties": false,
+        "description": "UUIDv7 is supplied in Idempotency-Key. Tenant and namespace are selected solely by verified credentials; namespace is an optional equality assertion. Configured participant limit defaults to 64 (supported ceiling 1024). Hold omission/null means no automatic lapse; context omission means empty."
+      },
+      "Commit": {
+        "type": "object",
+        "properties": {
+          "actuals": {
+            "anyOf": [
+              {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Actual"
+                },
+                "minItems": 1,
+                "maxItems": 1024
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [],
+        "additionalProperties": false,
+        "description": "Omitted/null actuals commits the entire reservation. Otherwise every operation appears exactly once, same direction and at most reserved magnitude. A retry must agree with the existing actuals."
+      },
+      "Empty": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "ResourceCreate": {
+        "type": "object",
+        "properties": {
+          "lower": {
+            "$ref": "#/components/schemas/Decimal"
+          },
+          "upper": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Decimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "initial": {
+            "$ref": "#/components/schemas/Decimal"
+          },
+          "unit": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "scale": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 38
+          }
+        },
+        "required": [
+          "lower",
+          "upper",
+          "initial",
+          "unit",
+          "scale"
+        ],
+        "additionalProperties": false
+      },
+      "ResourceSpec": {
+        "type": "object",
+        "properties": {
+          "resource_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "lower": {
+            "$ref": "#/components/schemas/Decimal"
+          },
+          "upper": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Decimal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "initial": {
+            "$ref": "#/components/schemas/Decimal"
+          },
+          "unit": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "scale": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 38
+          }
+        },
+        "required": [
+          "resource_id",
+          "lower",
+          "upper",
+          "initial",
+          "unit",
+          "scale"
+        ],
+        "additionalProperties": false
+      },
+      "AuthorizationFacts": {
+        "type": "object",
+        "properties": {
+          "principal_id": {
+            "$ref": "#/components/schemas/Fingerprint"
+          },
+          "credential_id": {
+            "$ref": "#/components/schemas/Fingerprint"
+          },
+          "policy_digest": {
+            "$ref": "#/components/schemas/Fingerprint"
+          }
+        },
+        "required": [
+          "principal_id",
+          "credential_id",
+          "policy_digest"
+        ],
+        "additionalProperties": false
+      },
+      "Request": {
+        "type": "object",
+        "properties": {
+          "transaction_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "namespace": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "operations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Operation"
+            },
+            "minItems": 1
+          },
+          "hold_ms": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 2592000000
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "context": {
+            "$ref": "#/components/schemas/Context"
+          },
+          "authorization": {
+            "$ref": "#/components/schemas/AuthorizationFacts"
+          }
+        },
+        "required": [
+          "transaction_id",
+          "operations",
+          "hold_ms"
+        ],
+        "additionalProperties": false
+      },
+      "Hold": {
+        "type": "object",
+        "properties": {
+          "transaction_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "delta": {
+            "$ref": "#/components/schemas/Decimal"
+          },
+          "namespace": {
+            "$ref": "#/components/schemas/Id"
+          }
+        },
+        "required": [
+          "transaction_id",
+          "delta"
+        ],
+        "additionalProperties": false
+      },
+      "Capacity": {
+        "type": "object",
+        "properties": {
+          "resource_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "requested_delta": {
+            "$ref": "#/components/schemas/Decimal"
+          },
+          "available": {
+            "$ref": "#/components/schemas/Decimal"
+          }
+        },
+        "required": [
+          "resource_id",
+          "requested_delta",
+          "available"
+        ],
+        "additionalProperties": false
+      },
+      "AbortReason": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "const": "requested"
+              }
+            },
+            "required": [
+              "reason"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "const": "lapsed"
+              }
+            },
+            "required": [
+              "reason"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "reason": {
+                "const": "rejected"
+              },
+              "rejection": {
+                "type": "string",
+                "enum": [
+                  "capacity",
+                  "overflow",
+                  "not_found"
+                ]
+              }
+            },
+            "required": [
+              "reason",
+              "rejection"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "State": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "prepared"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "committed"
+              },
+              "actuals": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Actual"
+                },
+                "minItems": 1
+              }
+            },
+            "required": [
+              "status",
+              "actuals"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "status": {
+                "const": "aborted"
+              },
+              "cause": {
+                "$ref": "#/components/schemas/AbortReason"
+              },
+              "capacity": {
+                "$ref": "#/components/schemas/Capacity"
+              }
+            },
+            "required": [
+              "status",
+              "cause"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "TransactionRecord": {
+        "type": "object",
+        "properties": {
+          "request": {
+            "$ref": "#/components/schemas/Request"
+          },
+          "expires_at_ms": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TimestampMs"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/State"
+          }
+        },
+        "required": [
+          "request",
+          "expires_at_ms",
+          "state"
+        ],
+        "additionalProperties": false
+      },
+      "Transaction": {
+        "type": "object",
+        "properties": {
+          "transaction": {
+            "$ref": "#/components/schemas/TransactionRecord"
+          },
+          "request_digest": {
+            "$ref": "#/components/schemas/Digest"
+          },
+          "actuals_digest": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Digest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "consistency": {
+            "const": "authoritative"
+          },
+          "materialization": {
+            "const": "complete"
+          },
+          "processing": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "transaction",
+          "request_digest",
+          "actuals_digest",
+          "consistency",
+          "materialization",
+          "processing"
+        ],
+        "additionalProperties": false,
+        "description": "Status is authoritative at observation. Atomic adapters materialize all participants in the same publication; complete is the only current materialization state. 202 requires read-only proof of an exact durable preparation after an in-flight request times out; processing is true. GET/replay normally has processing=false. Never authorizes external work by itself."
+      },
+      "Observation": {
+        "type": "object",
+        "properties": {
+          "consistency": {
+            "const": "sampled"
+          },
+          "observed_from_ms": {
+            "$ref": "#/components/schemas/TimestampMs"
+          },
+          "observed_until_ms": {
+            "$ref": "#/components/schemas/TimestampMs"
+          },
+          "quantity": {
+            "$ref": "#/components/schemas/Decimal"
+          },
+          "holds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Hold"
+            }
+          },
+          "reserved_down": {
+            "$ref": "#/components/schemas/Decimal"
+          },
+          "reserved_up": {
+            "$ref": "#/components/schemas/Decimal"
+          },
+          "available_down": {
+            "$ref": "#/components/schemas/Decimal"
+          },
+          "available_up": {
+            "$ref": "#/components/schemas/Decimal"
+          },
+          "finalization_pending": {
+            "const": false
+          }
+        },
+        "required": [
+          "consistency",
+          "observed_from_ms",
+          "observed_until_ms",
+          "quantity",
+          "holds",
+          "reserved_down",
+          "reserved_up",
+          "available_down",
+          "available_up",
+          "finalization_pending"
+        ],
+        "additionalProperties": false,
+        "description": "Read-only sample, not a reservation or a cross-request snapshot. A later reservation can consume displayed availability. Overdue holds remain visible until a write lapses them."
+      },
+      "Resource": {
+        "type": "object",
+        "properties": {
+          "spec": {
+            "$ref": "#/components/schemas/ResourceSpec"
+          },
+          "observation": {
+            "$ref": "#/components/schemas/Observation"
+          }
+        },
+        "required": [
+          "spec",
+          "observation"
+        ],
+        "additionalProperties": false
+      },
+      "Metadata": {
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "serving_region": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "deployment_cell": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "authority_generation": {
+            "$ref": "#/components/schemas/UuidV7"
+          },
+          "durability_profile": {
+            "$ref": "#/components/schemas/Profile"
+          }
+        },
+        "required": [
+          "request_id",
+          "serving_region",
+          "deployment_cell",
+          "authority_generation",
+          "durability_profile"
+        ],
+        "additionalProperties": false
+      },
+      "Links": {
+        "type": "object",
+        "required": [
+          "self"
+        ],
+        "properties": {
+          "self": {
+            "type": "string"
+          },
+          "commit": {
+            "type": "string"
+          },
+          "abort": {
+            "type": "string"
+          },
+          "next": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "description": "Relative links on the same configured origin; never infer new endpoint hosts from response links."
+      },
+      "ResourcePage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Resource"
+            }
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2048
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "additionalProperties": false
+      },
+      "ResourceEnvelope": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Resource"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Metadata"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          }
+        },
+        "required": [
+          "data",
+          "metadata",
+          "links"
+        ],
+        "additionalProperties": false
+      },
+      "ResourcePageEnvelope": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ResourcePage"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Metadata"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          }
+        },
+        "required": [
+          "data",
+          "metadata",
+          "links"
+        ],
+        "additionalProperties": false
+      },
+      "TransactionPage": {
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Transaction"
+            }
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2048
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor"
+        ],
+        "additionalProperties": false
+      },
+      "TransactionEnvelope": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Transaction"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Metadata"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          }
+        },
+        "required": [
+          "data",
+          "metadata",
+          "links"
+        ],
+        "additionalProperties": false
+      },
+      "TransactionPageEnvelope": {
+        "type": "object",
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/TransactionPage"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Metadata"
+          },
+          "links": {
+            "$ref": "#/components/schemas/Links"
+          }
+        },
+        "required": [
+          "data",
+          "metadata",
+          "links"
+        ],
+        "additionalProperties": false
+      },
+      "Problem": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "pattern": "^urn:rescrow:problem:[a-z_]+$"
+          },
+          "code": {
+            "type": "string",
+            "enum": [
+              "unauthenticated",
+              "forbidden",
+              "not_found",
+              "method_not_allowed",
+              "unsupported_media_type",
+              "conflict",
+              "capacity",
+              "already_initialized",
+              "invalid_input",
+              "overflow",
+              "too_large",
+              "limit_exceeded",
+              "expired",
+              "throttled",
+              "contention",
+              "io",
+              "unknown_outcome",
+              "deadline_exceeded",
+              "corrupt_state",
+              "unsupported_schema",
+              "missing_store",
+              "revision_exhausted"
+            ]
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "input",
+              "domain",
+              "stored_state",
+              "storage",
+              "unknown_outcome",
+              "authentication",
+              "authorization",
+              "admission"
+            ]
+          },
+          "status": {
+            "type": "integer",
+            "minimum": 0,
+            "enum": [
+              401,
+              403,
+              404,
+              405,
+              409,
+              415,
+              422,
+              429,
+              503
+            ]
+          },
+          "detail": {
+            "type": "string",
+            "maxLength": 1025
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "transaction_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "retryable": {
+            "type": "boolean"
+          },
+          "capacity": {
+            "$ref": "#/components/schemas/Capacity"
+          }
+        },
+        "required": [
+          "type",
+          "code",
+          "category",
+          "status",
+          "detail",
+          "request_id",
+          "transaction_id",
+          "retryable"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "responses": {
+      "Problem": {
+        "description": "Typed Application problem. Unknown/deadline outcomes may have been applied; retain the same identity, intent and actuals. Retry-After on retryable problems; WWW-Authenticate on 401. Other-tenant absence returns 404.",
+        "headers": {
+          "X-Request-ID": {
+            "schema": {
+              "$ref": "#/components/schemas/Id"
+            },
+            "description": "Response correlation ID."
+          },
+          "Durability-Profile": {
+            "schema": {
+              "$ref": "#/components/schemas/Profile"
+            },
+            "description": "Actual authority durability profile."
+          },
+          "Authority-Generation": {
+            "schema": {
+              "$ref": "#/components/schemas/UuidV7"
+            },
+            "description": "Stable initialized authority identity; changes when authority is replaced."
+          },
+          "Retry-After": {
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "description": "Integer seconds before retry of identical request."
+          }
+        },
+        "content": {
+          "application/problem+json": {
+            "schema": {
+              "$ref": "#/components/schemas/Problem"
+            }
+          }
+        }
+      }
+    }
+  },
+  "x-problem-codes": {
+    "unauthenticated": {
+      "status": 401,
+      "type": "urn:rescrow:problem:unauthenticated",
+      "retryable": false
+    },
+    "forbidden": {
+      "status": 403,
+      "type": "urn:rescrow:problem:forbidden",
+      "retryable": false
+    },
+    "not_found": {
+      "status": 404,
+      "type": "urn:rescrow:problem:not_found",
+      "retryable": false
+    },
+    "method_not_allowed": {
+      "status": 405,
+      "type": "urn:rescrow:problem:method_not_allowed",
+      "retryable": false
+    },
+    "unsupported_media_type": {
+      "status": 415,
+      "type": "urn:rescrow:problem:unsupported_media_type",
+      "retryable": false
+    },
+    "conflict": {
+      "status": 409,
+      "type": "urn:rescrow:problem:conflict",
+      "retryable": false
+    },
+    "capacity": {
+      "status": 409,
+      "type": "urn:rescrow:problem:capacity",
+      "retryable": false
+    },
+    "already_initialized": {
+      "status": 409,
+      "type": "urn:rescrow:problem:already_initialized",
+      "retryable": false
+    },
+    "invalid_input": {
+      "status": 422,
+      "type": "urn:rescrow:problem:invalid_input",
+      "retryable": false
+    },
+    "overflow": {
+      "status": 422,
+      "type": "urn:rescrow:problem:overflow",
+      "retryable": false
+    },
+    "too_large": {
+      "status": 422,
+      "type": "urn:rescrow:problem:too_large",
+      "retryable": false
+    },
+    "limit_exceeded": {
+      "status": 422,
+      "type": "urn:rescrow:problem:limit_exceeded",
+      "retryable": false
+    },
+    "expired": {
+      "status": 422,
+      "type": "urn:rescrow:problem:expired",
+      "retryable": false
+    },
+    "throttled": {
+      "status": 429,
+      "type": "urn:rescrow:problem:throttled",
+      "retryable": true
+    },
+    "contention": {
+      "status": 503,
+      "type": "urn:rescrow:problem:contention",
+      "retryable": true
+    },
+    "io": {
+      "status": 503,
+      "type": "urn:rescrow:problem:io",
+      "retryable": true
+    },
+    "unknown_outcome": {
+      "status": 503,
+      "type": "urn:rescrow:problem:unknown_outcome",
+      "retryable": true
+    },
+    "deadline_exceeded": {
+      "status": 503,
+      "type": "urn:rescrow:problem:deadline_exceeded",
+      "retryable": true
+    },
+    "corrupt_state": {
+      "status": 503,
+      "type": "urn:rescrow:problem:corrupt_state",
+      "retryable": false
+    },
+    "unsupported_schema": {
+      "status": 503,
+      "type": "urn:rescrow:problem:unsupported_schema",
+      "retryable": false
+    },
+    "missing_store": {
+      "status": 503,
+      "type": "urn:rescrow:problem:missing_store",
+      "retryable": false
+    },
+    "revision_exhausted": {
+      "status": 503,
+      "type": "urn:rescrow:problem:revision_exhausted",
+      "retryable": false
+    }
+  }
+}

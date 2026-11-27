@@ -1,6 +1,8 @@
 #![cfg(target_os = "linux")]
+mod support;
 use rescrow_application::dto::*;
 use std::{
+    cell::RefCell,
     fs,
     path::PathBuf,
     process::{Child, Command as Process, Output as ProcessOutput},
@@ -22,6 +24,8 @@ fn tx(name: &str) -> String {
 }
 struct Case {
     root: PathBuf,
+    http_binary: Option<PathBuf>,
+    remote: RefCell<Option<support::RemoteServer>>,
 }
 impl Case {
     fn new() -> Self {
@@ -34,14 +38,47 @@ impl Case {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
         fs::create_dir(&root).unwrap();
-        Self { root }
+        let http_binary = std::env::var_os("RESCROW_CLI_TEST_SERVER").map(PathBuf::from);
+        assert!(
+            http_binary.is_none() || cfg!(feature = "remote"),
+            "HTTP scenarios require the CLI remote feature"
+        );
+        Self {
+            root,
+            http_binary,
+            remote: RefCell::new(None),
+        }
     }
     fn process(&self, args: &[&str]) -> Process {
+        self.command(args, true)
+    }
+    fn command(&self, args: &[&str], json: bool) -> Process {
         let mut p = Process::new(env!("CARGO_BIN_EXE_rescrow"));
-        p.arg("--store")
-            .arg(self.root.join("store"))
-            .arg("--json")
-            .args(args);
+        // File initialization/readiness checks belong to local composition.
+        // Every business operation on the initialized store uses HTTP when
+        // this same scenario suite is run with RESCROW_CLI_TEST_SERVER.
+        if let Some(binary) = &self.http_binary
+            && args != ["init"]
+            && self.root.join("store/live.json").exists()
+        {
+            let mut remote = self.remote.borrow_mut();
+            let server =
+                remote.get_or_insert_with(|| support::RemoteServer::start(binary, &self.root));
+            p.arg("--endpoint")
+                .arg(&server.endpoint)
+                .arg("--token-file")
+                .arg(self.root.join(".rescrow-http-dev/token"))
+                .arg("--authority-generation")
+                .arg(&server.generation)
+                .arg("--require-profile")
+                .arg("local");
+        } else {
+            p.arg("--store").arg(self.root.join("store"));
+        }
+        if json {
+            p.arg("--json");
+        }
+        p.args(args);
         p
     }
     fn run(&self, args: &[&str]) -> ProcessOutput {
@@ -106,6 +143,7 @@ impl Case {
 }
 impl Drop for Case {
     fn drop(&mut self) {
+        drop(self.remote.get_mut().take());
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -353,10 +391,8 @@ fn machine_errors_invalid_inputs_and_exact_large_signed_values() {
     );
     assert_eq!(c.snapshot().transactions.len(), 1);
     assert_eq!(c.run(&["init"]).status.code(), Some(4));
-    let human = Process::new(env!("CARGO_BIN_EXE_rescrow"))
-        .arg("--store")
-        .arg(c.root.join("store"))
-        .args(["resource", "show", "large"])
+    let human = c
+        .command(&["resource", "show", "large"], false)
         .output()
         .unwrap();
     assert!(human.status.success());

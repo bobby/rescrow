@@ -51,6 +51,8 @@ pub fn tenancy<S: TransactionalStore + Readiness + Clone>(store: S) {
     };
     let id = uuid_v7(crate::model::created(), 123);
     let request = dto::Prepare {
+        context: Default::default(),
+        authorization: None,
         transaction_id: id.clone(),
         namespace: None,
         hold_ms: None,

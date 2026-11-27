@@ -35,6 +35,8 @@ fn prepare(name: &str, delta: &str) -> Command {
 }
 fn prepare_raw(transaction_id: &str, delta: &str) -> Command {
     Command::Prepare(Prepare {
+        context: Default::default(),
+        authorization: None,
         namespace: None,
         transaction_id: transaction_id.into(),
         operations: vec![Operation {
@@ -240,6 +242,7 @@ fn checkpoint_of(store: &MemoryStore) -> Checkpoint {
     let snapshot = snapshot(store);
     Checkpoint {
         schema_version: rescrow_application::SCHEMA_VERSION,
+        authority_generation: store.raw().0.unwrap().authority_generation,
         position: snapshot.revision,
         recorded_at_ms: store.raw().1.last().map_or(0, |e| e.recorded_at_ms),
         resources: snapshot.resources,
@@ -334,6 +337,8 @@ fn missing_resource_rejection_remains_terminal_after_resource_creation() {
 fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
     let (store, app) = ready();
     app.prepare(Prepare {
+        context: Default::default(),
+        authorization: None,
         namespace: None,
         transaction_id: id("held"),
         operations: vec![Operation {
@@ -345,6 +350,8 @@ fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
     })
     .unwrap();
     let request = Prepare {
+        context: Default::default(),
+        authorization: None,
         namespace: None,
         transaction_id: id("rejected"),
         operations: vec![Operation {

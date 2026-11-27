@@ -18,6 +18,9 @@ struct Gated {
     panic_after: Arc<AtomicBool>,
 }
 impl TransactionalStore for Gated {
+    fn identity(&self) -> Result<String, StoreError> {
+        self.inner.identity()
+    }
     fn initialize(&self) -> Result<(), StoreError> {
         self.inner.initialize()
     }
@@ -151,6 +154,8 @@ async fn an_unknown_task_delivery_keeps_the_original_transaction_identity() {
     let server = Server::start(app, DurabilityProfile::Simulation, 1).unwrap();
     let id = uuid_v7(system_clock(), 77);
     let command = dto::Command::Prepare(dto::Prepare {
+        context: Default::default(),
+        authorization: None,
         transaction_id: id.clone(),
         namespace: None,
         hold_ms: None,

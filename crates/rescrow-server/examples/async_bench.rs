@@ -49,6 +49,8 @@ async fn main() {
                         let resource = format!("r{}", if shared { 0 } else { client });
                         let commands = [
                             dto::Command::Prepare(dto::Prepare {
+                                context: Default::default(),
+                                authorization: None,
                                 transaction_id: id.clone(),
                                 namespace: None,
                                 operations: vec![dto::Operation {

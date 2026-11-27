@@ -86,6 +86,7 @@ pub enum RecordKey {
     /// A domain identity carries the authorized namespace and opaque ID as
     /// separate validated values. The same ID in two namespaces is distinct.
     Transaction(d::Id),
+    Pending,
 }
 impl RecordKey {
     pub fn resource(id: &str) -> Result<Self, crate::Error> {
@@ -102,6 +103,7 @@ pub struct Version(pub Vec<u8>);
 pub enum Value {
     Resource(dto::Resource),
     Transaction(dto::Transaction),
+    Pending(dto::Pending),
 }
 impl Value {
     /// Validate every decoded record before exposing it to domain operations,
@@ -115,6 +117,10 @@ impl Value {
             (RecordKey::Transaction(id), Self::Transaction(value)) => {
                 let tx = d::Transaction::try_from(value.clone()).map_err(invalid)?;
                 tx.request().id() == id
+            }
+            (RecordKey::Pending, Self::Pending(value)) => {
+                d::access::Pending::try_from(value.clone()).map_err(invalid)?;
+                true
             }
             _ => false,
         };
@@ -265,6 +271,55 @@ impl Commit {
                 record,
             });
         }
+        // Quota is derived from these same transaction transitions, never a
+        // second publication or a process-local admission counter.
+        let mut pending = None;
+        let mut transactions: BTreeMap<d::Id, d::Transaction> = BTreeMap::new();
+        for (_, change) in changes {
+            if let Some(tx) = change.transaction() {
+                if tx.request().authorization().is_some() {
+                    if pending.is_none() {
+                        pending = Some(match observed.records.get(&RecordKey::Pending) {
+                            Some(Some(Versioned {
+                                value: Value::Pending(v),
+                                ..
+                            })) => d::access::Pending::try_from(v.clone()).map_err(invalid)?,
+                            Some(None) => d::access::Pending::default(),
+                            _ => {
+                                return Err(invalid(
+                                    "authenticated transition has no pending-counter read",
+                                ));
+                            }
+                        });
+                    }
+                    let previous = match transactions.get(tx.request().id()) {
+                        Some(previous) => Some(previous.clone()),
+                        None => match observed
+                            .records
+                            .get(&RecordKey::Transaction(tx.request().id().clone()))
+                            .and_then(|v| v.as_ref())
+                        {
+                            Some(Versioned {
+                                value: Value::Transaction(v),
+                                ..
+                            }) => Some(d::Transaction::try_from(v.clone()).map_err(invalid)?),
+                            _ => None,
+                        },
+                    };
+                    pending = Some(
+                        pending
+                            .as_ref()
+                            .unwrap()
+                            .apply(previous.as_ref(), tx)
+                            .map_err(invalid)?,
+                    );
+                }
+                transactions.insert(tx.request().id().clone(), tx.clone());
+            }
+        }
+        if let Some(pending) = pending {
+            replacements.insert(RecordKey::Pending, Value::Pending((&pending).into()));
+        }
         if records.is_empty() {
             return Err(invalid("empty publication"));
         }
@@ -345,6 +400,9 @@ pub enum Resolution {
 /// acknowledge durability of observed writes. Terminal lookups may omit records
 /// older than `terminal_since_ms`; prepared transactions are never omitted.
 pub trait TransactionalStore {
+    /// Stable identity of this actual authority, shared by every frontend and
+    /// retained across reopen. Distinct empty authorities must not share it.
+    fn identity(&self) -> Result<String, StoreError>;
     fn initialize(&self) -> Result<(), StoreError>;
     fn read(
         &self,

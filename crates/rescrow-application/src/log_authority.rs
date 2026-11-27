@@ -37,6 +37,7 @@ fn empty() -> Read {
 fn key_supported(key: &RecordKey) -> bool {
     match key {
         RecordKey::Resource(id) | RecordKey::Transaction(id) => id.namespace().is_none(),
+        RecordKey::Pending => true,
     }
 }
 fn receipt(history: &HistoryRecord, position: u64) -> Result<Receipt, StoreError> {
@@ -55,6 +56,9 @@ fn receipt(history: &HistoryRecord, position: u64) -> Result<Receipt, StoreError
                     .try_into()
                     .map_err(|e: rescrow_domain::Error| StoreError::Corrupt(e.to_string()))?;
                 put(RecordKey::Transaction(tx.request().id().clone()));
+                if tx.request().authorization().is_some() {
+                    put(RecordKey::Pending);
+                }
                 if !matches!(
                     tx.state(),
                     rescrow_domain::State::Aborted(rescrow_domain::AbortReason::Rejected(_))
@@ -111,10 +115,18 @@ fn histories(entries: Vec<dto::Entry>) -> Result<Vec<(HistoryRecord, u64)>, Stor
     Ok(result)
 }
 impl<S: LogStore> TransactionalStore for S {
+    fn identity(&self) -> Result<String, StoreError> {
+        Ok(LogReader::new(self).view()?.authority_generation)
+    }
     fn initialize(&self) -> Result<(), StoreError> {
         LogStore::initialize(
             self,
-            &crate::checkpoint_dto(&rescrow_domain::Live::default(), 0, 0),
+            &crate::checkpoint_dto(
+                &rescrow_domain::Live::default(),
+                0,
+                0,
+                &crate::new_id().map_err(storage)?,
+            ),
         )
     }
     fn read(
@@ -134,6 +146,13 @@ impl<S: LogStore> TransactionalStore for S {
         let mut records = BTreeMap::new();
         for key in keys {
             let (value, recorded_at_ms) = match key {
+                RecordKey::Pending => {
+                    let pending = rescrow_domain::access::Pending::from_prepared(
+                        view.live.prepared().values(),
+                    )
+                    .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+                    (Some(Value::Pending((&pending).into())), view.recorded_at_ms)
+                }
                 _ if !key_supported(key) => (None, view.recorded_at_ms),
                 RecordKey::Resource(id) => (
                     view.live
@@ -201,6 +220,16 @@ impl<S: LogStore> TransactionalStore for S {
         let snapshot = reader.snapshot_at(view.clone()).map_err(storage)?;
         let history = histories(entries)?;
         let mut records = BTreeMap::new();
+        let pending = rescrow_domain::access::Pending::from_prepared(view.live.prepared().values())
+            .map_err(|e| StoreError::Corrupt(e.to_string()))?;
+        records.insert(
+            RecordKey::Pending,
+            Some(Versioned {
+                version: version(view.position),
+                recorded_at_ms: view.recorded_at_ms,
+                value: Value::Pending((&pending).into()),
+            }),
+        );
         for r in snapshot.resources {
             let key = RecordKey::resource(&r.spec.resource_id)
                 .map_err(|e| StoreError::Corrupt(e.to_string()))?;
@@ -320,7 +349,12 @@ impl<S: LogStore> TransactionalStore for S {
         if view.tail >= minimum_entries {
             LogStore::checkpoint(
                 self,
-                &crate::checkpoint_dto(&view.live, view.position, view.recorded_at_ms),
+                &crate::checkpoint_dto(
+                    &view.live,
+                    view.position,
+                    view.recorded_at_ms,
+                    &view.authority_generation,
+                ),
             )?;
         }
         Ok(())
