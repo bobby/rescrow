@@ -39,8 +39,8 @@ try {
   if (!(error instanceof ProblemError) || error.problem.code !== "conflict")
     throw error;
 }
-if (!(await client.list_transactions()).data.items.length)
-  throw new Error("Missing transactions");
+if (!(await client.list_reservations()).data.items.length)
+  throw new Error("Missing reservations");
 console.log(
   "TypeScript lifecycle, stable key, partial settlement and conflict passed",
 );

@@ -61,8 +61,8 @@ pub fn workload(case: u8) -> (Vec<Command>, Vec<Vec<Command>>) {
     }
     let partial = Some(vec![(0, sign), (1, 0)]);
     let read = match case % 3 {
-        0 => Command::Transaction(0),
-        1 => Command::Transactions,
+        0 => Command::Reservation(0),
+        1 => Command::Reservations,
         _ => Command::Resource(0),
     };
     let clients = vec![

@@ -12,11 +12,11 @@ use serde::{Deserialize, Serialize};
 pub enum Action {
     #[serde(rename = "resource:create")]
     Create,
-    #[serde(rename = "transaction:prepare")]
+    #[serde(rename = "reservation:prepare")]
     Prepare,
-    #[serde(rename = "transaction:commit")]
+    #[serde(rename = "reservation:commit")]
     Commit,
-    #[serde(rename = "transaction:abort")]
+    #[serde(rename = "reservation:abort")]
     Abort,
     #[serde(rename = "read")]
     Read,

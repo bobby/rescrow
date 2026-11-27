@@ -6,7 +6,7 @@ use axum::{
     http::{HeaderMap, Method, Request, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use rescrow_application::{
     Application, Category, Code, Error,
@@ -84,11 +84,12 @@ impl<S: TransactionalStore + Readiness + Send + Sync + 'static> Api<S> {
         };
         let router=Router::new()
             .route("/v1/resources",get(dispatch::<S>))
-            .route("/v1/resources/{id}",get(dispatch::<S>).put(dispatch::<S>))
-            .route("/v1/transactions",get(dispatch::<S>).post(dispatch::<S>))
-            .route("/v1/transactions/{id}",get(dispatch::<S>))
-            .route("/v1/transactions/{id}/commit",post(dispatch::<S>))
-            .route("/v1/transactions/{id}/abort",post(dispatch::<S>))
+            .route("/v1/resources/{id}",get(dispatch::<S>))
+            .route("/admin/v1/resources/{id}",put(dispatch::<S>))
+            .route("/v1/reservations",get(dispatch::<S>).post(dispatch::<S>))
+            .route("/v1/reservations/{id}",get(dispatch::<S>))
+            .route("/v1/reservations/{id}/commit",post(dispatch::<S>))
+            .route("/v1/reservations/{id}/abort",post(dispatch::<S>))
             .fallback(not_found::<S>)
             .method_not_allowed_fallback(method_not_allowed::<S>)
             .layer(tower_http::trace::TraceLayer::new_for_http().make_span_with(|request:&Request<Body>| {
@@ -174,7 +175,7 @@ fn profile(headers: &HeaderMap, default: DurabilityProfile) -> Result<Durability
     }
 }
 fn hint(parts: &axum::http::request::Parts) -> Option<String> {
-    if parts.method == Method::POST && parts.uri.path() == "/v1/transactions" {
+    if parts.method == Method::POST && parts.uri.path() == "/v1/reservations" {
         return parts
             .headers
             .get("idempotency-key")
@@ -183,7 +184,7 @@ fn hint(parts: &axum::http::request::Parts) -> Option<String> {
             .map(str::to_owned);
     }
     let segments: Vec<_> = parts.uri.path().split('/').collect();
-    if segments.get(2) != Some(&"transactions") {
+    if segments.get(2) != Some(&"reservations") {
         return None;
     }
     let id = percent_encoding::percent_decode_str(segments.get(3)?)
@@ -265,13 +266,13 @@ fn problem<S: TransactionalStore + Readiness + Send + Sync + 'static>(
     mut value: Error,
     tx: Option<String>,
 ) -> Response {
-    if value.transaction_id.is_none() {
-        value.transaction_id = tx;
+    if value.reservation_id.is_none() {
+        value.reservation_id = tx;
     }
     tracing::debug!(request_id=id,code=?value.code,"request rejected");
     let value = api::Problem::from_error(value, id.into());
     let status = StatusCode::from_u16(value.status).expect("documented problem status");
-    let transaction_id = value.transaction_id.clone();
+    let reservation_id = value.reservation_id.clone();
     let retryable = value.retryable;
     let mut response = (status, Json(value)).into_response();
     response.headers_mut().insert(
@@ -288,14 +289,14 @@ fn problem<S: TransactionalStore + Readiness + Send + Sync + 'static>(
             .headers_mut()
             .insert(header::RETRY_AFTER, "1".parse().unwrap());
     }
-    if let Some(id) = transaction_id
+    if let Some(id) = reservation_id
         && RecordKey::resource(&id).is_ok()
     {
         response.headers_mut().insert(
             header::LOCATION,
             format!(
-                "/v1/transactions/{}",
-                api::path_id(&id).expect("validated transaction identity")
+                "/v1/reservations/{}",
+                api::path_id(&id).expect("validated reservation identity")
             )
             .parse()
             .unwrap(),
@@ -511,9 +512,9 @@ async fn processing<S: TransactionalStore + Readiness + Send + Sync + 'static>(
     {
         Ok(Some(tx)) => {
             let prepared = matches!(tx.state, dto::State::Prepared {});
-            let mut data = api::Transaction::from_dto(tx).ok()?;
+            let mut data = api::Reservation::from_dto(tx).ok()?;
             data.processing = prepared;
-            let links = transaction_links(&data.transaction.request.transaction_id);
+            let links = reservation_links(&data.reservation.request.reservation_id);
             let ctx = RequestContext {
                 id: id.into(),
                 tracking: Arc::new(Tracking {
@@ -551,18 +552,18 @@ async fn processing<S: TransactionalStore + Readiness + Send + Sync + 'static>(
                 shared,
                 id,
                 error,
-                Some(request.transaction_id.clone()),
+                Some(request.reservation_id.clone()),
             ))
         }
         Err(_) => None,
     }
 }
-fn transaction_links(id: &str) -> BTreeMap<String, String> {
-    let id = api::path_id(id).expect("validated transaction identity");
+fn reservation_links(id: &str) -> BTreeMap<String, String> {
+    let id = api::path_id(id).expect("validated reservation identity");
     BTreeMap::from([
-        ("self".into(), format!("/v1/transactions/{id}")),
-        ("commit".into(), format!("/v1/transactions/{id}/commit")),
-        ("abort".into(), format!("/v1/transactions/{id}/abort")),
+        ("self".into(), format!("/v1/reservations/{id}")),
+        ("commit".into(), format!("/v1/reservations/{id}/commit")),
+        ("abort".into(), format!("/v1/reservations/{id}/abort")),
     ])
 }
 #[derive(Deserialize, Default)]
@@ -586,6 +587,7 @@ fn no_query(uri: &axum::http::Uri) -> Result<(), Error> {
     }
 }
 fn object_id(path: &str) -> Result<String, Error> {
+    let path = path.strip_prefix("/admin").unwrap_or(path);
     let segment = path
         .split('/')
         .nth(3)
@@ -701,10 +703,10 @@ async fn dispatch_inner<S: TransactionalStore + Readiness + Send + Sync + 'stati
         parts.method.clone()
     };
     let action = match (&method, route) {
-        (m, "/v1/resources/{id}") if *m == Method::PUT => Action::Create,
-        (m, "/v1/transactions") if *m == Method::POST => Action::Prepare,
-        (_, "/v1/transactions/{id}/commit") => Action::Commit,
-        (_, "/v1/transactions/{id}/abort") => Action::Abort,
+        (m, "/admin/v1/resources/{id}") if *m == Method::PUT => Action::Create,
+        (m, "/v1/reservations") if *m == Method::POST => Action::Prepare,
+        (_, "/v1/reservations/{id}/commit") => Action::Commit,
+        (_, "/v1/reservations/{id}/abort") => Action::Abort,
         _ => Action::Read,
     };
     caller.require(action)?;
@@ -712,7 +714,7 @@ async fn dispatch_inner<S: TransactionalStore + Readiness + Send + Sync + 'stati
     let lease = shared.server.reserve(caller, lane).await?;
     let from = system_clock();
     match (method, route) {
-        (Method::PUT, "/v1/resources/{id}") => {
+        (Method::PUT, "/admin/v1/resources/{id}") => {
             no_query(&parts.uri)?;
             let id = object_id(parts.uri.path())?;
             caller.resource(Action::Create, &id, None)?;
@@ -776,7 +778,7 @@ async fn dispatch_inner<S: TransactionalStore + Readiness + Send + Sync + 'stati
                 )]),
             ))
         }
-        (Method::POST, "/v1/transactions") => {
+        (Method::POST, "/v1/reservations") => {
             no_query(&parts.uri)?;
             let id = idempotency(&parts.headers)?;
             let value: api::Prepare = body(
@@ -790,7 +792,7 @@ async fn dispatch_inner<S: TransactionalStore + Readiness + Send + Sync + 'stati
             shared.config.limits.prepare(&request)?;
             let _ = ctx.tracking.prepare.set(request.clone());
             let result = execute(shared, ctx, dto::Command::Prepare(request), lease).await?;
-            let dto::Output::Transaction(tx) = result.output else {
+            let dto::Output::Reservation(tx) = result.output else {
                 unreachable!()
             };
             Ok(response(
@@ -801,34 +803,34 @@ async fn dispatch_inner<S: TransactionalStore + Readiness + Send + Sync + 'stati
                 } else {
                     StatusCode::CREATED
                 },
-                api::Transaction::from_dto(tx)?,
-                transaction_links(&id),
+                api::Reservation::from_dto(tx)?,
+                reservation_links(&id),
             ))
         }
-        (Method::GET, "/v1/transactions/{id}") => {
+        (Method::GET, "/v1/reservations/{id}") => {
             no_query(&parts.uri)?;
             let id = object_id(parts.uri.path())?;
             let result = execute(
                 shared,
                 ctx,
-                dto::Command::ShowTransaction {
-                    transaction_id: id.clone(),
+                dto::Command::ShowReservation {
+                    reservation_id: id.clone(),
                 },
                 lease,
             )
             .await?;
-            let dto::Output::Transaction(tx) = result.output else {
+            let dto::Output::Reservation(tx) = result.output else {
                 unreachable!()
             };
             Ok(response(
                 shared,
                 ctx,
                 StatusCode::OK,
-                api::Transaction::from_dto(tx)?,
-                transaction_links(&id),
+                api::Reservation::from_dto(tx)?,
+                reservation_links(&id),
             ))
         }
-        (Method::POST, "/v1/transactions/{id}/commit") => {
+        (Method::POST, "/v1/reservations/{id}/commit") => {
             no_query(&parts.uri)?;
             let id = object_id(parts.uri.path())?;
             let value: api::Commit =
@@ -838,24 +840,24 @@ async fn dispatch_inner<S: TransactionalStore + Readiness + Send + Sync + 'stati
                 shared,
                 ctx,
                 dto::Command::Commit(dto::Commit {
-                    transaction_id: id.clone(),
+                    reservation_id: id.clone(),
                     actuals: value.actuals,
                 }),
                 lease,
             )
             .await?;
-            let dto::Output::Transaction(tx) = result.output else {
+            let dto::Output::Reservation(tx) = result.output else {
                 unreachable!()
             };
             Ok(response(
                 shared,
                 ctx,
                 StatusCode::OK,
-                api::Transaction::from_dto(tx)?,
-                transaction_links(&id),
+                api::Reservation::from_dto(tx)?,
+                reservation_links(&id),
             ))
         }
-        (Method::POST, "/v1/transactions/{id}/abort") => {
+        (Method::POST, "/v1/reservations/{id}/abort") => {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
             struct Empty {}
@@ -867,26 +869,26 @@ async fn dispatch_inner<S: TransactionalStore + Readiness + Send + Sync + 'stati
                 shared,
                 ctx,
                 dto::Command::Abort {
-                    transaction_id: id.clone(),
+                    reservation_id: id.clone(),
                 },
                 lease,
             )
             .await?;
-            let dto::Output::Transaction(tx) = result.output else {
+            let dto::Output::Reservation(tx) = result.output else {
                 unreachable!()
             };
             Ok(response(
                 shared,
                 ctx,
                 StatusCode::OK,
-                api::Transaction::from_dto(tx)?,
-                transaction_links(&id),
+                api::Reservation::from_dto(tx)?,
+                reservation_links(&id),
             ))
         }
         (Method::GET, "/v1/resources") => {
             let query = query(&parts.uri)?;
             if query.state.is_some() {
-                return Err(Error::input("state filter applies only to transactions"));
+                return Err(Error::input("state filter applies only to reservations"));
             }
             let plan = page_plan(shared, ctx, "resources", &query)?;
             let result = execute(shared, ctx, dto::Command::ListResources, lease).await?;
@@ -907,29 +909,29 @@ async fn dispatch_inner<S: TransactionalStore + Readiness + Send + Sync + 'stati
             let links = page_links("resources", &query, data.next_cursor.as_deref());
             Ok(response(shared, ctx, StatusCode::OK, data, links))
         }
-        (Method::GET, "/v1/transactions") => {
+        (Method::GET, "/v1/reservations") => {
             let query = query(&parts.uri)?;
             if query
                 .state
                 .as_deref()
                 .is_some_and(|s| !matches!(s, "prepared" | "committed" | "aborted"))
             {
-                return Err(Error::input("unknown transaction state filter"));
+                return Err(Error::input("unknown reservation state filter"));
             }
-            let plan = page_plan(shared, ctx, "transactions", &query)?;
-            let result = execute(shared, ctx, dto::Command::ListTransactions, lease).await?;
-            let dto::Output::Transactions(transactions) = result.output else {
+            let plan = page_plan(shared, ctx, "reservations", &query)?;
+            let result = execute(shared, ctx, dto::Command::ListReservations, lease).await?;
+            let dto::Output::Reservations(reservations) = result.output else {
                 unreachable!()
             };
             let mut items = Vec::new();
-            for tx in transactions {
+            for tx in reservations {
                 let state = match tx.state {
                     dto::State::Prepared {} => "prepared",
                     dto::State::Committed { .. } => "committed",
                     dto::State::Aborted { .. } => "aborted",
                 };
                 if query.state.as_deref().is_none_or(|wanted| wanted == state) {
-                    items.push((tx.request.transaction_id.clone(), tx));
+                    items.push((tx.request.reservation_id.clone(), tx));
                 }
             }
             let selected = page(shared, plan, items)?;
@@ -937,11 +939,11 @@ async fn dispatch_inner<S: TransactionalStore + Readiness + Send + Sync + 'stati
                 items: selected
                     .items
                     .into_iter()
-                    .map(api::Transaction::from_dto)
+                    .map(api::Reservation::from_dto)
                     .collect::<Result<Vec<_>, _>>()?,
                 next_cursor: selected.next_cursor,
             };
-            let links = page_links("transactions", &query, data.next_cursor.as_deref());
+            let links = page_links("reservations", &query, data.next_cursor.as_deref());
             Ok(response(shared, ctx, StatusCode::OK, data, links))
         }
         _ => Err(error(

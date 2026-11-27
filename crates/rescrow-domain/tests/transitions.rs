@@ -42,7 +42,7 @@ fn replacements_include_only_participants_and_leave_inputs_unchanged() {
         .iter()
         .map(|r| (r.spec().id().clone(), r.clone()))
         .collect();
-    let tx = changes.transaction().unwrap();
+    let tx = changes.reservation().unwrap();
     assert!(
         transition::prepare(request(), Some(tx), &held, 0)
             .unwrap()
@@ -55,7 +55,7 @@ fn replacements_include_only_participants_and_leave_inputs_unchanged() {
 }
 #[test]
 fn individually_valid_records_do_not_bypass_participant_validation() {
-    let tx = Transaction::restore(request(), None, State::Prepared).unwrap();
+    let tx = Reservation::restore(request(), None, State::Prepared).unwrap();
     let resources = [(id("a"), resource("a")), (id("b"), resource("b"))]
         .into_iter()
         .collect();
@@ -103,7 +103,7 @@ fn holds_last_from_one_millisecond_to_thirty_days() {
 fn a_hold_lapses_only_once_its_deadline_passes_and_releases_both_directions() {
     let before = by_id(&[resource("a"), resource("b"), resource("unrelated")]);
     let prepared = transition::prepare(held(Some(100)), None, &before, 1_000).unwrap();
-    let tx = prepared.transaction().unwrap().clone();
+    let tx = prepared.reservation().unwrap().clone();
     assert_eq!(tx.expires_at_ms(), Some(1_100));
     let resources = by_id(prepared.resources());
     let live = Live::restore(resources.values().cloned().collect(), vec![tx.clone()]).unwrap();
@@ -126,14 +126,14 @@ fn a_hold_lapses_only_once_its_deadline_passes_and_releases_both_directions() {
     assert!(live.due([&id("unrelated")], 1_100).is_empty());
     assert_eq!(live.due([&id("a"), &id("b")], 1_100), vec![&tx]);
     let lapsed = transition::lapse(&tx, &resources, 1_100).unwrap();
-    let after = lapsed.transaction().unwrap();
+    let after = lapsed.reservation().unwrap();
     assert_eq!(*after.state(), State::Aborted(AbortReason::Lapsed));
     assert_eq!(after.expires_at_ms(), Some(1_100));
     // Both directions are released, and no quantity changes.
     assert!(lapsed.resources().iter().all(|r| r.holds().is_empty()));
     assert!(lapsed.resources().iter().all(|r| r.quantity() == 5));
     let released = by_id(lapsed.resources());
-    // A lapsed transaction cannot commit; aborting it again is a replay.
+    // A lapsed reservation cannot commit; aborting it again is a replay.
     assert_eq!(
         transition::commit(after, None, &released).unwrap_err(),
         Error::Conflict
@@ -148,7 +148,7 @@ fn a_hold_lapses_only_once_its_deadline_passes_and_releases_both_directions() {
 fn holds_without_a_deadline_never_lapse() {
     let before = by_id(&[resource("a"), resource("b")]);
     let prepared = transition::prepare(held(None), None, &before, 0).unwrap();
-    let tx = prepared.transaction().unwrap().clone();
+    let tx = prepared.reservation().unwrap().clone();
     assert_eq!(tx.expires_at_ms(), None);
     let resources = by_id(prepared.resources());
     let live = Live::restore(resources.values().cloned().collect(), vec![tx.clone()]).unwrap();
@@ -159,17 +159,17 @@ fn holds_without_a_deadline_never_lapse() {
     );
     // A deadline must agree with the request's hold.
     assert_eq!(
-        Transaction::restore(held(None), Some(5), State::Prepared).unwrap_err(),
+        Reservation::restore(held(None), Some(5), State::Prepared).unwrap_err(),
         Error::InvalidLedger
     );
     assert_eq!(
-        Transaction::restore(held(Some(5)), None, State::Prepared).unwrap_err(),
+        Reservation::restore(held(Some(5)), None, State::Prepared).unwrap_err(),
         Error::InvalidLedger
     );
 }
 
 #[test]
-fn identical_transaction_ids_in_different_namespaces_share_capacity_safely() {
+fn identical_reservation_ids_in_different_namespaces_share_capacity_safely() {
     use rescrow_domain as d;
     use std::collections::BTreeMap;
     let plain = |s: &str| d::Id::new(s.into()).unwrap();
@@ -192,9 +192,9 @@ fn identical_transaction_ids_in_different_namespaces_share_capacity_safely() {
     resources.insert(plain("r"), second.resources()[0].clone());
     assert_eq!(resources[&plain("r")].holds().len(), 2);
     assert_eq!(resources[&plain("r")].availability().available_down(), 2);
-    let commit = d::transition::commit(first.transaction().unwrap(), None, &resources).unwrap();
+    let commit = d::transition::commit(first.reservation().unwrap(), None, &resources).unwrap();
     resources.insert(plain("r"), commit.resources()[0].clone());
-    let abort = d::transition::abort(second.transaction().unwrap(), &resources).unwrap();
+    let abort = d::transition::abort(second.reservation().unwrap(), &resources).unwrap();
     assert_eq!(abort.resources()[0].quantity(), 6);
     assert!(abort.resources()[0].holds().is_empty());
 }

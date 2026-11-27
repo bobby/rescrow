@@ -1,6 +1,6 @@
 //! Small local benchmark of how point operations scale with retained history.
 //! History is built through the Application, so seeding pays real appends. Each
-//! seeded transaction is created ten minutes after the last, so the retained
+//! seeded reservation is created ten minutes after the last, so the retained
 //! history lies outside a new request's clock-skew bound, as it would in use.
 //! cargo run --release -p rescrow-adapters --example history_bench -- target/bench
 use rescrow_adapters::file::FileStore;
@@ -26,7 +26,7 @@ fn prepare(id: &str) -> Command {
         context: Default::default(),
         authorization: None,
         namespace: None,
-        transaction_id: id.into(),
+        reservation_id: id.into(),
         operations: vec![Operation {
             operation_id: "o".into(),
             resource_id: "r".into(),
@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let id = uuid_v7(created, index.into());
             seeder.execute(prepare(&id))?;
             seeder.execute(Command::Commit(Commit {
-                transaction_id: id,
+                reservation_id: id,
                 actuals: Some(vec![Actual {
                     operation_id: "o".into(),
                     delta: "0".into(),
@@ -92,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let id = uuid_v7(system_clock(), u128::from(count + index));
             let start = Instant::now();
             app.execute(prepare(&id))?;
-            app.execute(Command::Abort { transaction_id: id })?;
+            app.execute(Command::Abort { reservation_id: id })?;
             if index > 1 {
                 inspect.push(read);
                 replays.push(retry);

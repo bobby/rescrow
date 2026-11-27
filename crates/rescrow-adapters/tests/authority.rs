@@ -54,8 +54,8 @@ fn prepare<S: TransactionalStore>(
     n: u128,
 ) -> Commit {
     let scope = Scope::new(tenant.clone(), namespace).unwrap();
-    let txkey = scope.transaction("same").unwrap();
-    let RecordKey::Transaction(txid) = &txkey else {
+    let txkey = scope.reservation("same").unwrap();
+    let RecordKey::Reservation(txid) = &txkey else {
         unreachable!()
     };
     let request = d::Request::new(
@@ -133,7 +133,7 @@ fn tenant_and_namespace_keys_isolate_replay_and_share_only_tenant_resources() {
     );
     let key = Scope::new(a.clone(), "two")
         .unwrap()
-        .transaction("same")
+        .reservation("same")
         .unwrap();
     assert!(
         store
@@ -281,7 +281,7 @@ fn application_preserves_replays_lapses_and_namespace_boundaries() {
     let request = dto::Prepare {
         context: Default::default(),
         authorization: None,
-        transaction_id: txid.clone(),
+        reservation_id: txid.clone(),
         namespace: None,
         operations: vec![dto::Operation {
             operation_id: "op".into(),
@@ -297,22 +297,22 @@ fn application_preserves_replays_lapses_and_namespace_boundaries() {
     assert_eq!(prepared_b.request.namespace.as_deref(), Some("b"));
     assert_eq!(a.resource("r").unwrap().available_down, "2");
     assert_eq!(a.prepare(request.clone()).unwrap(), prepared_a);
-    assert_eq!(a.transactions().unwrap().len(), 1);
-    assert_eq!(b.transactions().unwrap().len(), 1);
+    assert_eq!(a.reservations().unwrap().len(), 1);
+    assert_eq!(b.reservations().unwrap().len(), 1);
     a.commit(dto::Commit {
-        transaction_id: txid.clone(),
+        reservation_id: txid.clone(),
         actuals: Some(vec![dto::Actual {
             operation_id: "op".into(),
             delta: "-2".into(),
         }]),
     })
     .unwrap();
-    assert_eq!(b.transaction(&txid).unwrap(), prepared_b);
+    assert_eq!(b.reservation(&txid).unwrap(), prepared_b);
     let later = app("b", 1010);
     assert_eq!(
         later
             .commit(dto::Commit {
-                transaction_id: txid.clone(),
+                reservation_id: txid.clone(),
                 actuals: None
             })
             .unwrap_err()
@@ -320,7 +320,7 @@ fn application_preserves_replays_lapses_and_namespace_boundaries() {
         rescrow_application::Code::Conflict
     );
     assert!(matches!(
-        later.transaction(&txid).unwrap().state,
+        later.reservation(&txid).unwrap().state,
         dto::State::Aborted {
             cause: dto::AbortReason::Lapsed,
             ..
@@ -336,7 +336,7 @@ fn application_preserves_replays_lapses_and_namespace_boundaries() {
         rescrow_application::Code::NotFound
     );
     assert_eq!(
-        other.transaction(&txid).unwrap_err().code,
+        other.reservation(&txid).unwrap_err().code,
         rescrow_application::Code::NotFound
     );
     assert!(other.snapshot().unwrap().resources.is_empty());
@@ -388,7 +388,7 @@ fn unresolved_publication_is_not_retried_and_absent_resolution_fences_delayed_wr
     let request = dto::Prepare {
         context: Default::default(),
         authorization: None,
-        transaction_id: uuid_v7(1000, 12),
+        reservation_id: uuid_v7(1000, 12),
         namespace: None,
         hold_ms: None,
         operations: vec![dto::Operation {

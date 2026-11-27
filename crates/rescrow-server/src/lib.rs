@@ -89,7 +89,7 @@ impl<S: TransactionalStore + Readiness + Send + Sync + 'static> Server<S> {
             admission::Lane::command(&command),
         )?;
         let work = self.control.register()?;
-        let transaction_id = command_id(&command);
+        let reservation_id = command_id(&command);
         let app = self.app.clone();
         tokio::task::spawn_blocking(move || {
             let _lease = lease;
@@ -104,8 +104,8 @@ impl<S: TransactionalStore + Readiness + Send + Sync + 'static> Server<S> {
             .into())
         })
         .map_err(|mut e| {
-            if e.transaction_id.is_none() {
-                e.transaction_id = transaction_id;
+            if e.reservation_id.is_none() {
+                e.reservation_id = reservation_id;
             }
             e
         })
@@ -116,11 +116,11 @@ impl<S: TransactionalStore + Readiness + Send + Sync + 'static> Server<S> {
         request: rescrow_application::dto::Prepare,
         required: DurabilityProfile,
         lease: admission::Lease,
-    ) -> Result<Option<rescrow_application::dto::Transaction>, Error> {
+    ) -> Result<Option<rescrow_application::dto::Reservation>, Error> {
         self.control
             .validate(&lease, context.scope().tenant(), admission::Lane::Recovery)?;
         let work = self.control.register()?;
-        let id = request.transaction_id.clone();
+        let id = request.reservation_id.clone();
         let app = self.app.clone();
         tokio::task::spawn_blocking(move || {
             let _lease = lease;
@@ -132,8 +132,8 @@ impl<S: TransactionalStore + Readiness + Send + Sync + 'static> Server<S> {
             Err(StoreError::Unknown(format!("preparation inspection stopped: {e}")).into())
         })
         .map_err(|mut e| {
-            if e.transaction_id.is_none() {
-                e.transaction_id = Some(id);
+            if e.reservation_id.is_none() {
+                e.reservation_id = Some(id);
             }
             e
         })
@@ -155,11 +155,11 @@ impl<S: TransactionalStore + Readiness + Send + Sync + 'static> Server<S> {
             .acquire_owned()
             .await
             .map_err(|e| StoreError::Io(e.to_string()))?;
-        let transaction_id = match &command {
-            Command::Prepare(v) => Some(v.transaction_id.clone()),
-            Command::Commit(v) => Some(v.transaction_id.clone()),
-            Command::Abort { transaction_id } | Command::ShowTransaction { transaction_id } => {
-                Some(transaction_id.clone())
+        let reservation_id = match &command {
+            Command::Prepare(v) => Some(v.reservation_id.clone()),
+            Command::Commit(v) => Some(v.reservation_id.clone()),
+            Command::Abort { reservation_id } | Command::ShowReservation { reservation_id } => {
+                Some(reservation_id.clone())
             }
             _ => None,
         };
@@ -178,8 +178,8 @@ impl<S: TransactionalStore + Readiness + Send + Sync + 'static> Server<S> {
             .into())
         })
         .map_err(|mut error| {
-            if error.transaction_id.is_none() {
-                error.transaction_id = transaction_id;
+            if error.reservation_id.is_none() {
+                error.reservation_id = reservation_id;
             }
             error
         })
@@ -188,10 +188,10 @@ impl<S: TransactionalStore + Readiness + Send + Sync + 'static> Server<S> {
 
 fn command_id(command: &Command) -> Option<String> {
     match command {
-        Command::Prepare(v) => Some(v.transaction_id.clone()),
-        Command::Commit(v) => Some(v.transaction_id.clone()),
-        Command::Abort { transaction_id } | Command::ShowTransaction { transaction_id } => {
-            Some(transaction_id.clone())
+        Command::Prepare(v) => Some(v.reservation_id.clone()),
+        Command::Commit(v) => Some(v.reservation_id.clone()),
+        Command::Abort { reservation_id } | Command::ShowReservation { reservation_id } => {
+            Some(reservation_id.clone())
         }
         _ => None,
     }

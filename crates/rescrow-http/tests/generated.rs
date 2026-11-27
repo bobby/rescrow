@@ -72,35 +72,35 @@ async fn remote_cli_uses_same_business_commands_and_json_contract() {
             "credits",
         ],
         vec![
-            "transaction",
+            "reservation",
             "prepare",
             &id,
             "--operations",
             ops.to_str().unwrap(),
         ],
         vec![
-            "transaction",
+            "reservation",
             "prepare",
             &id,
             "--operations",
             ops.to_str().unwrap(),
         ],
         vec![
-            "transaction",
+            "reservation",
             "commit",
             &id,
             "--actuals",
             actuals.to_str().unwrap(),
         ],
         vec![
-            "transaction",
+            "reservation",
             "commit",
             &id,
             "--actuals",
             actuals.to_str().unwrap(),
         ],
-        vec!["transaction", "show", &id],
-        vec!["transaction", "list"],
+        vec!["reservation", "show", &id],
+        vec!["reservation", "list"],
         vec!["resource", "list"],
         vec!["resource", "show", "credits"],
     ];
@@ -137,7 +137,7 @@ async fn remote_cli_uses_same_business_commands_and_json_contract() {
         .arg(&h.endpoint)
         .arg("--json")
         .args([
-            "transaction",
+            "reservation",
             "prepare",
             &id,
             "--operations",
@@ -150,7 +150,7 @@ async fn remote_cli_uses_same_business_commands_and_json_contract() {
     assert_eq!(output.status.code(), Some(3));
     let error: rescrow_application::Error = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(error.code, rescrow_application::Code::Capacity);
-    assert_eq!(error.transaction_id.as_deref(), Some(id.as_str()));
+    assert_eq!(error.reservation_id.as_deref(), Some(id.as_str()));
     std::fs::remove_dir_all(temp).unwrap();
     h.finish().await;
 }

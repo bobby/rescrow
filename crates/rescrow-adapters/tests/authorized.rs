@@ -55,7 +55,7 @@ fn create(id: &str) -> dto::Command {
 }
 fn prepare(n: u128, resource: &str) -> dto::Command {
     dto::Command::Prepare(dto::Prepare {
-        transaction_id: uuid_v7(NOW, n),
+        reservation_id: uuid_v7(NOW, n),
         namespace: None,
         hold_ms: None,
         operations: vec![dto::Operation {
@@ -98,7 +98,7 @@ fn durable_tenant_and_credential_limits_do_not_count_replays_or_replace_facts() 
     );
     let tx = app
         .scoped(a.scope().clone())
-        .transaction(&uuid_v7(NOW, 1))
+        .reservation(&uuid_v7(NOW, 1))
         .unwrap();
     assert_eq!(
         tx.request.authorization.unwrap().credential_id,
@@ -108,7 +108,7 @@ fn durable_tenant_and_credential_limits_do_not_count_replays_or_replace_facts() 
     app.execute_authorized(
         &renewed,
         dto::Command::Abort {
-            transaction_id: uuid_v7(NOW, 1),
+            reservation_id: uuid_v7(NOW, 1),
         },
     )
     .unwrap();
@@ -184,7 +184,7 @@ fn separate_instances_cannot_exceed_a_shared_quota_on_disjoint_resources() {
             .scoped(caller.scope().clone())
             .snapshot()
             .unwrap()
-            .transactions
+            .reservations
             .len(),
         1
     );
@@ -219,14 +219,14 @@ fn every_command_checks_current_permissions_and_namespace() {
             Action::Create => create("r2"),
             Action::Prepare => prepare(1, "r"),
             Action::Commit => dto::Command::Commit(dto::Commit {
-                transaction_id: uuid_v7(NOW, 1),
+                reservation_id: uuid_v7(NOW, 1),
                 actuals: None,
             }),
             Action::Abort => dto::Command::Abort {
-                transaction_id: uuid_v7(NOW, 1),
+                reservation_id: uuid_v7(NOW, 1),
             },
-            Action::Read => dto::Command::ShowTransaction {
-                transaction_id: uuid_v7(NOW, 1),
+            Action::Read => dto::Command::ShowReservation {
+                reservation_id: uuid_v7(NOW, 1),
             },
         };
         assert_eq!(
@@ -238,8 +238,8 @@ fn every_command_checks_current_permissions_and_namespace() {
     assert_eq!(
         app.execute_authorized(
             &other,
-            dto::Command::ShowTransaction {
-                transaction_id: uuid_v7(NOW, 1)
+            dto::Command::ShowReservation {
+                reservation_id: uuid_v7(NOW, 1)
             }
         )
         .unwrap_err()
@@ -250,8 +250,8 @@ fn every_command_checks_current_permissions_and_namespace() {
     assert_eq!(
         app.execute_authorized(
             &namespace,
-            dto::Command::ShowTransaction {
-                transaction_id: uuid_v7(NOW, 1)
+            dto::Command::ShowReservation {
+                reservation_id: uuid_v7(NOW, 1)
             }
         )
         .unwrap_err()
@@ -330,7 +330,7 @@ fn file_reopen_preserves_authority_identity_facts_and_atomic_quota_release() {
         .execute_authorized(
             &caller,
             dto::Command::Commit(dto::Commit {
-                transaction_id: uuid_v7(NOW, 1),
+                reservation_id: uuid_v7(NOW, 1),
                 actuals: None,
             }),
         )
@@ -340,7 +340,7 @@ fn file_reopen_preserves_authority_identity_facts_and_atomic_quota_release() {
         .execute_authorized(
             &caller,
             dto::Command::Abort {
-                transaction_id: uuid_v7(NOW, 2),
+                reservation_id: uuid_v7(NOW, 2),
             },
         )
         .unwrap();

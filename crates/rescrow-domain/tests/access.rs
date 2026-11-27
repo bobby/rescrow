@@ -74,7 +74,7 @@ fn credential_rotation_replays_original_facts_but_context_changes_conflict() {
     .unwrap()
     .with_authorization(Some(facts('b')));
     let first = d::transition::prepare(request.clone(), None, &resources, 0).unwrap();
-    let prepared = first.transaction().unwrap();
+    let prepared = first.reservation().unwrap();
     let resources = BTreeMap::from([(id("r"), first.resources()[0].clone())]);
     let renewed = request.clone().with_authorization(Some(facts('d')));
     assert!(request.same_intent(&renewed));

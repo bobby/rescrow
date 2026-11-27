@@ -41,7 +41,7 @@ async fn actual_socket_contract_and_exhaustive_problem_table() {
         &mut cases,
         "create_resource",
         Some(spec()),
-        h.put("/v1/resources/credits", &token, spec())
+        h.put("/admin/v1/resources/credits", &token, spec())
             .send()
             .await
             .unwrap(),
@@ -51,7 +51,7 @@ async fn actual_socket_contract_and_exhaustive_problem_table() {
         &mut cases,
         "create_resource",
         Some(spec()),
-        h.put("/v1/resources/credits", &token, spec())
+        h.put("/admin/v1/resources/credits", &token, spec())
             .send()
             .await
             .unwrap(),
@@ -78,7 +78,7 @@ async fn actual_socket_contract_and_exhaustive_problem_table() {
             &mut cases,
             "prepare",
             Some(body.clone()),
-            h.post("/v1/transactions", &token, body.clone())
+            h.post("/v1/reservations", &token, body.clone())
                 .header("idempotency-key", &id)
                 .send()
                 .await
@@ -88,9 +88,9 @@ async fn actual_socket_contract_and_exhaustive_problem_table() {
     }
     capture(
         &mut cases,
-        "get_transaction",
+        "get_reservation",
         None,
-        h.get(&format!("/v1/transactions/{id}"), &token)
+        h.get(&format!("/v1/reservations/{id}"), &token)
             .send()
             .await
             .unwrap(),
@@ -101,7 +101,7 @@ async fn actual_socket_contract_and_exhaustive_problem_table() {
         &mut cases,
         "commit",
         Some(actuals.clone()),
-        h.post(&format!("/v1/transactions/{id}/commit"), &token, actuals)
+        h.post(&format!("/v1/reservations/{id}/commit"), &token, actuals)
             .send()
             .await
             .unwrap(),
@@ -111,7 +111,7 @@ async fn actual_socket_contract_and_exhaustive_problem_table() {
         &mut cases,
         "abort",
         Some(json!({})),
-        h.post(&format!("/v1/transactions/{id}/abort"), &token, json!({}))
+        h.post(&format!("/v1/reservations/{id}/abort"), &token, json!({}))
             .send()
             .await
             .unwrap(),
@@ -121,7 +121,7 @@ async fn actual_socket_contract_and_exhaustive_problem_table() {
         &mut cases,
         "prepare",
         Some(prepare("-40")),
-        h.post("/v1/transactions", &token, prepare("-40"))
+        h.post("/v1/reservations", &token, prepare("-40"))
             .header("idempotency-key", new_id())
             .send()
             .await
@@ -133,7 +133,7 @@ async fn actual_socket_contract_and_exhaustive_problem_table() {
         &mut cases,
         "prepare",
         Some(prepare("-1")),
-        h.post("/v1/transactions", &token, prepare("-1"))
+        h.post("/v1/reservations", &token, prepare("-1"))
             .header("idempotency-key", &id)
             .send()
             .await
@@ -144,7 +144,7 @@ async fn actual_socket_contract_and_exhaustive_problem_table() {
         &mut cases,
         "abort",
         Some(json!({})),
-        h.post(&format!("/v1/transactions/{id}/abort"), &token, json!({}))
+        h.post(&format!("/v1/reservations/{id}/abort"), &token, json!({}))
             .send()
             .await
             .unwrap(),
@@ -152,9 +152,9 @@ async fn actual_socket_contract_and_exhaustive_problem_table() {
     .await;
     capture(
         &mut cases,
-        "list_transactions",
+        "list_reservations",
         None,
-        h.get("/v1/transactions?state=aborted&limit=1", &token)
+        h.get("/v1/reservations?state=aborted&limit=1", &token)
             .send()
             .await
             .unwrap(),

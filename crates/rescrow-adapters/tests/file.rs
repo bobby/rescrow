@@ -82,13 +82,13 @@ fn tx_at(name: &str, millis: u64) -> String {
 fn tx(name: &str) -> String {
     tx_at(name, created())
 }
-/// The transaction a test named `name`.
-fn named(snapshot: &Snapshot, name: &str) -> Transaction {
+/// The reservation a test named `name`.
+fn named(snapshot: &Snapshot, name: &str) -> Reservation {
     let id = tx(name);
     snapshot
-        .transactions
+        .reservations
         .iter()
-        .find(|t| t.request.transaction_id == id)
+        .find(|t| t.request.reservation_id == id)
         .unwrap()
         .clone()
 }
@@ -100,7 +100,7 @@ fn prepare_raw(id: &str) -> Command {
         context: Default::default(),
         authorization: None,
         namespace: None,
-        transaction_id: id.into(),
+        reservation_id: id.into(),
         operations: vec![Operation {
             operation_id: "o".into(),
             resource_id: "r".into(),
@@ -114,7 +114,7 @@ fn prepare() -> Command {
 }
 fn commit() -> Command {
     Command::Commit(Commit {
-        transaction_id: tx("t"),
+        reservation_id: tx("t"),
         actuals: None,
     })
 }
@@ -254,7 +254,7 @@ fn checkpoints_bound_replay_and_agree_with_history() {
         let id = format!("t{index}");
         app.execute(prepare_as(&id)).unwrap();
         app.execute(Command::Abort {
-            transaction_id: tx(&id),
+            reservation_id: tx(&id),
         })
         .unwrap();
     }
@@ -263,14 +263,14 @@ fn checkpoints_bound_replay_and_agree_with_history() {
     assert!(loaded.tail.len() < 2);
     let snapshot = temp.snapshot();
     assert_eq!(snapshot.revision, 11);
-    assert_eq!(snapshot.transactions.len(), 5);
-    // Replays of transactions older than the checkpoint still find their decision.
+    assert_eq!(snapshot.reservations.len(), 5);
+    // Replays of reservations older than the checkpoint still find their decision.
     assert_eq!(
         app.execute(Command::Abort {
-            transaction_id: tx("t0")
+            reservation_id: tx("t0")
         })
         .unwrap(),
-        Output::Transaction(named(&snapshot, "t0"))
+        Output::Reservation(named(&snapshot, "t0"))
     );
     assert_eq!(temp.snapshot(), snapshot);
 }
@@ -392,7 +392,7 @@ fn child(temp: &Temp, stage: Stage, mode: &str, expect: &str) -> std::process::C
         process.env(
             "RESCROW_TEST_NOW",
             temp.app()
-                .transaction(&tx("first"))
+                .reservation(&tx("first"))
                 .unwrap()
                 .expires_at_ms
                 .unwrap()
@@ -449,7 +449,7 @@ fn kill_at_append_boundaries_exposes_old_or_new_log() {
         // Loading also proves the OS released the killed owner's lock.
         let next = temp.snapshot();
         if appended(stage) {
-            assert_eq!(next.transactions.len(), 1);
+            assert_eq!(next.reservations.len(), 1);
             assert_eq!(next.resources[0].reserved_down, "3");
         } else {
             assert_eq!(next, old);
@@ -484,7 +484,7 @@ fn injected_append_and_read_failures_preserve_replay_identity() {
         );
         let next = temp.snapshot();
         if appended(stage) {
-            assert_eq!(next.transactions.len(), 1);
+            assert_eq!(next.reservations.len(), 1);
         } else {
             assert_eq!(next, old);
         }
@@ -509,7 +509,7 @@ fn checkpoint_failures_never_lose_or_repeat_appended_records() {
                 assert!(child(&temp, stage, mode, "ok").wait().unwrap().success());
             }
             let next = temp.snapshot();
-            assert_eq!(next.transactions.len(), 1, "{stage:?} {mode}");
+            assert_eq!(next.reservations.len(), 1, "{stage:?} {mode}");
             assert_eq!(next.revision, 2);
             finish(&temp);
         }
@@ -545,7 +545,7 @@ fn initialization_failures_never_reset_a_missing_or_published_authority() {
         if post {
             let snapshot = temp.snapshot();
             assert_eq!(snapshot.revision, 0);
-            assert!(snapshot.resources.is_empty() && snapshot.transactions.is_empty());
+            assert!(snapshot.resources.is_empty() && snapshot.reservations.is_empty());
             assert_eq!(app.initialize().unwrap_err().code, Code::AlreadyInitialized);
             assert_eq!(temp.snapshot(), snapshot);
         } else {
@@ -595,7 +595,7 @@ fn concurrent_readers_do_not_starve_writers() {
                     };
                     request.operations[0].delta = "-1".into();
                     execute(Command::Prepare(request)).unwrap();
-                    execute(Command::Abort { transaction_id: id }).unwrap();
+                    execute(Command::Abort { reservation_id: id }).unwrap();
                 }
             })
         })
@@ -608,7 +608,7 @@ fn concurrent_readers_do_not_starve_writers() {
         reader.join().unwrap();
     }
     let snapshot = temp.snapshot();
-    assert_eq!(snapshot.transactions.len(), 40);
+    assert_eq!(snapshot.reservations.len(), 40);
     assert_eq!(snapshot.resources[0].quantity, "5");
 }
 /// The locked fallback of a read that found apparent damage still excludes writers.
@@ -690,7 +690,7 @@ fn sealed_segments_keep_old_decisions_findable_through_indexes() {
     assert!(store.find(&tx("missing"), 0).unwrap().is_none());
     assert_eq!(
         app.execute(commit_as("t0", "0")).unwrap(),
-        Output::Transaction(named(&snapshot, "t0"))
+        Output::Reservation(named(&snapshot, "t0"))
     );
     assert_eq!(
         app.execute(commit_as("t0", "-1")).unwrap_err().code,
@@ -730,7 +730,7 @@ fn missing_or_corrupt_indexes_and_changed_sealed_segments_fail_closed() {
             }
         }
         assert_eq!(
-            app.execute(Command::ListTransactions).unwrap_err().code,
+            app.execute(Command::ListReservations).unwrap_err().code,
             Code::CorruptState,
             "{damage}"
         );
@@ -779,7 +779,7 @@ fn commit_as(name: &str, delta: &str) -> Command {
 }
 fn commit_raw(id: &str, delta: &str) -> Command {
     Command::Commit(Commit {
-        transaction_id: id.into(),
+        reservation_id: id.into(),
         actuals: Some(vec![Actual {
             operation_id: "o".into(),
             delta: delta.into(),
@@ -819,7 +819,7 @@ fn writes_and_point_reads_do_not_grow_with_history() {
     app.execute(prepare_as("small")).unwrap();
     let write_small = log() - before;
     app.execute(Command::Abort {
-        transaction_id: tx("small"),
+        reservation_id: tx("small"),
     })
     .unwrap();
     settle(40..400);
@@ -877,8 +877,8 @@ fn new_prepares_skip_segments_older_than_their_skew_bound() {
         Code::CorruptState
     );
     assert_eq!(
-        app.execute(Command::ShowTransaction {
-            transaction_id: tx_at("t0", old)
+        app.execute(Command::ShowReservation {
+            reservation_id: tx_at("t0", old)
         })
         .unwrap_err()
         .code,
@@ -918,7 +918,7 @@ fn an_interrupted_lapse_and_prepare_batch_never_publishes_a_prefix() {
             assert_eq!(observed, before);
         } else {
             assert_eq!(observed.revision, before.revision + 2);
-            assert_eq!(observed.transactions.len(), 2);
+            assert_eq!(observed.reservations.len(), 2);
         }
         let recovered =
             Application::new(FileStore::new(temp.store()).unwrap()).with_clock(move || deadline);
@@ -926,7 +926,7 @@ fn an_interrupted_lapse_and_prepare_batch_never_publishes_a_prefix() {
         assert_eq!(recovered.snapshot().unwrap().revision, before.revision + 2);
         assert_eq!(recovered.resource("r").unwrap().reserved_down, "3");
         assert!(matches!(
-            recovered.transaction(&tx("first")).unwrap().state,
+            recovered.reservation(&tx("first")).unwrap().state,
             State::Aborted {
                 cause: AbortReason::Lapsed,
                 ..

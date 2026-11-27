@@ -69,7 +69,7 @@ def _unknown(key):
             "status": 503,
             "detail": "Outcome unconfirmed; inspect or retry only the identical identity and request.",
             "request_id": "client",
-            "transaction_id": key,
+            "reservation_id": key,
             "retryable": True,
         }
     )
@@ -138,9 +138,9 @@ class Transport:
         self._tls = ssl.create_default_context()
 
     def request(
-        self, method, path, body=None, key=None, query=None, transaction_id=None
+        self, method, path, body=None, key=None, query=None, reservation_id=None
     ):
-        identity = key or transaction_id
+        identity = key or reservation_id
         if key is not None and not _generation(key):
             raise ValueError("Idempotency-Key must be a canonical UUIDv7")
         # Capture bytes exactly once, before the first attempt.
@@ -193,7 +193,7 @@ class Transport:
                             "code": "conflict",
                             "detail": "Endpoint belongs to a different authority generation.",
                             "retryable": False,
-                            "transaction_id": identity,
+                            "reservation_id": identity,
                         }
                     )
                 self.generation = generation
@@ -226,8 +226,8 @@ class Transport:
                 else:
                     if value.get("status") != response.status:
                         raise _unknown(identity)
-                    if value.get("transaction_id") is None and identity is not None:
-                        value["transaction_id"] = identity
+                    if value.get("reservation_id") is None and identity is not None:
+                        value["reservation_id"] = identity
                     last = ProblemError(value)
                     if response.status not in (429, 503) or not value.get("retryable"):
                         raise last

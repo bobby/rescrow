@@ -64,7 +64,7 @@ pub struct Error {
     pub code: Code,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transaction_id: Option<String>,
+    pub reservation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<Box<dto::CapacityFailure>>,
 }
@@ -74,12 +74,12 @@ impl Error {
             category,
             code,
             message: message.into(),
-            transaction_id: None,
+            reservation_id: None,
             capacity: None,
         }
     }
-    pub(crate) fn with_transaction(mut self, id: &str) -> Self {
-        self.transaction_id = Some(id.into());
+    pub(crate) fn with_reservation(mut self, id: &str) -> Self {
+        self.reservation_id = Some(id.into());
         self
     }
     fn rejection(reason: d::Rejection) -> Self {
@@ -94,7 +94,7 @@ impl Error {
             category: Category::Input,
             code: Code::InvalidInput,
             message: message.into(),
-            transaction_id: None,
+            reservation_id: None,
             capacity: None,
         }
     }
@@ -111,7 +111,7 @@ impl Error {
             category: Category::Domain,
             code,
             message: e.to_string(),
-            transaction_id: None,
+            reservation_id: None,
             capacity: match &e {
                 d::Error::Capacity(failure) => Some(Box::new(failure.into())),
                 _ => None,
@@ -122,8 +122,8 @@ impl Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}: {}", self.code, self.message)?;
-        if let Some(id) = &self.transaction_id {
-            write!(f, " [transaction {id}]")?;
+        if let Some(id) = &self.reservation_id {
+            write!(f, " [reservation {id}]")?;
         }
         Ok(())
     }
@@ -185,7 +185,7 @@ impl From<StoreError> for Error {
             category,
             code,
             message: e.to_string(),
-            transaction_id: None,
+            reservation_id: None,
             capacity: None,
         }
     }
@@ -226,9 +226,9 @@ pub trait LogStore {
     fn append(&self, entries: &[dto::Entry]) -> Result<Publication, StoreError>;
     /// Replace the checkpoint when this one is at a later position; otherwise do nothing.
     fn checkpoint(&self, checkpoint: &dto::Checkpoint) -> Result<(), StoreError>;
-    /// The most recent terminal entry for a transaction among those recorded
+    /// The most recent terminal entry for a reservation among those recorded
     /// at or after `since_ms`. Older entries need not be read.
-    fn find(&self, transaction_id: &str, since_ms: u64) -> Result<Option<dto::Entry>, StoreError>;
+    fn find(&self, reservation_id: &str, since_ms: u64) -> Result<Option<dto::Entry>, StoreError>;
     /// Every entry from position zero, in order.
     fn history(&self) -> Result<Vec<dto::Entry>, StoreError>;
     /// All entries of one atomic publication, or absence. Implementations may
@@ -256,7 +256,7 @@ pub fn validated_snapshot(snapshot: Snapshot) -> Result<d::Ledger, Error> {
     d::Ledger::try_from(snapshot).map_err(corrupt)
 }
 
-/// Validated live state at a log position, plus terminal transactions found
+/// Validated live state at a log position, plus terminal reservations found
 /// in the tail after the checkpoint, each with its recording time.
 #[derive(Clone)]
 struct LogView {
@@ -265,7 +265,7 @@ struct LogView {
     /// When the last entry was recorded.
     recorded_at_ms: u64,
     live: d::Live,
-    terminal: BTreeMap<d::Id, (u64, d::Transaction)>,
+    terminal: BTreeMap<d::Id, (u64, d::Reservation)>,
     tail: usize,
 }
 /// A validated write command.
@@ -288,7 +288,7 @@ impl Write {
         Ok(Self::Prepare(request.try_into().map_err(input)?))
     }
     pub(crate) fn commit(command: dto::Commit) -> Result<Self, Error> {
-        let id = d::Id::new(command.transaction_id).map_err(input)?;
+        let id = d::Id::new(command.reservation_id).map_err(input)?;
         let actuals = command
             .actuals
             .map(|entries| {
@@ -306,10 +306,10 @@ impl Write {
     }
 }
 /// A write's changes, and its result once they are durable.
-fn transaction_output(output: Output) -> dto::Transaction {
+fn reservation_output(output: Output) -> dto::Reservation {
     match output {
-        Output::Transaction(tx) => tx,
-        _ => unreachable!("transaction commands output transactions"),
+        Output::Reservation(tx) => tx,
+        _ => unreachable!("reservation commands output reservations"),
     }
 }
 
@@ -352,7 +352,7 @@ impl<S: LogStore> LogReader<S> {
         }
         history.truncate(view.position as usize);
         let mut specs = BTreeMap::new();
-        let mut transactions: BTreeMap<d::Id, d::Transaction> = BTreeMap::new();
+        let mut reservations: BTreeMap<d::Id, d::Reservation> = BTreeMap::new();
         let mut recorded_at_ms = 0;
         for (position, entry) in history.into_iter().enumerate() {
             if entry.sequence != position as u64 {
@@ -369,11 +369,11 @@ impl<S: LogStore> LogReader<S> {
                         return Err(corrupt("resource created twice"));
                     }
                 }
-                dto::Record::Transaction(tx) => {
-                    let tx = d::Transaction::try_from(tx).map_err(corrupt)?;
-                    let previous = transactions.get(tx.request().id());
+                dto::Record::Reservation(tx) => {
+                    let tx = d::Reservation::try_from(tx).map_err(corrupt)?;
+                    let previous = reservations.get(tx.request().id());
                     let valid = matches!(
-                        (previous.map(d::Transaction::state), tx.state()),
+                        (previous.map(d::Reservation::state), tx.state()),
                         (
                             None,
                             d::State::Prepared | d::State::Aborted(d::AbortReason::Rejected(_))
@@ -386,9 +386,9 @@ impl<S: LogStore> LogReader<S> {
                         )
                     );
                     if !valid || previous.is_some_and(|p| p.request() != tx.request()) {
-                        return Err(corrupt("transaction record out of order"));
+                        return Err(corrupt("reservation record out of order"));
                     }
-                    transactions.insert(tx.request().id().clone(), tx);
+                    reservations.insert(tx.request().id().clone(), tx);
                 }
             }
         }
@@ -398,7 +398,7 @@ impl<S: LogStore> LogReader<S> {
                 .resources()
                 .iter()
                 .all(|(id, r)| specs.get(id) == Some(r.spec()));
-        let prepared_match = transactions
+        let prepared_match = reservations
             .iter()
             .filter(|(_, tx)| *tx.state() == d::State::Prepared)
             .eq(live.prepared().iter());
@@ -407,7 +407,7 @@ impl<S: LogStore> LogReader<S> {
         }
         let ledger = d::Ledger::restore(
             live.resources().values().cloned().collect(),
-            transactions.into_values().collect(),
+            reservations.into_values().collect(),
         )
         .map_err(corrupt)?;
         Ok(Snapshot::from_ledger(&ledger, view.position))
@@ -465,8 +465,8 @@ fn replay(view: &mut LogView, record: dto::Record) -> Result<(), Error> {
             }
             changes
         }
-        dto::Record::Transaction(tx) => {
-            let tx = d::Transaction::try_from(tx).map_err(corrupt)?;
+        dto::Record::Reservation(tx) => {
+            let tx = d::Reservation::try_from(tx).map_err(corrupt)?;
             let id = tx.request().id();
             let resources = view.live.resources();
             let prepared = view.live.prepared().get(id);
@@ -494,10 +494,10 @@ fn replay(view: &mut LogView, record: dto::Record) -> Result<(), Error> {
                 (d::State::Aborted(d::AbortReason::Lapsed), Some(prepared)) => {
                     transition::lapse(prepared, resources, view.recorded_at_ms)
                 }
-                _ => return Err(corrupt("transaction record out of order")),
+                _ => return Err(corrupt("reservation record out of order")),
             }
             .map_err(corrupt)?;
-            if changes.transaction() != Some(&tx) {
+            if changes.reservation() != Some(&tx) {
                 return Err(corrupt("record does not match its transition"));
             }
             if *tx.state() != d::State::Prepared {
@@ -524,7 +524,7 @@ fn live_from(checkpoint: dto::Checkpoint) -> Result<(u64, u64, d::Live), Error> 
         checkpoint
             .prepared
             .into_iter()
-            .map(d::Transaction::try_from)
+            .map(d::Reservation::try_from)
             .collect::<Result<_, _>>()
             .map_err(corrupt)?,
     )

@@ -126,8 +126,8 @@ pub fn prepare_bytes(request: &dto::Prepare) -> Result<Vec<u8>, Error> {
 pub fn prepare_digest(request: &dto::Prepare) -> Result<String, Error> {
     Ok(digest("rescrow.prepare.v1", &prepare_bytes(request)?))
 }
-pub fn actuals_digest(transaction: &dto::Transaction) -> Result<Option<String>, Error> {
-    let tx: d::Transaction = transaction
+pub fn actuals_digest(reservation: &dto::Reservation) -> Result<Option<String>, Error> {
+    let tx: d::Reservation = reservation
         .clone()
         .try_into()
         .map_err(|e: d::Error| Error::input(e.to_string()))?;

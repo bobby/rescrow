@@ -25,7 +25,7 @@ pub struct Operation {
 pub struct Prepare {
     /// A UUIDv7, in canonical lowercase form, for a new prepare. Its timestamp
     /// is when the client first created the request; every retry repeats it.
-    pub transaction_id: String,
+    pub reservation_id: String,
     /// An authorized idempotency namespace; absent for the implicit local namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
@@ -70,7 +70,7 @@ pub struct Actual {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Commit {
-    pub transaction_id: String,
+    pub reservation_id: String,
     pub actuals: Option<Vec<Actual>>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,17 +84,17 @@ pub enum Command {
     CreateResource(ResourceSpec),
     Prepare(Prepare),
     Commit(Commit),
-    Abort { transaction_id: String },
+    Abort { reservation_id: String },
     ShowResource { resource_id: String },
     ListResources,
-    ShowTransaction { transaction_id: String },
-    ListTransactions,
+    ShowReservation { reservation_id: String },
+    ListReservations,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Hold {
-    pub transaction_id: String,
+    pub reservation_id: String,
     pub delta: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
@@ -174,7 +174,7 @@ impl From<&d::CapacityFailure> for CapacityFailure {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Transaction {
+pub struct Reservation {
     pub request: Prepare,
     /// When the hold may lapse, fixed at admission; `null` if it never does.
     #[serde(deserialize_with = "required")]
@@ -187,7 +187,7 @@ pub struct Snapshot {
     pub schema_version: u32,
     pub revision: u64,
     pub resources: Vec<Resource>,
-    pub transactions: Vec<Transaction>,
+    pub reservations: Vec<Reservation>,
 }
 impl Snapshot {
     pub fn from_ledger(ledger: &d::Ledger, revision: u64) -> Self {
@@ -195,15 +195,15 @@ impl Snapshot {
             schema_version: 1,
             revision,
             resources: ledger.resources().values().map(Resource::from).collect(),
-            transactions: ledger
-                .transactions()
+            reservations: ledger
+                .reservations()
                 .values()
-                .map(Transaction::from)
+                .map(Reservation::from)
                 .collect(),
         }
     }
 }
-/// Live state as of a log position: resources and transactions still holding capacity.
+/// Live state as of a log position: resources and reservations still holding capacity.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Checkpoint {
@@ -217,7 +217,7 @@ pub struct Checkpoint {
     /// When the last of those entries was recorded, or zero if there are none.
     pub recorded_at_ms: u64,
     pub resources: Vec<Resource>,
-    pub prepared: Vec<Transaction>,
+    pub prepared: Vec<Reservation>,
 }
 /// Versioned pending-hold accounting for one tenant. A vector preserves
 /// duplicate detection at the inbound boundary.
@@ -273,7 +273,7 @@ impl From<&d::access::Pending> for Pending {
 )]
 pub enum Record {
     ResourceCreated(ResourceSpec),
-    Transaction(Transaction),
+    Reservation(Reservation),
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -299,8 +299,8 @@ pub enum Output {
     Initialized,
     Resource(Resource),
     Resources(Vec<Resource>),
-    Transaction(Transaction),
-    Transactions(Vec<Transaction>),
+    Reservation(Reservation),
+    Reservations(Vec<Reservation>),
 }
 
 /// An optional value whose field must still be present, as `null` if absent.
@@ -369,7 +369,7 @@ impl TryFrom<Prepare> for d::Request {
     type Error = d::Error;
     fn try_from(v: Prepare) -> Result<Self, Self::Error> {
         let request = Self::new(
-            transaction_id(v.namespace, v.transaction_id)?,
+            reservation_id(v.namespace, v.reservation_id)?,
             v.operations
                 .into_iter()
                 .map(d::Operation::try_from)
@@ -388,7 +388,7 @@ impl TryFrom<Prepare> for d::Request {
 impl From<&d::Request> for Prepare {
     fn from(v: &d::Request) -> Self {
         Self {
-            transaction_id: v.id().as_str().into(),
+            reservation_id: v.id().as_str().into(),
             namespace: v.id().namespace().map(str::to_owned),
             operations: v.operations().iter().map(Operation::from).collect(),
             hold_ms: v.hold_ms(),
@@ -407,7 +407,7 @@ impl TryFrom<Resource> for d::Resource {
                 .into_iter()
                 .map(|h| {
                     Ok((
-                        transaction_id(h.namespace, h.transaction_id)?,
+                        reservation_id(h.namespace, h.reservation_id)?,
                         decimal(&h.delta)?,
                     ))
                 })
@@ -435,7 +435,7 @@ impl From<&d::Resource> for Resource {
                 .holds()
                 .iter()
                 .map(|(id, delta)| Hold {
-                    transaction_id: id.as_str().into(),
+                    reservation_id: id.as_str().into(),
                     namespace: id.namespace().map(str::to_owned),
                     delta: delta.to_string(),
                 })
@@ -447,9 +447,9 @@ impl From<&d::Resource> for Resource {
         }
     }
 }
-impl TryFrom<Transaction> for d::Transaction {
+impl TryFrom<Reservation> for d::Reservation {
     type Error = d::Error;
-    fn try_from(v: Transaction) -> Result<Self, Self::Error> {
+    fn try_from(v: Reservation) -> Result<Self, Self::Error> {
         let request: d::Request = v.request.try_into()?;
         let state = match v.state {
             State::Prepared {} => d::State::Prepared,
@@ -481,8 +481,8 @@ impl TryFrom<Transaction> for d::Transaction {
         Self::restore(request, v.expires_at_ms, state)
     }
 }
-impl From<&d::Transaction> for Transaction {
-    fn from(v: &d::Transaction) -> Self {
+impl From<&d::Reservation> for Reservation {
+    fn from(v: &d::Reservation) -> Self {
         let state = match v.state() {
             d::State::Prepared => State::Prepared {},
             d::State::Committed(a) => State::Committed {
@@ -531,15 +531,15 @@ impl TryFrom<Snapshot> for d::Ledger {
                 .into_iter()
                 .map(d::Resource::try_from)
                 .collect::<Result<_, _>>()?,
-            v.transactions
+            v.reservations
                 .into_iter()
-                .map(d::Transaction::try_from)
+                .map(d::Reservation::try_from)
                 .collect::<Result<_, _>>()?,
         )
     }
 }
 
-fn transaction_id(namespace: Option<String>, value: String) -> Result<d::Id, d::Error> {
+fn reservation_id(namespace: Option<String>, value: String) -> Result<d::Id, d::Error> {
     let value = id(value)?;
     match namespace {
         None => Ok(value),

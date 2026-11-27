@@ -57,7 +57,7 @@ async fn lost_http_response_retries_identical_key_and_bytes_without_reserving_tw
                         Code::UnknownOutcome,
                         "injected lost response",
                     );
-                    error.transaction_id = key;
+                    error.reservation_id = key;
                     let mut lost = (
                         StatusCode::SERVICE_UNAVAILABLE,
                         Json(Problem::from_error(error, "lost-response".into())),
@@ -90,7 +90,7 @@ async fn lost_http_response_retries_identical_key_and_bytes_without_reserving_tw
     config.attempt_timeout = Duration::from_secs(1);
     let client = Client::new(config).unwrap();
     let id = new_id();
-    let request:dto::Prepare=serde_json::from_value(serde_json::json!({"transaction_id":id,"operations":[{"operation_id":"op","resource_id":"credits","delta":"-40"}],"hold_ms":null})).unwrap();
+    let request:dto::Prepare=serde_json::from_value(serde_json::json!({"reservation_id":id,"operations":[{"operation_id":"op","resource_id":"credits","delta":"-40"}],"hold_ms":null})).unwrap();
     client
         .execute(dto::Command::Prepare(request))
         .await

@@ -44,7 +44,7 @@ function unknown(key?: string): ProblemError {
     detail:
       "Outcome unconfirmed; inspect or retry only the identical identity and request.",
     request_id: "client",
-    transaction_id: key ?? null,
+    reservation_id: key ?? null,
     retryable: true,
   });
 }
@@ -121,9 +121,9 @@ export class Transport {
     body?: unknown,
     key?: string,
     query?: Record<string, string | number>,
-    transactionId?: string,
+    reservationId?: string,
   ): Promise<unknown> {
-    const identity = key ?? transactionId;
+    const identity = key ?? reservationId;
     if (key !== undefined && !uuid7.test(key))
       throw new Error("Idempotency-Key must be a canonical UUIDv7");
     // Capture the exact body once; every attempt uses these bytes and this key.
@@ -172,7 +172,7 @@ export class Transport {
             code: "conflict",
             detail: "Endpoint belongs to a different authority generation.",
             retryable: false,
-            transaction_id: identity ?? null,
+            reservation_id: identity ?? null,
           });
         this.generation = generation;
         const reader = response.body?.getReader();
@@ -211,8 +211,8 @@ export class Transport {
           last = unknown(identity);
         } else {
           if (value.status !== response.status) throw unknown(identity);
-          if (value.transaction_id == null && identity !== undefined)
-            value.transaction_id = identity;
+          if (value.reservation_id == null && identity !== undefined)
+            value.reservation_id = identity;
           last = new ProblemError(value);
           if (![429, 503].includes(response.status) || value.retryable !== true)
             throw last;

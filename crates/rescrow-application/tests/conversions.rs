@@ -16,7 +16,7 @@ fn sample() -> Snapshot {
         context: Default::default(),
         authorization: None,
         namespace: None,
-        transaction_id: "t".into(),
+        reservation_id: "t".into(),
         operations: vec![Operation {
             operation_id: "o".into(),
             resource_id: "r".into(),
@@ -58,11 +58,11 @@ fn canonical_decimal_and_typed_json() {
     // A hold is optional but its field is not: `null` means no deadline.
     assert!(
         serde_json::from_str::<Command>(
-            r#"{"command":"prepare","input":{"transaction_id":"t","operations":[]}}"#
+            r#"{"command":"prepare","input":{"reservation_id":"t","operations":[]}}"#
         )
         .is_err()
     );
-    let cmd: Command = serde_json::from_str(r#"{"command":"prepare","input":{"transaction_id":"t","operations":[{"operation_id":"o","resource_id":"r","delta":"-9007199254740993"}],"hold_ms":null}}"#).unwrap();
+    let cmd: Command = serde_json::from_str(r#"{"command":"prepare","input":{"reservation_id":"t","operations":[{"operation_id":"o","resource_id":"r","delta":"-9007199254740993"}],"hold_ms":null}}"#).unwrap();
     let Command::Prepare(p) = cmd else { panic!() };
     assert_eq!(
         d::Request::try_from(p).unwrap().operations()[0].delta(),
@@ -101,7 +101,7 @@ fn round_trips_every_lifecycle() {
                 context: Default::default(),
                 authorization: None,
                 namespace: None,
-                transaction_id: "reject".into(),
+                reservation_id: "reject".into(),
                 operations: vec![Operation {
                     operation_id: "o".into(),
                     resource_id: "r".into(),
@@ -123,7 +123,7 @@ fn round_trips_every_lifecycle() {
 fn reject_impossible_records_without_dropping_entries() {
     let mutate: Vec<fn(&mut Snapshot)> = vec![
         |s| s.resources.push(s.resources[0].clone()),
-        |s| s.transactions.push(s.transactions[0].clone()),
+        |s| s.reservations.push(s.reservations[0].clone()),
         |s| {
             let h = s.resources[0].holds[0].clone();
             s.resources[0].holds.push(h);
@@ -132,20 +132,20 @@ fn reject_impossible_records_without_dropping_entries() {
         |s| s.resources[0].reserved_down = "2".into(),
         |s| s.resources[0].available_down = "7".into(),
         |s| s.resources[0].holds[0].delta = "-4".into(),
-        |s| s.resources[0].holds[0].transaction_id = "missing".into(),
-        |s| s.transactions[0].request.operations[0].resource_id = "missing".into(),
+        |s| s.resources[0].holds[0].reservation_id = "missing".into(),
+        |s| s.reservations[0].request.operations[0].resource_id = "missing".into(),
         |s| {
-            let o = s.transactions[0].request.operations[0].clone();
-            s.transactions[0].request.operations.push(o);
+            let o = s.reservations[0].request.operations[0].clone();
+            s.reservations[0].request.operations.push(o);
         },
         |s| {
-            s.transactions[0].state = State::Aborted {
+            s.reservations[0].state = State::Aborted {
                 cause: AbortReason::Requested,
                 capacity: None,
             }
         },
         |s| {
-            s.transactions[0].state = State::Committed {
+            s.reservations[0].state = State::Committed {
                 actuals: vec![Actual {
                     operation_id: "o".into(),
                     delta: "-4".into(),
@@ -153,7 +153,7 @@ fn reject_impossible_records_without_dropping_entries() {
             }
         },
         |s| s.resources.clear(),
-        |s| s.transactions.clear(),
+        |s| s.reservations.clear(),
         |s| s.resources[0].spec.initial = "6".into(),
         |s| s.resources[0].spec.lower = "6".into(),
         |s| s.resources[0].spec.upper = Some("4".into()),
@@ -179,7 +179,7 @@ fn documented_json_examples_use_the_validated_contract() {
         context: Default::default(),
         authorization: None,
         namespace: None,
-        transaction_id: "work".into(),
+        reservation_id: "work".into(),
         operations,
         hold_ms: None,
     }
@@ -206,7 +206,7 @@ fn documented_json_examples_use_the_validated_contract() {
         context: Default::default(),
         authorization: None,
         namespace: None,
-        transaction_id: "credit".into(),
+        reservation_id: "credit".into(),
         operations: credit,
         hold_ms: None,
     }
@@ -233,7 +233,7 @@ fn capacity_details_are_required_and_validated() {
                 context: Default::default(),
                 authorization: None,
                 namespace: None,
-                transaction_id: "reject".into(),
+                reservation_id: "reject".into(),
                 operations: vec![Operation {
                     operation_id: "o".into(),
                     resource_id: "r".into(),
@@ -249,7 +249,7 @@ fn capacity_details_are_required_and_validated() {
     let dto = Snapshot::from_ledger(&rejected, 4);
     for change in [0, 1, 2, 3, 4] {
         let mut invalid = dto.clone();
-        let State::Aborted { cause, capacity } = &mut invalid.transactions[0].state else {
+        let State::Aborted { cause, capacity } = &mut invalid.reservations[0].state else {
             panic!()
         };
         match change {
@@ -272,7 +272,7 @@ fn qualified_identities_round_trip_without_string_joining() {
         let request: d::Request = Prepare {
             context: Default::default(),
             authorization: None,
-            transaction_id: "same".into(),
+            reservation_id: "same".into(),
             namespace: Some(namespace.into()),
             operations: vec![Operation {
                 operation_id: "op".into(),

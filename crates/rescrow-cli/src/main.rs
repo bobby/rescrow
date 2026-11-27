@@ -38,7 +38,7 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Top {
-    /// Print a fresh UUIDv7 for a new transaction. Create one per business
+    /// Print a fresh UUIDv7 for a new reservation. Create one per business
     /// request and repeat it on every retry of that request.
     NewId,
     /// Initialize an empty store. Never overwrites an existing state.
@@ -47,9 +47,9 @@ enum Top {
         #[command(subcommand)]
         command: ResourceCommand,
     },
-    Transaction {
+    Reservation {
         #[command(subcommand)]
-        command: TransactionCommand,
+        command: ReservationCommand,
     },
 }
 #[derive(Subcommand)]
@@ -73,7 +73,7 @@ enum ResourceCommand {
     List,
 }
 #[derive(Subcommand)]
-enum TransactionCommand {
+enum ReservationCommand {
     Prepare {
         /// A UUIDv7, generated once when the request is first made; a retry
         /// repeats it.
@@ -123,7 +123,7 @@ fn main() -> ExitCode {
             match rendered.and_then(|v| writeln!(io::stdout().lock(), "{v}")) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    eprintln!("output failed: {e}; inspect/retry the same transaction identity");
+                    eprintln!("output failed: {e}; inspect/retry the same reservation identity");
                     ExitCode::from(7)
                 }
             }
@@ -139,7 +139,7 @@ fn main() -> ExitCode {
                 eprintln!("{error}");
                 if error.category == Category::UnknownOutcome {
                     eprintln!(
-                        "Publication may have succeeded; inspect/retry the same transaction ID and request."
+                        "Publication may have succeeded; inspect/retry the same reservation ID and request."
                     );
                 }
             }
@@ -172,8 +172,8 @@ fn run(cli: &Cli) -> Result<Output, Error> {
             },
             ResourceCommand::List => Command::ListResources,
         }),
-        Top::Transaction { command } => Some(match command {
-            TransactionCommand::Prepare {
+        Top::Reservation { command } => Some(match command {
+            ReservationCommand::Prepare {
                 id,
                 operations,
                 hold,
@@ -181,20 +181,20 @@ fn run(cli: &Cli) -> Result<Output, Error> {
                 context: Default::default(),
                 authorization: None,
                 namespace: None,
-                transaction_id: id.clone(),
+                reservation_id: id.clone(),
                 operations: read_json(operations)?,
                 hold_ms: *hold,
             }),
-            TransactionCommand::Show { id } => Command::ShowTransaction {
-                transaction_id: id.clone(),
+            ReservationCommand::Show { id } => Command::ShowReservation {
+                reservation_id: id.clone(),
             },
-            TransactionCommand::List => Command::ListTransactions,
-            TransactionCommand::Commit { id, actuals } => Command::Commit(Commit {
-                transaction_id: id.clone(),
+            ReservationCommand::List => Command::ListReservations,
+            ReservationCommand::Commit { id, actuals } => Command::Commit(Commit {
+                reservation_id: id.clone(),
                 actuals: actuals.as_deref().map(read_json).transpose()?,
             }),
-            TransactionCommand::Abort { id } => Command::Abort {
-                transaction_id: id.clone(),
+            ReservationCommand::Abort { id } => Command::Abort {
+                reservation_id: id.clone(),
             },
         }),
     };
@@ -264,13 +264,13 @@ fn human(output: &Output) -> String {
                 rs.iter().map(resource_text).collect::<Vec<_>>().join("\n")
             }
         }
-        Output::Transaction(t) => transaction_text(t),
-        Output::Transactions(ts) => {
+        Output::Reservation(t) => reservation_text(t),
+        Output::Reservations(ts) => {
             if ts.is_empty() {
-                "No transactions.".into()
+                "No reservations.".into()
             } else {
                 ts.iter()
-                    .map(transaction_text)
+                    .map(reservation_text)
                     .collect::<Vec<_>>()
                     .join("\n")
             }
@@ -292,7 +292,7 @@ fn resource_text(r: &Resource) -> String {
         r.available_up
     )
 }
-fn transaction_text(t: &Transaction) -> String {
+fn reservation_text(t: &Reservation) -> String {
     let state = match &t.state {
         State::Prepared {} => "prepared".into(),
         State::Committed { actuals } => format!(
@@ -311,7 +311,7 @@ fn transaction_text(t: &Transaction) -> String {
         .unwrap_or_default();
     format!(
         "{}: {state}{expires}; operations: {}",
-        t.request.transaction_id,
+        t.request.reservation_id,
         t.request
             .operations
             .iter()

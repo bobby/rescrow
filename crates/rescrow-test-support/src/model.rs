@@ -1,5 +1,5 @@
 //! Independent small-integer specification. Materialized quantities and pending
-//! extrema are derived from accepted transaction history, never cached or updated
+//! extrema are derived from accepted reservation history, never cached or updated
 //! using the production transition functions. DTOs are used only for observation.
 //! A hold lapses when a write that could reserve or release its resources
 //! runs at or after its deadline.
@@ -29,17 +29,17 @@ pub enum Command {
     Commit(u16, Option<Vec<(u8, i64)>>),
     Abort(u16),
     Resource(u8),
-    Transaction(u16),
+    Reservation(u16),
     Resources,
-    Transactions,
+    Reservations,
 }
 impl Command {
-    pub fn transaction_id(&self) -> Option<u16> {
+    pub fn reservation_id(&self) -> Option<u16> {
         match self {
             Self::Prepare(id, ..)
             | Self::Commit(id, _)
             | Self::Abort(id)
-            | Self::Transaction(id) => Some(*id),
+            | Self::Reservation(id) => Some(*id),
             _ => None,
         }
     }
@@ -50,7 +50,7 @@ impl Command {
                 context: Default::default(),
                 authorization: None,
                 namespace: None,
-                transaction_id: tx_id(*id),
+                reservation_id: tx_id(*id),
                 operations: ops
                     .iter()
                     .map(|o| dto::Operation {
@@ -62,7 +62,7 @@ impl Command {
                 hold_ms: *hold,
             }),
             Self::Commit(id, actuals) => dto::Command::Commit(dto::Commit {
-                transaction_id: tx_id(*id),
+                reservation_id: tx_id(*id),
                 actuals: actuals.as_ref().map(|a| {
                     a.iter()
                         .map(|(id, d)| dto::Actual {
@@ -73,16 +73,16 @@ impl Command {
                 }),
             }),
             Self::Abort(id) => dto::Command::Abort {
-                transaction_id: tx_id(*id),
+                reservation_id: tx_id(*id),
             },
             Self::Resource(id) => dto::Command::ShowResource {
                 resource_id: resource_id(*id),
             },
-            Self::Transaction(id) => dto::Command::ShowTransaction {
-                transaction_id: tx_id(*id),
+            Self::Reservation(id) => dto::Command::ShowReservation {
+                reservation_id: tx_id(*id),
             },
             Self::Resources => dto::Command::ListResources,
-            Self::Transactions => dto::Command::ListTransactions,
+            Self::Reservations => dto::Command::ListReservations,
         }
     }
 }
@@ -122,7 +122,7 @@ pub enum State {
     Lapsed,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Transaction {
+pub struct Reservation {
     pub operations: Vec<Op>,
     pub hold: Option<u64>,
     pub expires: Option<u64>,
@@ -133,7 +133,7 @@ const MAX_HOLD: u64 = 30 * 24 * 60 * 60 * 1000;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Model {
     pub resources: BTreeMap<u8, Spec>,
-    pub transactions: BTreeMap<u16, Transaction>,
+    pub reservations: BTreeMap<u16, Reservation>,
     /// The store's clock, in milliseconds since the Unix epoch.
     pub now: u64,
     /// Entries appended so far.
@@ -143,7 +143,7 @@ impl Model {
     /// Lapse overdue holds on any of `resources`, one entry each.
     fn lapse_due(&mut self, resources: &[u8]) {
         let now = self.now;
-        for tx in self.transactions.values_mut() {
+        for tx in self.reservations.values_mut() {
             if tx.state == State::Prepared
                 && tx.expires.is_some_and(|at| at <= now)
                 && tx
@@ -157,20 +157,20 @@ impl Model {
         }
     }
     /// Lapse every overdue hold, as a long-lived service does at each deadline,
-    /// and return the lapsed transactions. The CLI histories, which include
+    /// and return the lapsed reservations. The CLI histories, which include
     /// this model too, have no service.
     #[allow(dead_code)]
     pub fn lapse_all(&mut self) -> Vec<u16> {
-        let before = self.transactions.clone();
+        let before = self.reservations.clone();
         self.lapse_due(&self.resources.keys().copied().collect::<Vec<_>>());
-        self.transactions
+        self.reservations
             .iter()
             .filter(|(id, tx)| before[*id].state != tx.state)
             .map(|(id, _)| *id)
             .collect()
     }
     fn resources_of(&self, id: u16) -> Vec<u8> {
-        self.transactions[&id]
+        self.reservations[&id]
             .operations
             .iter()
             .map(|op| op.resource)
@@ -179,7 +179,7 @@ impl Model {
     pub fn quantity(&self, resource: u8) -> i64 {
         self.resources[&resource].initial
             + self
-                .transactions
+                .reservations
                 .values()
                 .map(|tx| match &tx.state {
                     State::Committed(actuals) => tx
@@ -195,7 +195,7 @@ impl Model {
     /// Minimum and maximum possible quantities over every subset of pending commits.
     fn extrema(&self, resource: u8) -> (i64, i64) {
         let q = self.quantity(resource);
-        self.transactions
+        self.reservations
             .values()
             .filter(|tx| tx.state == State::Prepared)
             .flat_map(|tx| &tx.operations)
@@ -230,7 +230,7 @@ impl Model {
                 let mut operations = operations.clone();
                 operations.sort_by_key(|op| op.id);
                 self.lapse_due(&operations.iter().map(|op| op.resource).collect::<Vec<_>>());
-                if let Some(old) = self.transactions.get(id) {
+                if let Some(old) = self.reservations.get(id) {
                     if old.operations != operations || old.hold != *hold {
                         return Err(Failure::Conflict);
                     }
@@ -269,9 +269,9 @@ impl Model {
                     })
                 };
                 self.position += 1;
-                self.transactions.insert(
+                self.reservations.insert(
                     *id,
-                    Transaction {
+                    Reservation {
                         operations,
                         hold: *hold,
                         expires: hold.map(|h| self.now + h),
@@ -287,10 +287,10 @@ impl Model {
                 }
             }
             Command::Commit(id, supplied) => {
-                if self.transactions.get(id).ok_or(Failure::Missing)?.state == State::Prepared {
+                if self.reservations.get(id).ok_or(Failure::Missing)?.state == State::Prepared {
                     self.lapse_due(&self.resources_of(*id));
                 }
-                let tx = &self.transactions[id];
+                let tx = &self.reservations[id];
                 let mut actuals = supplied
                     .clone()
                     .unwrap_or_else(|| tx.operations.iter().map(|o| (o.id, o.delta)).collect());
@@ -313,21 +313,21 @@ impl Model {
                         Err(Failure::Conflict)
                     }
                     State::Prepared => {
-                        self.transactions.get_mut(id).unwrap().state = State::Committed(actuals);
+                        self.reservations.get_mut(id).unwrap().state = State::Committed(actuals);
                         self.position += 1;
                         Ok(())
                     }
                 }
             }
             Command::Abort(id) => {
-                if self.transactions.get(id).ok_or(Failure::Missing)?.state == State::Prepared {
+                if self.reservations.get(id).ok_or(Failure::Missing)?.state == State::Prepared {
                     self.lapse_due(&self.resources_of(*id));
                 }
-                match &self.transactions[id].state {
+                match &self.reservations[id].state {
                     State::Committed(_) => Err(Failure::Conflict),
                     State::Aborted(_) | State::Lapsed => Ok(()),
                     State::Prepared => {
-                        self.transactions.get_mut(id).unwrap().state = State::Aborted(None);
+                        self.reservations.get_mut(id).unwrap().state = State::Aborted(None);
                         self.position += 1;
                         Ok(())
                     }
@@ -338,21 +338,21 @@ impl Model {
                 .contains_key(id)
                 .then_some(())
                 .ok_or(Failure::Missing),
-            Command::Transaction(id) => self
-                .transactions
+            Command::Reservation(id) => self
+                .reservations
                 .contains_key(id)
                 .then_some(())
                 .ok_or(Failure::Missing),
-            Command::Resources | Command::Transactions => Ok(()),
+            Command::Resources | Command::Reservations => Ok(()),
         }
     }
     pub fn snapshot(&self, revision: u64) -> dto::Snapshot {
-        let mut transactions: Vec<_> = self
-            .transactions
+        let mut reservations: Vec<_> = self
+            .reservations
             .iter()
             .map(|(id, tx)| tx.dto(*id))
             .collect();
-        transactions.sort_by(|a, b| a.request.transaction_id.cmp(&b.request.transaction_id));
+        reservations.sort_by(|a, b| a.request.reservation_id.cmp(&b.request.reservation_id));
         dto::Snapshot {
             schema_version: 1,
             revision,
@@ -363,20 +363,20 @@ impl Model {
                     let q = self.quantity(*id);
                     let (low, high) = self.extrema(*id);
                     let mut holds: Vec<_> =
-                        self.transactions
+                        self.reservations
                             .iter()
                             .filter(|(_, tx)| tx.state == State::Prepared)
                             .flat_map(|(tid, tx)| {
                                 tx.operations.iter().filter(|op| op.resource == *id).map(
                                     move |op| dto::Hold {
                                         namespace: None,
-                                        transaction_id: tx_id(*tid),
+                                        reservation_id: tx_id(*tid),
                                         delta: op.delta.to_string(),
                                     },
                                 )
                             })
                             .collect();
-                    holds.sort_by(|a, b| a.transaction_id.cmp(&b.transaction_id));
+                    holds.sort_by(|a, b| a.reservation_id.cmp(&b.reservation_id));
                     // Unbounded resources still have a finite numeric ceiling. All model
                     // quantities are small, so this expression cannot overflow i128.
                     let up = match spec.upper {
@@ -394,7 +394,7 @@ impl Model {
                     }
                 })
                 .collect(),
-            transactions,
+            reservations,
         }
     }
     pub fn output(&self, command: &Command, revision: u64) -> dto::Output {
@@ -409,10 +409,10 @@ impl Model {
             Command::Prepare(id, ..)
             | Command::Commit(id, _)
             | Command::Abort(id)
-            | Command::Transaction(id) => dto::Output::Transaction(self.transactions[id].dto(*id)),
+            | Command::Reservation(id) => dto::Output::Reservation(self.reservations[id].dto(*id)),
             Command::Resources => dto::Output::Resources(self.snapshot(revision).resources),
-            Command::Transactions => {
-                dto::Output::Transactions(self.snapshot(revision).transactions)
+            Command::Reservations => {
+                dto::Output::Reservations(self.snapshot(revision).reservations)
             }
         }
     }
@@ -429,8 +429,8 @@ impl Spec {
         }
     }
 }
-impl Transaction {
-    fn dto(&self, id: u16) -> dto::Transaction {
+impl Reservation {
+    fn dto(&self, id: u16) -> dto::Reservation {
         let dto::Command::Prepare(request) =
             Command::Prepare(id, self.operations.clone(), self.hold).dto()
         else {
@@ -463,7 +463,7 @@ impl Transaction {
                 capacity: None,
             },
         };
-        dto::Transaction {
+        dto::Reservation {
             request,
             expires_at_ms: self.expires,
             state,

@@ -68,9 +68,9 @@ impl Scope {
     pub fn namespace(&self) -> Option<&str> {
         self.namespace.as_ref().map(d::Id::as_str)
     }
-    pub fn transaction(&self, id: &str) -> Result<RecordKey, crate::Error> {
+    pub fn reservation(&self, id: &str) -> Result<RecordKey, crate::Error> {
         let id = d::Id::new(id.into()).map_err(|e| crate::Error::input(e.to_string()))?;
-        Ok(RecordKey::Transaction(match &self.namespace {
+        Ok(RecordKey::Reservation(match &self.namespace {
             None => id,
             Some(namespace) => d::Id::qualified(namespace.clone(), id)
                 .map_err(|e| crate::Error::input(e.to_string()))?,
@@ -85,7 +85,7 @@ pub enum RecordKey {
     Resource(d::Id),
     /// A domain identity carries the authorized namespace and opaque ID as
     /// separate validated values. The same ID in two namespaces is distinct.
-    Transaction(d::Id),
+    Reservation(d::Id),
     Pending,
 }
 impl RecordKey {
@@ -102,7 +102,7 @@ pub struct Version(pub Vec<u8>);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
     Resource(dto::Resource),
-    Transaction(dto::Transaction),
+    Reservation(dto::Reservation),
     Pending(dto::Pending),
 }
 impl Value {
@@ -114,8 +114,8 @@ impl Value {
                 let r = d::Resource::try_from(value.clone()).map_err(invalid)?;
                 r.spec().id() == id && id.namespace().is_none()
             }
-            (RecordKey::Transaction(id), Self::Transaction(value)) => {
-                let tx = d::Transaction::try_from(value.clone()).map_err(invalid)?;
+            (RecordKey::Reservation(id), Self::Reservation(value)) => {
+                let tx = d::Reservation::try_from(value.clone()).map_err(invalid)?;
                 tx.request().id() == id
             }
             (RecordKey::Pending, Self::Pending(value)) => {
@@ -256,13 +256,13 @@ impl Commit {
                     Value::Resource(r.into()),
                 );
             }
-            let record = match changes.transaction() {
+            let record = match changes.reservation() {
                 Some(tx) => {
                     replacements.insert(
-                        RecordKey::Transaction(tx.request().id().clone()),
-                        Value::Transaction(tx.into()),
+                        RecordKey::Reservation(tx.request().id().clone()),
+                        Value::Reservation(tx.into()),
                     );
-                    dto::Record::Transaction(tx.into())
+                    dto::Record::Reservation(tx.into())
                 }
                 None => dto::Record::ResourceCreated(changes.resources()[0].spec().into()),
             };
@@ -271,12 +271,12 @@ impl Commit {
                 record,
             });
         }
-        // Quota is derived from these same transaction transitions, never a
+        // Quota is derived from these same reservation transitions, never a
         // second publication or a process-local admission counter.
         let mut pending = None;
-        let mut transactions: BTreeMap<d::Id, d::Transaction> = BTreeMap::new();
+        let mut reservations: BTreeMap<d::Id, d::Reservation> = BTreeMap::new();
         for (_, change) in changes {
-            if let Some(tx) = change.transaction() {
+            if let Some(tx) = change.reservation() {
                 if tx.request().authorization().is_some() {
                     if pending.is_none() {
                         pending = Some(match observed.records.get(&RecordKey::Pending) {
@@ -292,17 +292,17 @@ impl Commit {
                             }
                         });
                     }
-                    let previous = match transactions.get(tx.request().id()) {
+                    let previous = match reservations.get(tx.request().id()) {
                         Some(previous) => Some(previous.clone()),
                         None => match observed
                             .records
-                            .get(&RecordKey::Transaction(tx.request().id().clone()))
+                            .get(&RecordKey::Reservation(tx.request().id().clone()))
                             .and_then(|v| v.as_ref())
                         {
                             Some(Versioned {
-                                value: Value::Transaction(v),
+                                value: Value::Reservation(v),
                                 ..
-                            }) => Some(d::Transaction::try_from(v.clone()).map_err(invalid)?),
+                            }) => Some(d::Reservation::try_from(v.clone()).map_err(invalid)?),
                             _ => None,
                         },
                     };
@@ -314,7 +314,7 @@ impl Commit {
                             .map_err(invalid)?,
                     );
                 }
-                transactions.insert(tx.request().id().clone(), tx.clone());
+                reservations.insert(tx.request().id().clone(), tx.clone());
             }
         }
         if let Some(pending) = pending {
@@ -398,7 +398,7 @@ pub enum Resolution {
 /// consistent cut for this tenant (ordering of unrelated records is adapter
 /// specific, but causal predecessors must come first). `read` and `resolve`
 /// acknowledge durability of observed writes. Terminal lookups may omit records
-/// older than `terminal_since_ms`; prepared transactions are never omitted.
+/// older than `terminal_since_ms`; prepared reservations are never omitted.
 pub trait TransactionalStore {
     /// Stable identity of this actual authority, shared by every frontend and
     /// retained across reopen. Distinct empty authorities must not share it.

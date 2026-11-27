@@ -215,7 +215,7 @@
       "content-type": "application/json",
       "date": "Fri, 27 Nov 2026 18:09:27 GMT",
       "durability-profile": "simulation",
-      "location": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3",
+      "location": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3",
       "x-request-id": "01a21e32-af2b-78fc-8b57-20dea6288871"
     },
     "operation": "prepare",
@@ -237,7 +237,7 @@
         "materialization": "complete",
         "processing": false,
         "request_digest": "sha256:62c583d6ef036b46f041557cd2a6f5aa5bac88e3a079ea6bbd029a418caf66a9",
-        "transaction": {
+        "reservation": {
           "expires_at_ms": null,
           "request": {
             "authorization": {
@@ -254,7 +254,7 @@
                 "resource_id": "credits"
               }
             ],
-            "transaction_id": "01a21e32-af2b-744e-9f46-657bc354a1d3"
+            "reservation_id": "01a21e32-af2b-744e-9f46-657bc354a1d3"
           },
           "state": {
             "status": "prepared"
@@ -262,9 +262,9 @@
         }
       },
       "links": {
-        "abort": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/abort",
-        "commit": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/commit",
-        "self": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3"
+        "abort": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3/abort",
+        "commit": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3/commit",
+        "self": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3"
       },
       "metadata": {
         "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
@@ -283,7 +283,7 @@
       "content-type": "application/json",
       "date": "Fri, 27 Nov 2026 18:09:27 GMT",
       "durability-profile": "simulation",
-      "location": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3",
+      "location": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3",
       "x-request-id": "01a21e32-af36-72e2-9213-a5741299bd39"
     },
     "operation": "prepare",
@@ -305,7 +305,7 @@
         "materialization": "complete",
         "processing": false,
         "request_digest": "sha256:62c583d6ef036b46f041557cd2a6f5aa5bac88e3a079ea6bbd029a418caf66a9",
-        "transaction": {
+        "reservation": {
           "expires_at_ms": null,
           "request": {
             "authorization": {
@@ -322,7 +322,7 @@
                 "resource_id": "credits"
               }
             ],
-            "transaction_id": "01a21e32-af2b-744e-9f46-657bc354a1d3"
+            "reservation_id": "01a21e32-af2b-744e-9f46-657bc354a1d3"
           },
           "state": {
             "status": "prepared"
@@ -330,9 +330,9 @@
         }
       },
       "links": {
-        "abort": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/abort",
-        "commit": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/commit",
-        "self": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3"
+        "abort": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3/abort",
+        "commit": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3/commit",
+        "self": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3"
       },
       "metadata": {
         "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
@@ -351,10 +351,10 @@
       "content-type": "application/json",
       "date": "Fri, 27 Nov 2026 18:09:27 GMT",
       "durability-profile": "simulation",
-      "location": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3",
+      "location": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3",
       "x-request-id": "01a21e32-af40-797b-b136-3da2a08456f7"
     },
-    "operation": "get_transaction",
+    "operation": "get_reservation",
     "request": null,
     "response": {
       "data": {
@@ -363,7 +363,7 @@
         "materialization": "complete",
         "processing": false,
         "request_digest": "sha256:62c583d6ef036b46f041557cd2a6f5aa5bac88e3a079ea6bbd029a418caf66a9",
-        "transaction": {
+        "reservation": {
           "expires_at_ms": null,
           "request": {
             "authorization": {
@@ -380,7 +380,7 @@
                 "resource_id": "credits"
               }
             ],
-            "transaction_id": "01a21e32-af2b-744e-9f46-657bc354a1d3"
+            "reservation_id": "01a21e32-af2b-744e-9f46-657bc354a1d3"
           },
           "state": {
             "status": "prepared"
@@ -388,9 +388,9 @@
         }
       },
       "links": {
-        "abort": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/abort",
-        "commit": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/commit",
-        "self": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3"
+        "abort": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3/abort",
+        "commit": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3/commit",
+        "self": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3"
       },
       "metadata": {
         "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
@@ -409,7 +409,7 @@
       "content-type": "application/json",
       "date": "Fri, 27 Nov 2026 18:09:27 GMT",
       "durability-profile": "simulation",
-      "location": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3",
+      "location": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3",
       "x-request-id": "01a21e32-af4b-7d39-b624-fc4f81d2a519"
     },
     "operation": "commit",
@@ -428,7 +428,7 @@
         "materialization": "complete",
         "processing": false,
         "request_digest": "sha256:62c583d6ef036b46f041557cd2a6f5aa5bac88e3a079ea6bbd029a418caf66a9",
-        "transaction": {
+        "reservation": {
           "expires_at_ms": null,
           "request": {
             "authorization": {
@@ -445,7 +445,7 @@
                 "resource_id": "credits"
               }
             ],
-            "transaction_id": "01a21e32-af2b-744e-9f46-657bc354a1d3"
+            "reservation_id": "01a21e32-af2b-744e-9f46-657bc354a1d3"
           },
           "state": {
             "actuals": [
@@ -459,9 +459,9 @@
         }
       },
       "links": {
-        "abort": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/abort",
-        "commit": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3/commit",
-        "self": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3"
+        "abort": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3/abort",
+        "commit": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3/commit",
+        "self": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3"
       },
       "metadata": {
         "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
@@ -480,7 +480,7 @@
       "content-type": "application/problem+json",
       "date": "Fri, 27 Nov 2026 18:09:27 GMT",
       "durability-profile": "simulation",
-      "location": "/v1/transactions/01a21e32-af2b-744e-9f46-657bc354a1d3",
+      "location": "/v1/reservations/01a21e32-af2b-744e-9f46-657bc354a1d3",
       "x-request-id": "01a21e32-af57-77b0-ab68-9265a7967a3c"
     },
     "operation": "abort",
@@ -492,7 +492,7 @@
       "request_id": "01a21e32-af57-77b0-ab68-9265a7967a3c",
       "retryable": false,
       "status": 409,
-      "transaction_id": "01a21e32-af2b-744e-9f46-657bc354a1d3",
+      "reservation_id": "01a21e32-af2b-744e-9f46-657bc354a1d3",
       "type": "urn:rescrow:problem:conflict"
     },
     "status": 409
@@ -504,7 +504,7 @@
       "content-type": "application/problem+json",
       "date": "Fri, 27 Nov 2026 18:09:27 GMT",
       "durability-profile": "simulation",
-      "location": "/v1/transactions/01a21e32-af62-7544-b644-5a5c4ffaf349",
+      "location": "/v1/reservations/01a21e32-af62-7544-b644-5a5c4ffaf349",
       "x-request-id": "01a21e32-af62-7d5a-9b98-f54114900c7e"
     },
     "operation": "prepare",
@@ -531,7 +531,7 @@
       "request_id": "01a21e32-af62-7d5a-9b98-f54114900c7e",
       "retryable": false,
       "status": 409,
-      "transaction_id": "01a21e32-af62-7544-b644-5a5c4ffaf349",
+      "reservation_id": "01a21e32-af62-7544-b644-5a5c4ffaf349",
       "type": "urn:rescrow:problem:capacity"
     },
     "status": 409
@@ -543,7 +543,7 @@
       "content-type": "application/json",
       "date": "Fri, 27 Nov 2026 18:09:27 GMT",
       "durability-profile": "simulation",
-      "location": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20",
+      "location": "/v1/reservations/01a21e32-af6d-7606-91bc-391529484f20",
       "x-request-id": "01a21e32-af6d-7adf-978e-bccff28ef05e"
     },
     "operation": "prepare",
@@ -565,7 +565,7 @@
         "materialization": "complete",
         "processing": false,
         "request_digest": "sha256:6748992c3d3450891837ae512ee1eea626642d8bcac88e08b60ad1964c4e7a4b",
-        "transaction": {
+        "reservation": {
           "expires_at_ms": null,
           "request": {
             "authorization": {
@@ -582,7 +582,7 @@
                 "resource_id": "credits"
               }
             ],
-            "transaction_id": "01a21e32-af6d-7606-91bc-391529484f20"
+            "reservation_id": "01a21e32-af6d-7606-91bc-391529484f20"
           },
           "state": {
             "status": "prepared"
@@ -590,9 +590,9 @@
         }
       },
       "links": {
-        "abort": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20/abort",
-        "commit": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20/commit",
-        "self": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20"
+        "abort": "/v1/reservations/01a21e32-af6d-7606-91bc-391529484f20/abort",
+        "commit": "/v1/reservations/01a21e32-af6d-7606-91bc-391529484f20/commit",
+        "self": "/v1/reservations/01a21e32-af6d-7606-91bc-391529484f20"
       },
       "metadata": {
         "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
@@ -611,7 +611,7 @@
       "content-type": "application/json",
       "date": "Fri, 27 Nov 2026 18:09:27 GMT",
       "durability-profile": "simulation",
-      "location": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20",
+      "location": "/v1/reservations/01a21e32-af6d-7606-91bc-391529484f20",
       "x-request-id": "01a21e32-af79-7afc-852c-697e99a40ed0"
     },
     "operation": "abort",
@@ -623,7 +623,7 @@
         "materialization": "complete",
         "processing": false,
         "request_digest": "sha256:6748992c3d3450891837ae512ee1eea626642d8bcac88e08b60ad1964c4e7a4b",
-        "transaction": {
+        "reservation": {
           "expires_at_ms": null,
           "request": {
             "authorization": {
@@ -640,7 +640,7 @@
                 "resource_id": "credits"
               }
             ],
-            "transaction_id": "01a21e32-af6d-7606-91bc-391529484f20"
+            "reservation_id": "01a21e32-af6d-7606-91bc-391529484f20"
           },
           "state": {
             "cause": {
@@ -651,9 +651,9 @@
         }
       },
       "links": {
-        "abort": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20/abort",
-        "commit": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20/commit",
-        "self": "/v1/transactions/01a21e32-af6d-7606-91bc-391529484f20"
+        "abort": "/v1/reservations/01a21e32-af6d-7606-91bc-391529484f20/abort",
+        "commit": "/v1/reservations/01a21e32-af6d-7606-91bc-391529484f20/commit",
+        "self": "/v1/reservations/01a21e32-af6d-7606-91bc-391529484f20"
       },
       "metadata": {
         "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
@@ -672,10 +672,10 @@
       "content-type": "application/json",
       "date": "Fri, 27 Nov 2026 18:09:27 GMT",
       "durability-profile": "simulation",
-      "location": "/v1/transactions",
+      "location": "/v1/reservations",
       "x-request-id": "01a21e32-af84-754a-ace8-7685a8433725"
     },
-    "operation": "list_transactions",
+    "operation": "list_reservations",
     "request": null,
     "response": {
       "data": {
@@ -686,7 +686,7 @@
             "materialization": "complete",
             "processing": false,
             "request_digest": "sha256:62c583d6ef036b46f041557cd2a6f5aa5bac88e3a079ea6bbd029a418caf66a9",
-            "transaction": {
+            "reservation": {
               "expires_at_ms": null,
               "request": {
                 "authorization": {
@@ -703,7 +703,7 @@
                     "resource_id": "credits"
                   }
                 ],
-                "transaction_id": "01a21e32-af62-7544-b644-5a5c4ffaf349"
+                "reservation_id": "01a21e32-af62-7544-b644-5a5c4ffaf349"
               },
               "state": {
                 "capacity": {
@@ -723,8 +723,8 @@
         "next_cursor": "eyJzY29wZSI6InNoYTI1NjphNzExOTU3NDEyMGU3ZGI1NDU0YjcyNWQwOWJjYzk4NzA1ZWIwNmY0NTZhYWZjYTBhMGUxNzM2YjcxYjM2YTM3IiwiYWZ0ZXIiOiIwMWEyMWUzMi1hZjYyLTc1NDQtYjY0NC01YTVjNGZmYWYzNDkiLCJleHBpcmVzX2F0X21zIjoxNzk1ODAzODY3OTUwfQ.q6MZO-qW_iDIxgQpmoiWRClfbME_4QwacpK1v5xZ0fE"
       },
       "links": {
-        "next": "/v1/transactions?cursor=eyJzY29wZSI6InNoYTI1NjphNzExOTU3NDEyMGU3ZGI1NDU0YjcyNWQwOWJjYzk4NzA1ZWIwNmY0NTZhYWZjYTBhMGUxNzM2YjcxYjM2YTM3IiwiYWZ0ZXIiOiIwMWEyMWUzMi1hZjYyLTc1NDQtYjY0NC01YTVjNGZmYWYzNDkiLCJleHBpcmVzX2F0X21zIjoxNzk1ODAzODY3OTUwfQ.q6MZO-qW_iDIxgQpmoiWRClfbME_4QwacpK1v5xZ0fE&limit=1&state=aborted",
-        "self": "/v1/transactions"
+        "next": "/v1/reservations?cursor=eyJzY29wZSI6InNoYTI1NjphNzExOTU3NDEyMGU3ZGI1NDU0YjcyNWQwOWJjYzk4NzA1ZWIwNmY0NTZhYWZjYTBhMGUxNzM2YjcxYjM2YTM3IiwiYWZ0ZXIiOiIwMWEyMWUzMi1hZjYyLTc1NDQtYjY0NC01YTVjNGZmYWYzNDkiLCJleHBpcmVzX2F0X21zIjoxNzk1ODAzODY3OTUwfQ.q6MZO-qW_iDIxgQpmoiWRClfbME_4QwacpK1v5xZ0fE&limit=1&state=aborted",
+        "self": "/v1/reservations"
       },
       "metadata": {
         "authority_generation": "01a21e32-aeee-720e-a5dd-2072e5c3f021",
@@ -755,7 +755,7 @@
       "request_id": "01a21e32-af90-7393-a34b-41a906167d4e",
       "retryable": false,
       "status": 401,
-      "transaction_id": null,
+      "reservation_id": null,
       "type": "urn:rescrow:problem:unauthenticated"
     },
     "status": 401

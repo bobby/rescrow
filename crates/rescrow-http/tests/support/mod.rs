@@ -56,9 +56,9 @@ pub fn admin(tenant: &str) -> String {
         Some("workflow"),
         &[
             "resource:create",
-            "transaction:prepare",
-            "transaction:commit",
-            "transaction:abort",
+            "reservation:prepare",
+            "reservation:commit",
+            "reservation:abort",
             "read",
         ],
     )
@@ -121,7 +121,7 @@ impl Harness {
     pub async fn create(&self, id: &str, token: &str) {
         let id = api::path_id(id).unwrap();
         let response = self
-            .put(&format!("/v1/resources/{id}"), token, spec())
+            .put(&format!("/admin/v1/resources/{id}"), token, spec())
             .send()
             .await
             .unwrap();
