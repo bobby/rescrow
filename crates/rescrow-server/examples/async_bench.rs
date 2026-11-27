@@ -51,7 +51,7 @@ async fn main() {
                             dto::Command::Prepare(dto::Prepare {
                                 context: Default::default(),
                                 authorization: None,
-                                transaction_id: id.clone(),
+                                reservation_id: id.clone(),
                                 namespace: None,
                                 operations: vec![dto::Operation {
                                     operation_id: "op".into(),
@@ -60,7 +60,7 @@ async fn main() {
                                 }],
                                 hold_ms: None,
                             }),
-                            dto::Command::Abort { transaction_id: id },
+                            dto::Command::Abort { reservation_id: id },
                         ];
                         for command in commands {
                             let begin = Instant::now();

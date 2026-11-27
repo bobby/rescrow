@@ -33,12 +33,12 @@ fn create() -> Command {
 fn prepare(name: &str, delta: &str) -> Command {
     prepare_raw(&id(name), delta)
 }
-fn prepare_raw(transaction_id: &str, delta: &str) -> Command {
+fn prepare_raw(reservation_id: &str, delta: &str) -> Command {
     Command::Prepare(Prepare {
         context: Default::default(),
         authorization: None,
         namespace: None,
-        transaction_id: transaction_id.into(),
+        reservation_id: reservation_id.into(),
         operations: vec![Operation {
             operation_id: "o".into(),
             resource_id: "r".into(),
@@ -71,9 +71,9 @@ fn direct_api_publishes_rejections_and_replays_do_not_advance_revision() {
     let rejected = snapshot(&store);
     assert_eq!(rejected.revision, before.revision + 1);
     assert_eq!(rejected.resources, before.resources);
-    assert_eq!(rejected.transactions.len(), 2);
+    assert_eq!(rejected.reservations.len(), 2);
     app.execute(Command::Abort {
-        transaction_id: id("t"),
+        reservation_id: id("t"),
     })
     .unwrap();
     assert_eq!(
@@ -82,7 +82,7 @@ fn direct_api_publishes_rejections_and_replays_do_not_advance_revision() {
     );
     assert_eq!(
         app.execute(Command::Commit(Commit {
-            transaction_id: id("rejected"),
+            reservation_id: id("rejected"),
             actuals: None
         }))
         .unwrap_err()
@@ -91,7 +91,7 @@ fn direct_api_publishes_rejections_and_replays_do_not_advance_revision() {
     );
     let revision = snapshot(&store).revision;
     app.execute(Command::Abort {
-        transaction_id: id("t"),
+        reservation_id: id("t"),
     })
     .unwrap();
     assert_eq!(snapshot(&store).revision, revision);
@@ -110,7 +110,7 @@ fn bounded_retries_prepublication_failures_and_lost_response() {
     assert_eq!(store.evaluations() - evaluations, 3);
     store.inject(Fault::LostResponse);
     let commit = Command::Commit(Commit {
-        transaction_id: id("t"),
+        reservation_id: id("t"),
         actuals: Some(vec![Actual {
             operation_id: "o".into(),
             delta: "-2".into(),
@@ -153,12 +153,12 @@ fn lost_prepare_rejection_and_abort_responses_keep_identity() {
         if expected.is_none() {
             store.inject(Fault::LostResponse);
             app.execute(Command::Abort {
-                transaction_id: id("t"),
+                reservation_id: id("t"),
             })
             .unwrap();
             let before = snapshot(&store);
             app.execute(Command::Abort {
-                transaction_id: id("t"),
+                reservation_id: id("t"),
             })
             .unwrap();
             assert_eq!(snapshot(&store), before);
@@ -185,7 +185,7 @@ fn corrupt_storage_bad_input_and_revision_overflow_fail_closed() {
             .category,
         Category::Input
     );
-    // A checkpoint whose holds disagree with its prepared transactions.
+    // A checkpoint whose holds disagree with its prepared reservations.
     let (store, app) = ready();
     app.execute(prepare("t", "-1")).unwrap();
     let (_, entries) = store.raw();
@@ -247,7 +247,7 @@ fn checkpoint_of(store: &MemoryStore) -> Checkpoint {
         recorded_at_ms: store.raw().1.last().map_or(0, |e| e.recorded_at_ms),
         resources: snapshot.resources,
         prepared: snapshot
-            .transactions
+            .reservations
             .into_iter()
             .filter(|tx| tx.state == State::Prepared {})
             .collect(),
@@ -299,7 +299,7 @@ fn conflict_reloads_and_recomputes_admission() {
     );
     let snapshot = snapshot(&store);
     assert_eq!(snapshot.resources[0].reserved_down, "5");
-    assert_eq!(snapshot.transactions.len(), 2);
+    assert_eq!(snapshot.reservations.len(), 2);
     assert_eq!(snapshot.revision, 3);
 }
 
@@ -313,7 +313,7 @@ fn missing_resource_rejection_remains_terminal_after_resource_creation() {
         Code::NotFound
     );
     let rejected = snapshot(&store);
-    assert_eq!(rejected.transactions.len(), 1);
+    assert_eq!(rejected.reservations.len(), 1);
     assert!(rejected.resources.is_empty());
     app.execute(create()).unwrap();
     let before = snapshot(&store);
@@ -324,7 +324,7 @@ fn missing_resource_rejection_remains_terminal_after_resource_creation() {
     assert_eq!(snapshot(&store), before);
     assert_eq!(
         app.execute(Command::Commit(Commit {
-            transaction_id: id("missing"),
+            reservation_id: id("missing"),
             actuals: None
         }))
         .unwrap_err()
@@ -340,7 +340,7 @@ fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
         context: Default::default(),
         authorization: None,
         namespace: None,
-        transaction_id: id("held"),
+        reservation_id: id("held"),
         operations: vec![Operation {
             operation_id: "o".into(),
             resource_id: "r".into(),
@@ -353,7 +353,7 @@ fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
         context: Default::default(),
         authorization: None,
         namespace: None,
-        transaction_id: id("rejected"),
+        reservation_id: id("rejected"),
         operations: vec![Operation {
             operation_id: "a".into(),
             resource_id: "r".into(),
@@ -363,7 +363,7 @@ fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
     };
     let error = app.prepare(request.clone()).unwrap_err();
     assert_eq!(
-        error.transaction_id.as_deref(),
+        error.reservation_id.as_deref(),
         Some(id("rejected").as_str())
     );
     assert_eq!(
@@ -381,7 +381,7 @@ fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
         serialized
     );
     assert!(matches!(
-        app.transaction(&id("rejected")).unwrap().state,
+        app.reservation(&id("rejected")).unwrap().state,
         State::Aborted {
             capacity: Some(_),
             ..
@@ -389,11 +389,11 @@ fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
     ));
     assert_eq!(app.resource("r").unwrap().quantity, "5");
     assert_eq!(app.resources().unwrap().len(), 1);
-    assert_eq!(app.transactions().unwrap().len(), 2);
+    assert_eq!(app.reservations().unwrap().len(), 2);
     // Valid-looking records are still checked against their transitions.
     let (checkpoint, mut entries) = store.raw();
-    let Record::Transaction(tx) = &mut entries.last_mut().unwrap().record else {
-        panic!("expected a transaction record");
+    let Record::Reservation(tx) = &mut entries.last_mut().unwrap().record else {
+        panic!("expected a reservation record");
     };
     tx.state = State::Aborted {
         cause: AbortReason::Rejected(Rejection::Capacity),
@@ -404,7 +404,7 @@ fn typed_api_returns_specific_values_and_freezes_capacity_diagnostics() {
         }),
     };
     store.set_raw(checkpoint.unwrap(), entries);
-    assert_eq!(app.transactions().unwrap_err().code, Code::CorruptState);
+    assert_eq!(app.reservations().unwrap_err().code, Code::CorruptState);
 }
 
 const HOUR: u64 = 60 * 60 * 1000;
@@ -430,7 +430,7 @@ fn prepare_at(name: &str, created_at_ms: u64) -> Command {
 }
 fn commit_at(name: &str, created_at_ms: u64) -> Command {
     Command::Commit(Commit {
-        transaction_id: id_at(name, created_at_ms),
+        reservation_id: id_at(name, created_at_ms),
         actuals: None,
     })
 }
@@ -457,14 +457,14 @@ fn retries_replay_inside_the_window_and_expire_after_it() {
     );
     // Inspection still reads all of history.
     assert_eq!(
-        app.execute(Command::ShowTransaction {
-            transaction_id: id_at("done", T)
+        app.execute(Command::ShowReservation {
+            reservation_id: id_at("done", T)
         })
         .unwrap(),
         committed
     );
-    // A transaction still holding capacity is live, so its retries never expire.
-    let Output::Transaction(held) = app.execute(prepare_at("held", T)).unwrap() else {
+    // A reservation still holding capacity is live, so its retries never expire.
+    let Output::Reservation(held) = app.execute(prepare_at("held", T)).unwrap() else {
         panic!()
     };
     assert_eq!(held.state, State::Prepared {});
@@ -477,7 +477,7 @@ fn new_ids_must_be_uuid_v7_created_near_the_clock() {
     let ahead = id_at("ahead", T + 5 * MINUTE + 1);
     let error = app.execute(prepare_raw(&ahead, "-1")).unwrap_err();
     assert_eq!(error.code, Code::InvalidInput);
-    assert_eq!(error.transaction_id.as_deref(), Some(ahead.as_str()));
+    assert_eq!(error.reservation_id.as_deref(), Some(ahead.as_str()));
     let v4 = id_at("v4", T).replacen("-7", "-4", 1);
     let upper = id_at("upper", T).to_uppercase();
     let mut variant = id_at("variant", T);
@@ -489,7 +489,7 @@ fn new_ids_must_be_uuid_v7_created_near_the_clock() {
             "{bad}"
         );
     }
-    assert!(snapshot(&store).transactions.is_empty());
+    assert!(snapshot(&store).reservations.is_empty());
     app.execute(prepare_at("ahead", T + 5 * MINUTE)).unwrap();
 }
 #[test]
@@ -527,9 +527,9 @@ fn hold_at(name: &str, created_at_ms: u64, delta: &str, hold_ms: Option<u64>) ->
     request.hold_ms = hold_ms;
     Command::Prepare(request)
 }
-fn transaction(output: Output) -> Transaction {
-    let Output::Transaction(tx) = output else {
-        panic!("expected a transaction")
+fn reservation(output: Output) -> Reservation {
+    let Output::Reservation(tx) = output else {
+        panic!("expected a reservation")
     };
     tx
 }
@@ -542,7 +542,7 @@ fn lapsed() -> State {
 #[test]
 fn a_hold_lapses_in_the_same_append_as_the_write_that_needs_its_capacity() {
     let (store, app, clock) = clocked();
-    let held = transaction(app.execute(hold_at("held", T, "-5", Some(1_000))).unwrap());
+    let held = reservation(app.execute(hold_at("held", T, "-5", Some(1_000))).unwrap());
     assert_eq!(held.expires_at_ms, Some(T + 1_000));
     // Before the deadline the hold keeps its capacity.
     clock.store(T + 999, Ordering::Relaxed);
@@ -560,14 +560,14 @@ fn a_hold_lapses_in_the_same_append_as_the_write_that_needs_its_capacity() {
     assert_eq!(store.evaluations() - appends, 1);
     assert_eq!(snapshot(&store).revision, revision + 2);
     let (_, entries) = store.raw();
-    let Record::Transaction(lapse) = &entries[entries.len() - 2].record else {
+    let Record::Reservation(lapse) = &entries[entries.len() - 2].record else {
         panic!("expected the lapse first")
     };
-    assert_eq!(lapse.request.transaction_id, held.request.transaction_id);
+    assert_eq!(lapse.request.reservation_id, held.request.reservation_id);
     assert_eq!(lapse.state, lapsed());
     assert_eq!(
-        app.transaction(&held.request.transaction_id).unwrap(),
-        Transaction {
+        app.reservation(&held.request.reservation_id).unwrap(),
+        Reservation {
             state: lapsed(),
             ..held
         }
@@ -586,18 +586,18 @@ fn a_decision_after_the_deadline_finds_the_hold_lapsed() {
     clock.store(T + 1_000, Ordering::Relaxed);
     let commit = app.execute(commit_at("lost", T)).unwrap_err();
     assert_eq!(
-        (commit.code, commit.transaction_id),
+        (commit.code, commit.reservation_id),
         (Code::Conflict, Some(id_at("lost", T)))
     );
     let abort = app
         .execute(Command::Abort {
-            transaction_id: id_at("aborted", T),
+            reservation_id: id_at("aborted", T),
         })
         .unwrap();
-    assert_eq!(transaction(abort).state, lapsed());
+    assert_eq!(reservation(abort).state, lapsed());
     // A retried prepare returns the lapse with its original deadline; a
     // different hold is a different request.
-    let replay = transaction(app.execute(held("lost")).unwrap());
+    let replay = reservation(app.execute(held("lost")).unwrap());
     assert_eq!(
         (replay.state, replay.expires_at_ms),
         (lapsed(), Some(T + 1_000))

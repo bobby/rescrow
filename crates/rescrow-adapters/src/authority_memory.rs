@@ -62,7 +62,7 @@ impl TransactionalStore for MemoryAuthority {
             .map(|key| {
                 let record = records.and_then(|rs| rs.get(&key)).cloned().flatten();
                 let record = record.filter(|v| match &v.value {
-                    rescrow_application::authority::Value::Transaction(tx) => {
+                    rescrow_application::authority::Value::Reservation(tx) => {
                         matches!(tx.state, rescrow_application::dto::State::Prepared {})
                             || v.recorded_at_ms >= terminal_since_ms
                     }

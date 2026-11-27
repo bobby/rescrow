@@ -21,7 +21,7 @@ fn verifier() -> JwtAuthenticator {
     .unwrap()
 }
 fn claims() -> serde_json::Value {
-    json!({"iss":"https://issuer.example","aud":"rescrow","sub":"agent","exp":jsonwebtoken::get_current_timestamp()+3600,"tenant":"tenant-a","namespace":"workflow","credential_id":"stable-agent-credential","scopes":["transaction:prepare","read"],"resources":[{"resource_prefix":"budget.","debit":true,"credit":false,"max_amount":"100"}],"max_hold_ms":3600000})
+    json!({"iss":"https://issuer.example","aud":"rescrow","sub":"agent","exp":jsonwebtoken::get_current_timestamp()+3600,"tenant":"tenant-a","namespace":"workflow","credential_id":"stable-agent-credential","scopes":["reservation:prepare","read"],"resources":[{"resource_prefix":"budget.","debit":true,"credit":false,"max_amount":"100"}],"max_hold_ms":3600000})
 }
 fn token(value: serde_json::Value) -> String {
     let mut header = Header::new(Algorithm::EdDSA);

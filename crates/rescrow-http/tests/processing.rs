@@ -2,7 +2,7 @@ mod support;
 use rescrow_adapters::authority_memory::MemoryAuthority;
 use rescrow_application::{
     Application, Code, StoreError,
-    api::{Envelope, Limits, Transaction},
+    api::{Envelope, Limits, Reservation},
     authority::*,
     capabilities::*,
 };
@@ -107,7 +107,7 @@ async fn processing_requires_durable_proof_and_shutdown_waits_for_cancelled_real
         let token = admin("tenant");
         assert_eq!(
             client
-                .put(format!("{endpoint}/v1/resources/credits"))
+                .put(format!("{endpoint}/admin/v1/resources/credits"))
                 .bearer_auth(&token)
                 .json(&spec())
                 .send()
@@ -119,7 +119,7 @@ async fn processing_requires_durable_proof_and_shutdown_waits_for_cancelled_real
         store.armed.store(true, Ordering::SeqCst);
         let id = new_id();
         let response = client
-            .post(format!("{endpoint}/v1/transactions"))
+            .post(format!("{endpoint}/v1/reservations"))
             .bearer_auth(&token)
             .header("idempotency-key", &id)
             .json(&prepare("-10"))
@@ -132,9 +132,9 @@ async fn processing_requires_durable_proof_and_shutdown_waits_for_cancelled_real
             assert_eq!(response.headers()["retry-after"], "1");
             assert_eq!(
                 response.headers()["location"],
-                format!("/v1/transactions/{id}")
+                format!("/v1/reservations/{id}")
             );
-            let value: Envelope<Transaction> = response.json().await.unwrap();
+            let value: Envelope<Reservation> = response.json().await.unwrap();
             assert!(value.data.processing);
             assert_eq!(
                 value.data.materialization,
@@ -142,7 +142,7 @@ async fn processing_requires_durable_proof_and_shutdown_waits_for_cancelled_real
             );
         } else {
             let value = problem(response, 503, Code::DeadlineExceeded).await;
-            assert_eq!(value.transaction_id.as_deref(), Some(id.as_str()));
+            assert_eq!(value.reservation_id.as_deref(), Some(id.as_str()));
             assert!(value.retryable);
         }
         stop.send(()).unwrap();
@@ -160,6 +160,6 @@ async fn processing_requires_durable_proof_and_shutdown_waits_for_cancelled_real
         let app = Application::new(store.inner)
             .scoped(Scope::new(TenantId::new("tenant").unwrap(), "workflow").unwrap());
         assert_eq!(app.resource("credits").unwrap().reserved_down, "10");
-        assert_eq!(app.transactions().unwrap().len(), 1);
+        assert_eq!(app.reservations().unwrap().len(), 1);
     }
 }

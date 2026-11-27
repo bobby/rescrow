@@ -1,4 +1,4 @@
-//! Pure transitions over a transaction's participants, independent of ledger size.
+//! Pure transitions over a reservation's participants, independent of ledger size.
 use super::*;
 
 /// Replacements that must become visible together. Only domain transitions can
@@ -6,17 +6,17 @@ use super::*;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Changes {
     resources: Vec<Resource>,
-    transaction: Option<Transaction>,
+    reservation: Option<Reservation>,
 }
 impl Changes {
     pub fn resources(&self) -> &[Resource] {
         &self.resources
     }
-    pub fn transaction(&self) -> Option<&Transaction> {
-        self.transaction.as_ref()
+    pub fn reservation(&self) -> Option<&Reservation> {
+        self.reservation.as_ref()
     }
     pub fn is_empty(&self) -> bool {
-        self.resources.is_empty() && self.transaction.is_none()
+        self.resources.is_empty() && self.reservation.is_none()
     }
 }
 
@@ -30,14 +30,14 @@ pub fn create(spec: ResourceSpec, existing: Option<&Resource>) -> Result<Changes
     }
     Ok(Changes {
         resources: vec![Resource::restore(spec.clone(), spec.initial, vec![])?],
-        transaction: None,
+        reservation: None,
     })
 }
 
-/// Check the loaded transaction's relationships to its declared participants.
+/// Check the loaded reservation's relationships to its declared participants.
 /// This does not reconstruct materialized balances from all historical commits.
 pub fn validate_participants(
-    tx: &Transaction,
+    tx: &Reservation,
     resources: &BTreeMap<Id, Resource>,
 ) -> Result<(), Error> {
     let missing_allowed = tx.state == State::Aborted(AbortReason::Rejected(Rejection::NotFound));
@@ -61,7 +61,7 @@ pub fn validate_participants(
 /// replay an identical existing one.
 pub fn prepare(
     request: Request,
-    existing: Option<&Transaction>,
+    existing: Option<&Reservation>,
     resources: &BTreeMap<Id, Resource>,
     now_ms: u64,
 ) -> Result<Changes, Error> {
@@ -110,7 +110,7 @@ pub fn prepare(
     }
     Ok(Changes {
         resources: replacements,
-        transaction: Some(Transaction {
+        reservation: Some(Reservation {
             request,
             expires_at_ms,
             state,
@@ -119,7 +119,7 @@ pub fn prepare(
 }
 
 pub fn commit(
-    tx: &Transaction,
+    tx: &Reservation,
     supplied: Option<Vec<(Id, i128)>>,
     resources: &BTreeMap<Id, Resource>,
 ) -> Result<Changes, Error> {
@@ -132,7 +132,7 @@ pub fn commit(
     }
 }
 
-pub fn abort(tx: &Transaction, resources: &BTreeMap<Id, Resource>) -> Result<Changes, Error> {
+pub fn abort(tx: &Reservation, resources: &BTreeMap<Id, Resource>) -> Result<Changes, Error> {
     validate_participants(tx, resources)?;
     match tx.state {
         State::Committed(_) => Err(Error::Conflict),
@@ -141,9 +141,9 @@ pub fn abort(tx: &Transaction, resources: &BTreeMap<Id, Resource>) -> Result<Cha
     }
 }
 
-/// Abort a prepared transaction whose deadline has passed by `now_ms`.
+/// Abort a prepared reservation whose deadline has passed by `now_ms`.
 pub fn lapse(
-    tx: &Transaction,
+    tx: &Reservation,
     resources: &BTreeMap<Id, Resource>,
     now_ms: u64,
 ) -> Result<Changes, Error> {
@@ -155,7 +155,7 @@ pub fn lapse(
 }
 
 fn finish(
-    tx: &Transaction,
+    tx: &Reservation,
     state: State,
     resources: &BTreeMap<Id, Resource>,
 ) -> Result<Changes, Error> {
@@ -176,7 +176,7 @@ fn finish(
         .collect::<Result<_, _>>()?;
     Ok(Changes {
         resources: replacements,
-        transaction: Some(Transaction {
+        reservation: Some(Reservation {
             request: tx.request.clone(),
             expires_at_ms: tx.expires_at_ms,
             state,

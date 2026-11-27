@@ -11,7 +11,7 @@ async fn socket_workflow_metadata_partial_decision_replay_and_isolation() {
     let token = admin("tenant-a");
     h.create("credits", &token).await;
     let original = h
-        .put("/v1/resources/credits", &token, spec())
+        .put("/admin/v1/resources/credits", &token, spec())
         .send()
         .await
         .unwrap();
@@ -19,7 +19,7 @@ async fn socket_workflow_metadata_partial_decision_replay_and_isolation() {
     let id = new_id();
     let request = prepare("-40");
     let first = h
-        .post("/v1/transactions", &token, request.clone())
+        .post("/v1/reservations", &token, request.clone())
         .header("idempotency-key", &id)
         .header("x-request-id", "test-request")
         .send()
@@ -28,25 +28,25 @@ async fn socket_workflow_metadata_partial_decision_replay_and_isolation() {
     assert_eq!(first.status(), 201);
     assert_eq!(
         first.headers()["location"],
-        format!("/v1/transactions/{id}")
+        format!("/v1/reservations/{id}")
     );
     assert_eq!(first.headers()["authority-generation"], h.generation);
     assert_eq!(first.headers()["durability-profile"], "simulation");
-    let first: Envelope<api::Transaction> = first.json().await.unwrap();
+    let first: Envelope<api::Reservation> = first.json().await.unwrap();
     assert_eq!(first.metadata.request_id, "test-request");
     assert!(!first.data.processing);
     assert_eq!(first.data.request_digest.len(), 71);
     let replay = h
-        .post("/v1/transactions", &token, request.clone())
+        .post("/v1/reservations", &token, request.clone())
         .header("idempotency-key", &id)
         .send()
         .await
         .unwrap();
     assert_eq!(replay.status(), 200);
-    let replay: Envelope<api::Transaction> = replay.json().await.unwrap();
+    let replay: Envelope<api::Reservation> = replay.json().await.unwrap();
     assert_eq!(replay.data, first.data);
     let conflict = h
-        .post("/v1/transactions", &token, prepare("-39"))
+        .post("/v1/reservations", &token, prepare("-39"))
         .header("idempotency-key", &id)
         .send()
         .await
@@ -54,7 +54,7 @@ async fn socket_workflow_metadata_partial_decision_replay_and_isolation() {
     problem(conflict, 409, Code::Conflict).await;
     let commit = h
         .post(
-            &format!("/v1/transactions/{id}/commit"),
+            &format!("/v1/reservations/{id}/commit"),
             &token,
             json!({"actuals":[{"operation_id":"op","delta":"-25"}]}),
         )
@@ -62,11 +62,11 @@ async fn socket_workflow_metadata_partial_decision_replay_and_isolation() {
         .await
         .unwrap();
     assert_eq!(commit.status(), 200);
-    let committed: Envelope<api::Transaction> = commit.json().await.unwrap();
+    let committed: Envelope<api::Reservation> = commit.json().await.unwrap();
     assert!(committed.data.actuals_digest.is_some());
     let replay = h
         .post(
-            &format!("/v1/transactions/{id}/commit"),
+            &format!("/v1/reservations/{id}/commit"),
             &token,
             json!({"actuals":[{"operation_id":"op","delta":"-25"}]}),
         )
@@ -76,7 +76,7 @@ async fn socket_workflow_metadata_partial_decision_replay_and_isolation() {
     assert_eq!(replay.status(), 200);
     problem(
         h.post(
-            &format!("/v1/transactions/{id}/commit"),
+            &format!("/v1/reservations/{id}/commit"),
             &token,
             json!({"actuals":[{"operation_id":"op","delta":"-24"}]}),
         )
@@ -88,7 +88,7 @@ async fn socket_workflow_metadata_partial_decision_replay_and_isolation() {
     )
     .await;
     problem(
-        h.post(&format!("/v1/transactions/{id}/abort"), &token, json!({}))
+        h.post(&format!("/v1/reservations/{id}/abort"), &token, json!({}))
             .send()
             .await
             .unwrap(),
@@ -128,7 +128,7 @@ async fn socket_workflow_metadata_partial_decision_replay_and_isolation() {
         .unwrap();
     assert_eq!(resource.data.observation.quantity, "60");
     problem(
-        h.get(&format!("/v1/transactions/{id}"), &other)
+        h.get(&format!("/v1/reservations/{id}"), &other)
             .send()
             .await
             .unwrap(),
@@ -136,8 +136,8 @@ async fn socket_workflow_metadata_partial_decision_replay_and_isolation() {
         Code::NotFound,
     )
     .await;
-    let list: Envelope<Page<api::Transaction>> = h
-        .get("/v1/transactions", &token)
+    let list: Envelope<Page<api::Reservation>> = h
+        .get("/v1/reservations", &token)
         .send()
         .await
         .unwrap()
@@ -175,7 +175,7 @@ async fn malformed_duplicate_expired_and_mismatched_authority_requests_have_prob
         .unwrap();
     problem(response, 401, Code::Unauthenticated).await;
     problem(
-        h.post("/v1/transactions", &token, request.clone())
+        h.post("/v1/reservations", &token, request.clone())
             .send()
             .await
             .unwrap(),
@@ -186,7 +186,7 @@ async fn malformed_duplicate_expired_and_mismatched_authority_requests_have_prob
     let id = new_id();
     let response = h
         .client
-        .post(format!("{}/v1/transactions", h.endpoint))
+        .post(format!("{}/v1/reservations", h.endpoint))
         .bearer_auth(&token)
         .header("content-type", "application/json")
         .header("idempotency-key", &id)
@@ -198,14 +198,14 @@ async fn malformed_duplicate_expired_and_mismatched_authority_requests_have_prob
     let expired =
         rescrow_application::uuid_v7(rescrow_application::system_clock() - 25 * 60 * 60 * 1000, 7);
     let response = h
-        .post("/v1/transactions", &token, request.clone())
+        .post("/v1/reservations", &token, request.clone())
         .header("idempotency-key", expired)
         .send()
         .await
         .unwrap();
     problem(response, 422, Code::Expired).await;
     let response = h
-        .post("/v1/transactions", &token, request.clone())
+        .post("/v1/reservations", &token, request.clone())
         .header("idempotency-key", &id)
         .header("require-authority-generation", new_id())
         .send()
@@ -213,7 +213,7 @@ async fn malformed_duplicate_expired_and_mismatched_authority_requests_have_prob
         .unwrap();
     problem(response, 409, Code::Conflict).await;
     let response = h
-        .post("/v1/transactions", &token, request)
+        .post("/v1/reservations", &token, request)
         .header("idempotency-key", &id)
         .header("require-durability-profile", "local")
         .send()
@@ -239,11 +239,11 @@ async fn concurrent_identical_preparations_report_exactly_one_creation() {
     h.create("credits", &token).await;
     let id = new_id();
     let a = h
-        .post("/v1/transactions", &token, prepare("-40"))
+        .post("/v1/reservations", &token, prepare("-40"))
         .header("idempotency-key", &id)
         .send();
     let b = h
-        .post("/v1/transactions", &token, prepare("-40"))
+        .post("/v1/reservations", &token, prepare("-40"))
         .header("idempotency-key", &id)
         .send();
     let (a, b) = tokio::join!(a, b);
@@ -254,13 +254,13 @@ async fn concurrent_identical_preparations_report_exactly_one_creation() {
     let data: Envelope<api::Resource> = response.json().await.unwrap();
     assert_eq!(data.data.observation.reserved_down, "40");
     let response = h
-        .post(&format!("/v1/transactions/{id}/abort"), &token, json!({}))
+        .post(&format!("/v1/reservations/{id}/abort"), &token, json!({}))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
     let response = h
-        .post(&format!("/v1/transactions/{id}/abort"), &token, json!({}))
+        .post(&format!("/v1/reservations/{id}/abort"), &token, json!({}))
         .send()
         .await
         .unwrap();
@@ -275,7 +275,7 @@ async fn every_endpoint_rechecks_scopes_and_resource_grants() {
     h.create("credits", &admin).await;
     let id = new_id();
     assert_eq!(
-        h.post("/v1/transactions", &admin, prepare("-10"))
+        h.post("/v1/reservations", &admin, prepare("-10"))
             .header("idempotency-key", &id)
             .send()
             .await
@@ -286,38 +286,38 @@ async fn every_endpoint_rechecks_scopes_and_resource_grants() {
     let endpoints = [
         (
             "PUT",
-            "/v1/resources/other".to_owned(),
+            "/admin/v1/resources/other".to_owned(),
             "resource:create",
             spec(),
         ),
         (
             "POST",
-            "/v1/transactions".into(),
-            "transaction:prepare",
+            "/v1/reservations".into(),
+            "reservation:prepare",
             prepare("-10"),
         ),
         (
             "POST",
-            format!("/v1/transactions/{id}/commit"),
-            "transaction:commit",
+            format!("/v1/reservations/{id}/commit"),
+            "reservation:commit",
             json!({}),
         ),
         (
             "POST",
-            format!("/v1/transactions/{id}/abort"),
-            "transaction:abort",
+            format!("/v1/reservations/{id}/abort"),
+            "reservation:abort",
             json!({}),
         ),
         ("GET", "/v1/resources".into(), "read", json!({})),
         ("GET", "/v1/resources/credits".into(), "read", json!({})),
-        ("GET", "/v1/transactions".into(), "read", json!({})),
-        ("GET", format!("/v1/transactions/{id}"), "read", json!({})),
+        ("GET", "/v1/reservations".into(), "read", json!({})),
+        ("GET", format!("/v1/reservations/{id}"), "read", json!({})),
     ];
     let scopes = [
         "resource:create",
-        "transaction:prepare",
-        "transaction:commit",
-        "transaction:abort",
+        "reservation:prepare",
+        "reservation:commit",
+        "reservation:abort",
         "read",
     ];
     for (method, path, scope, body) in endpoints {
@@ -348,7 +348,7 @@ async fn every_endpoint_rechecks_scopes_and_resource_grants() {
         json!({"iss":"https://issuer.example","aud":"rescrow","sub":"agent","exp":jsonwebtoken::get_current_timestamp()+3600,"tenant":"tenant","namespace":"workflow","credential_id":"agent-credential","scopes":scopes,"resources":[{"resource_prefix":"credits","debit":true,"credit":false,"max_amount":"9"}]}),
     );
     problem(
-        h.post("/v1/transactions", &narrow, prepare("-10"))
+        h.post("/v1/reservations", &narrow, prepare("-10"))
             .header("idempotency-key", &id)
             .send()
             .await
@@ -358,7 +358,7 @@ async fn every_endpoint_rechecks_scopes_and_resource_grants() {
     )
     .await;
     problem(
-        h.post("/v1/transactions", &narrow, prepare("1"))
+        h.post("/v1/reservations", &narrow, prepare("1"))
             .header("idempotency-key", new_id())
             .send()
             .await
@@ -368,7 +368,7 @@ async fn every_endpoint_rechecks_scopes_and_resource_grants() {
     )
     .await;
     problem(
-        h.put("/v1/resources/other", &narrow, spec())
+        h.put("/admin/v1/resources/other", &narrow, spec())
             .send()
             .await
             .unwrap(),
@@ -384,7 +384,7 @@ async fn every_endpoint_rechecks_scopes_and_resource_grants() {
     .await;
     let other_namespace = token("tenant", Some("other"), &scopes);
     problem(
-        h.get(&format!("/v1/transactions/{id}"), &other_namespace)
+        h.get(&format!("/v1/reservations/{id}"), &other_namespace)
             .send()
             .await
             .unwrap(),
@@ -395,7 +395,7 @@ async fn every_endpoint_rechecks_scopes_and_resource_grants() {
     let mut foreign = prepare("-1");
     foreign["namespace"] = json!("other");
     problem(
-        h.post("/v1/transactions", &admin, foreign)
+        h.post("/v1/reservations", &admin, foreign)
             .header("idempotency-key", new_id())
             .send()
             .await
@@ -488,7 +488,7 @@ async fn configured_limits_shed_admission_while_decisions_and_recovery_progress(
     let mut value = prepare("-1");
     value["context"] = json!({"k":"1234"});
     problem(
-        h.post("/v1/transactions", &token, value)
+        h.post("/v1/reservations", &token, value)
             .header("idempotency-key", new_id())
             .send()
             .await
@@ -503,7 +503,7 @@ async fn configured_limits_shed_admission_while_decisions_and_recovery_progress(
         .unwrap()
         .push(json!({"operation_id":"b","resource_id":"b","delta":"-1"}));
     problem(
-        h.post("/v1/transactions", &token, value)
+        h.post("/v1/reservations", &token, value)
             .header("idempotency-key", new_id())
             .send()
             .await
@@ -513,7 +513,7 @@ async fn configured_limits_shed_admission_while_decisions_and_recovery_progress(
     )
     .await;
     problem(
-        h.post("/v1/transactions", &token, prepare("-101"))
+        h.post("/v1/reservations", &token, prepare("-101"))
             .header("idempotency-key", new_id())
             .send()
             .await
@@ -526,7 +526,7 @@ async fn configured_limits_shed_admission_while_decisions_and_recovery_progress(
     let mut boundary = prepare("-1");
     boundary["context"] = json!({"k":"123"});
     assert_eq!(
-        h.post("/v1/transactions", &token, boundary)
+        h.post("/v1/reservations", &token, boundary)
             .header("idempotency-key", &id)
             .send()
             .await
@@ -536,7 +536,7 @@ async fn configured_limits_shed_admission_while_decisions_and_recovery_progress(
     );
     let blocked = new_id();
     let response = h
-        .post("/v1/transactions", &token, prepare("-1"))
+        .post("/v1/reservations", &token, prepare("-1"))
         .header("idempotency-key", &blocked)
         .send()
         .await
@@ -544,7 +544,7 @@ async fn configured_limits_shed_admission_while_decisions_and_recovery_progress(
     assert_eq!(response.headers()["retry-after"], "1");
     problem(response, 429, Code::Throttled).await;
     assert_eq!(
-        h.get(&format!("/v1/transactions/{id}"), &token)
+        h.get(&format!("/v1/reservations/{id}"), &token)
             .send()
             .await
             .unwrap()
@@ -552,7 +552,7 @@ async fn configured_limits_shed_admission_while_decisions_and_recovery_progress(
         200
     );
     assert_eq!(
-        h.post(&format!("/v1/transactions/{id}/abort"), &token, json!({}))
+        h.post(&format!("/v1/reservations/{id}/abort"), &token, json!({}))
             .send()
             .await
             .unwrap()
@@ -560,7 +560,7 @@ async fn configured_limits_shed_admission_while_decisions_and_recovery_progress(
         200
     );
     assert_eq!(
-        h.post("/v1/transactions", &token, prepare("-1"))
+        h.post("/v1/reservations", &token, prepare("-1"))
             .header("idempotency-key", &blocked)
             .send()
             .await
@@ -570,7 +570,7 @@ async fn configured_limits_shed_admission_while_decisions_and_recovery_progress(
     );
     let response = h
         .client
-        .post(format!("{}/v1/transactions", h.endpoint))
+        .post(format!("{}/v1/reservations", h.endpoint))
         .bearer_auth(&token)
         .header("content-type", "application/json")
         .header("idempotency-key", new_id())
@@ -587,7 +587,7 @@ async fn configured_limits_shed_admission_while_decisions_and_recovery_progress(
     let token = admin("tenant");
     h.create("credits", &token).await;
     problem(
-        h.post("/v1/transactions", &token, prepare("-1"))
+        h.post("/v1/reservations", &token, prepare("-1"))
             .header("idempotency-key", new_id())
             .send()
             .await
@@ -604,5 +604,132 @@ async fn configured_limits_shed_admission_while_decisions_and_recovery_progress(
             .status(),
         200
     );
+    h.finish().await;
+}
+
+#[tokio::test]
+async fn reservation_names_and_admin_creation_replace_the_previous_interface() {
+    let h = Harness::start(Limits::default()).await;
+    let token = admin("tenant");
+    let created = h
+        .put("/admin/v1/resources/credits", &token, spec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    assert_eq!(created.headers()["location"], "/v1/resources/credits");
+    let created: Envelope<api::Resource> = created.json().await.unwrap();
+    assert_eq!(created.data.spec.resource_id, "credits");
+    assert_eq!(created.links["self"], "/v1/resources/credits");
+    assert_eq!(
+        h.get(&created.links["self"], &token)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    problem(
+        h.put("/v1/resources/credits", &token, spec())
+            .send()
+            .await
+            .unwrap(),
+        405,
+        Code::MethodNotAllowed,
+    )
+    .await;
+    let reader = support::token("tenant", Some("workflow"), &["read"]);
+    problem(
+        h.put("/admin/v1/resources/forbidden", &reader, spec())
+            .send()
+            .await
+            .unwrap(),
+        403,
+        Code::Forbidden,
+    )
+    .await;
+    let id = new_id();
+    for (method, path) in [
+        ("POST", "/v1/transactions".to_string()),
+        ("GET", "/v1/transactions".to_string()),
+        ("GET", format!("/v1/transactions/{id}")),
+        ("POST", format!("/v1/transactions/{id}/commit")),
+        ("POST", format!("/v1/transactions/{id}/abort")),
+    ] {
+        let mut request = h
+            .client
+            .request(method.parse().unwrap(), format!("{}{path}", h.endpoint))
+            .bearer_auth(&token);
+        if method == "POST" {
+            request = request.header("idempotency-key", &id).json(&prepare("-1"));
+        }
+        problem(request.send().await.unwrap(), 404, Code::NotFound).await;
+    }
+    // Retired scope names are invalid claims, never aliases for the new scopes.
+    let old_scope = support::token("tenant", Some("workflow"), &["transaction:prepare"]);
+    problem(
+        h.post("/v1/reservations", &old_scope, prepare("-1"))
+            .header("idempotency-key", &id)
+            .send()
+            .await
+            .unwrap(),
+        401,
+        Code::Unauthenticated,
+    )
+    .await;
+    // Body identifiers are never accepted in place of the idempotency header.
+    let mut old_field = prepare("-1");
+    old_field["transaction_id"] = json!(&id);
+    problem(
+        h.post("/v1/reservations", &token, old_field)
+            .header("idempotency-key", &id)
+            .send()
+            .await
+            .unwrap(),
+        422,
+        Code::InvalidInput,
+    )
+    .await;
+    problem(
+        h.get(&format!("/v1/reservations/{id}"), &token)
+            .send()
+            .await
+            .unwrap(),
+        404,
+        Code::NotFound,
+    )
+    .await;
+    let response = h
+        .post("/v1/reservations", &token, prepare("-1"))
+        .header("idempotency-key", &id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    assert_eq!(
+        response.headers()["location"],
+        format!("/v1/reservations/{id}")
+    );
+    let value: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        value["data"]["reservation"]["request"]["reservation_id"],
+        id
+    );
+    assert!(value["data"].get("transaction").is_none());
+    assert!(
+        value["data"]["reservation"]["request"]
+            .get("transaction_id")
+            .is_none()
+    );
+    let response = h
+        .post("/v1/reservations", &token, prepare("-100"))
+        .header("idempotency-key", new_id())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    let value: serde_json::Value = response.json().await.unwrap();
+    assert!(value["reservation_id"].is_string());
+    assert!(value.get("transaction_id").is_none());
     h.finish().await;
 }

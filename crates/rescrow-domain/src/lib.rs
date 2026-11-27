@@ -40,9 +40,9 @@ impl std::fmt::Display for Error {
             Self::InvalidAuthorization => "authorization facts or resource grants are invalid",
             Self::AdmissionLimit => "outstanding hold limit reached; settle existing holds before retrying",
             Self::Overflow => "quantity, magnitude, offset, or reservation total exceeds signed 128-bit range",
-            Self::NotFound => "referenced resource or transaction does not exist",
+            Self::NotFound => "referenced resource or reservation does not exist",
             Self::Conflict => "request conflicts with an existing identity or terminal decision",
-            Self::InvalidLedger => "resource balances, holds, and transaction records disagree",
+            Self::InvalidLedger => "resource balances, holds, and reservation records disagree",
         })
     }
 }
@@ -71,7 +71,7 @@ impl Id {
     pub fn as_str(&self) -> &str {
         &self.value
     }
-    /// Qualify a transaction identity without joining strings or changing its
+    /// Qualify a reservation identity without joining strings or changing its
     /// external ID. Resource and operation identities remain unqualified.
     pub fn qualified(namespace: Id, id: Id) -> Result<Self, Error> {
         if namespace.namespace.is_some() || id.namespace.is_some() {
@@ -315,13 +315,13 @@ pub enum State {
     Aborted(AbortReason),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Transaction {
+pub struct Reservation {
     request: Request,
     /// When the hold may lapse, fixed at admission from the request's hold.
     expires_at_ms: Option<u64>,
     state: State,
 }
-impl Transaction {
+impl Reservation {
     pub fn restore(
         request: Request,
         expires_at_ms: Option<u64>,
@@ -501,12 +501,12 @@ impl Resource {
         })
     }
     /// Reusable participant rule: opposite-direction pending changes never supply capacity.
-    pub fn reserve(&self, transaction: &Id, delta: i128) -> Result<Self, Error> {
+    pub fn reserve(&self, reservation: &Id, delta: i128) -> Result<Self, Error> {
         if delta == 0 || delta == i128::MIN {
             return Err(Error::InvalidOperations);
         }
         let mut next = self.clone();
-        if next.holds.insert(transaction.clone(), delta).is_some() {
+        if next.holds.insert(reservation.clone(), delta).is_some() {
             return Err(Error::Conflict);
         }
         next.availability = match next.calculate_availability() {
@@ -526,9 +526,9 @@ impl Resource {
         };
         Ok(next)
     }
-    fn settle(&self, transaction: &Id, actual: i128) -> Result<Self, Error> {
+    fn settle(&self, reservation: &Id, actual: i128) -> Result<Self, Error> {
         let mut next = self.clone();
-        let reserved = next.holds.remove(transaction).ok_or(Error::InvalidLedger)?;
+        let reserved = next.holds.remove(reservation).ok_or(Error::InvalidLedger)?;
         if (actual != 0 && actual.signum() != reserved.signum())
             || actual.checked_abs().ok_or(Error::InvalidActuals)? > reserved.abs()
         {
@@ -543,14 +543,14 @@ impl Resource {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Ledger {
     resources: BTreeMap<Id, Resource>,
-    transactions: BTreeMap<Id, Transaction>,
+    reservations: BTreeMap<Id, Reservation>,
 }
 impl Ledger {
     pub fn resources(&self) -> &BTreeMap<Id, Resource> {
         &self.resources
     }
-    pub fn transactions(&self) -> &BTreeMap<Id, Transaction> {
-        &self.transactions
+    pub fn reservations(&self) -> &BTreeMap<Id, Reservation> {
+        &self.reservations
     }
     pub fn create(&self, spec: ResourceSpec) -> Result<Self, Error> {
         let changes = transition::create(spec.clone(), self.resources.get(spec.id()))?;
@@ -559,18 +559,18 @@ impl Ledger {
     pub fn prepare(&self, request: Request, now_ms: u64) -> Result<Self, Error> {
         let changes = transition::prepare(
             request.clone(),
-            self.transactions.get(request.id()),
+            self.reservations.get(request.id()),
             &self.resources,
             now_ms,
         )?;
         Ok(self.apply(changes))
     }
     pub fn commit(&self, id: &Id, supplied: Option<Vec<(Id, i128)>>) -> Result<Self, Error> {
-        let tx = self.transactions.get(id).ok_or(Error::NotFound)?;
+        let tx = self.reservations.get(id).ok_or(Error::NotFound)?;
         Ok(self.apply(transition::commit(tx, supplied, &self.resources)?))
     }
     pub fn abort(&self, id: &Id) -> Result<Self, Error> {
-        let tx = self.transactions.get(id).ok_or(Error::NotFound)?;
+        let tx = self.reservations.get(id).ok_or(Error::NotFound)?;
         Ok(self.apply(transition::abort(tx, &self.resources)?))
     }
     fn apply(&self, changes: transition::Changes) -> Self {
@@ -579,8 +579,8 @@ impl Ledger {
             next.resources
                 .insert(resource.spec().id().clone(), resource.clone());
         }
-        if let Some(tx) = changes.transaction() {
-            next.transactions
+        if let Some(tx) = changes.reservation() {
+            next.reservations
                 .insert(tx.request().id().clone(), tx.clone());
         }
         next
@@ -588,7 +588,7 @@ impl Ledger {
     /// Reconstruct trusted state only after validating every cross-record invariant.
     pub fn restore(
         resources: Vec<Resource>,
-        transactions: Vec<Transaction>,
+        reservations: Vec<Reservation>,
     ) -> Result<Self, Error> {
         let mut ledger = Self::default();
         for r in resources {
@@ -596,9 +596,9 @@ impl Ledger {
                 return Err(Error::InvalidLedger);
             }
         }
-        for tx in transactions {
+        for tx in reservations {
             if ledger
-                .transactions
+                .reservations
                 .insert(tx.request.id.clone(), tx)
                 .is_some()
             {
@@ -615,7 +615,7 @@ impl Ledger {
             .iter()
             .map(|(id, r)| (id.clone(), vec![r.spec.initial]))
             .collect();
-        for (id, tx) in &ledger.transactions {
+        for (id, tx) in &ledger.reservations {
             for op in &tx.request.operations {
                 // Only a retained missing-resource rejection may reference an
                 // absent resource. It cannot carry any hold or committed effect.
@@ -647,7 +647,7 @@ impl Ledger {
     }
 }
 
-// Sum opposite signs first so a valid final total doesn't depend on transaction ID order.
+// Sum opposite signs first so a valid final total doesn't depend on reservation ID order.
 fn checked_sum(values: &[i128]) -> Result<i128, Error> {
     let mut positive = values.iter().copied().filter(|v| *v >= 0);
     let mut negative = values.iter().copied().filter(|v| *v < 0);
@@ -665,28 +665,28 @@ fn checked_sum(values: &[i128]) -> Result<i128, Error> {
     }
 }
 
-/// Current resources and the transactions still holding capacity. Terminal
+/// Current resources and the reservations still holding capacity. Terminal
 /// history lives outside this value, so its size depends only on resources and
 /// open reservations.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Live {
     resources: BTreeMap<Id, Resource>,
-    prepared: BTreeMap<Id, Transaction>,
+    prepared: BTreeMap<Id, Reservation>,
 }
 impl Live {
     pub fn resources(&self) -> &BTreeMap<Id, Resource> {
         &self.resources
     }
-    pub fn prepared(&self) -> &BTreeMap<Id, Transaction> {
+    pub fn prepared(&self) -> &BTreeMap<Id, Reservation> {
         &self.prepared
     }
-    /// Prepared transactions holding any of `resources` whose deadline has
+    /// Prepared reservations holding any of `resources` whose deadline has
     /// passed by `now_ms`, in ID order.
     pub fn due<'a>(
         &self,
         resources: impl IntoIterator<Item = &'a Id>,
         now_ms: u64,
-    ) -> Vec<&Transaction> {
+    ) -> Vec<&Reservation> {
         let ids: BTreeSet<&Id> = resources
             .into_iter()
             .filter_map(|id| self.resources.get(id))
@@ -697,16 +697,16 @@ impl Live {
             .filter(|tx| tx.is_due(now_ms))
             .collect()
     }
-    /// The earliest deadline among prepared transactions, if any has one.
+    /// The earliest deadline among prepared reservations, if any has one.
     pub fn next_deadline(&self) -> Option<u64> {
         self.prepared
             .values()
-            .filter_map(Transaction::expires_at_ms)
+            .filter_map(Reservation::expires_at_ms)
             .min()
     }
-    /// Validate that holds and prepared transactions describe each other exactly.
+    /// Validate that holds and prepared reservations describe each other exactly.
     /// Balances are not reconstructed from history; a full Ledger restore does that.
-    pub fn restore(resources: Vec<Resource>, prepared: Vec<Transaction>) -> Result<Self, Error> {
+    pub fn restore(resources: Vec<Resource>, prepared: Vec<Reservation>) -> Result<Self, Error> {
         let mut live = Self::default();
         for r in resources {
             if live.resources.insert(r.spec.id.clone(), r).is_some() {
@@ -748,7 +748,7 @@ impl Live {
             next.resources
                 .insert(resource.spec.id.clone(), resource.clone());
         }
-        if let Some(tx) = changes.transaction() {
+        if let Some(tx) = changes.reservation() {
             if tx.state == State::Prepared {
                 next.prepared.insert(tx.request.id.clone(), tx.clone());
             } else {
@@ -764,7 +764,7 @@ impl Ledger {
         Live {
             resources: self.resources.clone(),
             prepared: self
-                .transactions
+                .reservations
                 .iter()
                 .filter(|(_, tx)| tx.state == State::Prepared)
                 .map(|(id, tx)| (id.clone(), tx.clone()))

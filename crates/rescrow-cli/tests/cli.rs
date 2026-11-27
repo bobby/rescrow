@@ -161,13 +161,13 @@ fn separate_process_walkthrough_partial_commit_abort_and_replay() {
         "tokens",
     ]);
     let ops=c.file("ops.json",r#"[{"operation_id":"a","resource_id":"r","delta":"-40"},{"operation_id":"b","resource_id":"s","delta":"-3"}]"#);
-    c.ok(&["transaction", "prepare", &tx("work"), "--operations", &ops]);
+    c.ok(&["reservation", "prepare", &tx("work"), "--operations", &ops]);
     let other = c.file(
         "other.json",
         r#"[{"operation_id":"a","resource_id":"r","delta":"30"}]"#,
     );
     c.ok(&[
-        "transaction",
+        "reservation",
         "prepare",
         &tx("other"),
         "--operations",
@@ -184,12 +184,12 @@ fn separate_process_walkthrough_partial_commit_abort_and_replay() {
         "actual.json",
         r#"[{"operation_id":"a","delta":"-25"},{"operation_id":"b","delta":"0"}]"#,
     );
-    c.ok(&["transaction", "commit", &tx("work"), "--actuals", &actual]);
+    c.ok(&["reservation", "commit", &tx("work"), "--actuals", &actual]);
     let before = c.snapshot();
-    c.ok(&["transaction", "commit", &tx("work"), "--actuals", &actual]);
-    c.ok(&["transaction", "prepare", &tx("work"), "--operations", &ops]);
+    c.ok(&["reservation", "commit", &tx("work"), "--actuals", &actual]);
+    c.ok(&["reservation", "prepare", &tx("work"), "--operations", &ops]);
     assert_eq!(c.snapshot(), before);
-    c.ok(&["transaction", "abort", &tx("other")]);
+    c.ok(&["reservation", "abort", &tx("other")]);
     let Output::Resource(r) = c.ok(&["resource", "show", "r"]) else {
         panic!()
     };
@@ -200,14 +200,14 @@ fn separate_process_walkthrough_partial_commit_abort_and_replay() {
     };
     assert_eq!(s.quantity, "8");
     c.ok(&["resource", "list"]);
-    c.ok(&["transaction", "list"]);
-    c.ok(&["transaction", "show", &tx("work")]);
+    c.ok(&["reservation", "list"]);
+    c.ok(&["reservation", "show", &tx("work")]);
     assert_eq!(
-        c.run(&["transaction", "abort", &tx("work")]).status.code(),
+        c.run(&["reservation", "abort", &tx("work")]).status.code(),
         Some(4)
     );
     assert_eq!(
-        c.run(&["transaction", "commit", &tx("other")])
+        c.run(&["reservation", "commit", &tx("other")])
             .status
             .code(),
         Some(4)
@@ -224,7 +224,7 @@ fn independent_processes_cannot_over_reserve_scarce_capacity() {
     let ids: Vec<_> = (0..20).map(|n| tx(&format!("t{n}"))).collect();
     let requests: Vec<_> = ids
         .iter()
-        .map(|id| ["transaction", "prepare", id, "--operations", &ops])
+        .map(|id| ["reservation", "prepare", id, "--operations", &ops])
         .collect();
     let children: Vec<_> = requests.iter().map(|args| c.spawn(args)).collect();
     let mut successes = 0;
@@ -241,7 +241,7 @@ fn independent_processes_cannot_over_reserve_scarce_capacity() {
     }
     assert_eq!(successes, 5);
     let snapshot = c.snapshot();
-    assert_eq!(snapshot.transactions.len(), 20);
+    assert_eq!(snapshot.reservations.len(), 20);
     assert_eq!(snapshot.resources[0].reserved_down, "5");
     assert_eq!(snapshot.resources[0].quantity, "5");
 }
@@ -254,8 +254,8 @@ fn identical_prepare_and_commit_replays_publish_once() {
         r#"[{"operation_id":"o","resource_id":"r","delta":"-3"}]"#,
     );
     for args in [
-        vec!["transaction", "prepare", &tx("same"), "--operations", &ops],
-        vec!["transaction", "commit", &tx("same")],
+        vec!["reservation", "prepare", &tx("same"), "--operations", &ops],
+        vec!["reservation", "commit", &tx("same")],
     ] {
         let before = c.snapshot().revision;
         let children: Vec<_> = (0..12).map(|_| c.spawn(&args)).collect();
@@ -282,10 +282,10 @@ fn commit_abort_race_has_exactly_one_terminal_decision() {
     let mut commits = 0;
     for n in 0..12 {
         let id = tx(&format!("t{n}"));
-        c.ok(&["transaction", "prepare", &id, "--operations", &ops]);
+        c.ok(&["reservation", "prepare", &id, "--operations", &ops]);
         let (commit_args, abort_args) = (
-            ["transaction", "commit", id.as_str()],
-            ["transaction", "abort", id.as_str()],
+            ["reservation", "commit", id.as_str()],
+            ["reservation", "abort", id.as_str()],
         );
         let commit = c.spawn(&commit_args);
         let abort = c.spawn(&abort_args);
@@ -300,9 +300,9 @@ fn commit_abort_race_has_exactly_one_terminal_decision() {
         }
         let before = c.snapshot();
         if committed.status.success() {
-            c.ok(&["transaction", "commit", &id]);
+            c.ok(&["reservation", "commit", &id]);
         } else {
-            c.ok(&["transaction", "abort", &id]);
+            c.ok(&["reservation", "abort", &id]);
         }
         assert_eq!(c.snapshot(), before);
     }
@@ -332,7 +332,7 @@ fn new_id_prints_distinct_current_uuid_v7s() {
         "ops.json",
         r#"[{"operation_id":"o","resource_id":"r","delta":"-1"}]"#,
     );
-    c.ok(&["transaction", "prepare", &first, "--operations", &ops]);
+    c.ok(&["reservation", "prepare", &first, "--operations", &ops]);
 }
 #[test]
 fn machine_errors_invalid_inputs_and_exact_large_signed_values() {
@@ -364,7 +364,7 @@ fn machine_errors_invalid_inputs_and_exact_large_signed_values() {
     );
     let before = c.snapshot();
     let output = c.run(&[
-        "transaction",
+        "reservation",
         "prepare",
         &tx("bad"),
         "--operations",
@@ -379,7 +379,7 @@ fn machine_errors_invalid_inputs_and_exact_large_signed_values() {
     );
     assert_eq!(
         c.run(&[
-            "transaction",
+            "reservation",
             "prepare",
             &tx("reject"),
             "--operations",
@@ -389,7 +389,7 @@ fn machine_errors_invalid_inputs_and_exact_large_signed_values() {
         .code(),
         Some(3)
     );
-    assert_eq!(c.snapshot().transactions.len(), 1);
+    assert_eq!(c.snapshot().reservations.len(), 1);
     assert_eq!(c.run(&["init"]).status.code(), Some(4));
     let human = c
         .command(&["resource", "show", "large"], false)
@@ -412,14 +412,14 @@ fn an_abandoned_hold_lapses_when_a_later_prepare_needs_its_capacity() {
     );
     let prepare = |name: &str, extra: &[&str]| {
         let id = tx(name);
-        let mut args = vec!["transaction", "prepare", &id, "--operations", &all];
+        let mut args = vec!["reservation", "prepare", &id, "--operations", &all];
         args.extend_from_slice(extra);
         c.run(&args)
     };
     let held = prepare("abandoned", &["--hold", "1s"]);
     assert!(held.status.success());
-    let Output::Transaction(held) = serde_json::from_slice(&held.stdout).unwrap() else {
-        panic!("expected a transaction")
+    let Output::Reservation(held) = serde_json::from_slice(&held.stdout).unwrap() else {
+        panic!("expected a reservation")
     };
     assert_eq!(held.request.hold_ms, Some(1_000));
     assert!(held.expires_at_ms.is_some());
@@ -427,8 +427,8 @@ fn an_abandoned_hold_lapses_when_a_later_prepare_needs_its_capacity() {
     assert_eq!(prepare("early", &[]).status.code(), Some(3));
     std::thread::sleep(std::time::Duration::from_millis(1_100));
     assert!(prepare("later", &[]).status.success());
-    let Output::Transaction(lapsed) = c.ok(&["transaction", "show", &tx("abandoned")]) else {
-        panic!("expected a transaction")
+    let Output::Reservation(lapsed) = c.ok(&["reservation", "show", &tx("abandoned")]) else {
+        panic!("expected a reservation")
     };
     assert_eq!(
         lapsed.state,
@@ -438,7 +438,7 @@ fn an_abandoned_hold_lapses_when_a_later_prepare_needs_its_capacity() {
         }
     );
     assert_eq!(
-        c.run(&["transaction", "commit", &tx("abandoned")])
+        c.run(&["reservation", "commit", &tx("abandoned")])
             .status
             .code(),
         Some(4)
@@ -451,4 +451,19 @@ fn an_abandoned_hold_lapses_when_a_later_prepare_needs_its_capacity() {
             "{invalid}"
         );
     }
+}
+
+#[test]
+fn transaction_is_not_an_alias_for_the_reservation_command() {
+    let output = Process::new(env!("CARGO_BIN_EXE_rescrow"))
+        .args(["transaction", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("unrecognized subcommand")
+    );
 }

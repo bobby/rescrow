@@ -59,9 +59,9 @@ claims = {
     "credential_id": "development-admin",
     "scopes": [
         "resource:create",
-        "transaction:prepare",
-        "transaction:commit",
-        "transaction:abort",
+        "reservation:prepare",
+        "reservation:commit",
+        "reservation:abort",
         "read",
     ],
     "resources": [

@@ -26,7 +26,7 @@ pub fn run(store: &impl Readiness, hooks: Hooks<'_>) {
             .expect("crash/reopen qualification hook required")();
     }
 }
-/// Identical resource/transaction IDs in two tenants, and independent namespaces
+/// Identical resource/reservation IDs in two tenants, and independent namespaces
 /// sharing one tenant's capacity, through the same public Application API.
 pub fn tenancy<S: TransactionalStore + Readiness + Clone>(store: S) {
     store.initialize().unwrap();
@@ -53,7 +53,7 @@ pub fn tenancy<S: TransactionalStore + Readiness + Clone>(store: S) {
     let request = dto::Prepare {
         context: Default::default(),
         authorization: None,
-        transaction_id: id.clone(),
+        reservation_id: id.clone(),
         namespace: None,
         hold_ms: None,
         operations: vec![dto::Operation {
@@ -70,7 +70,7 @@ pub fn tenancy<S: TransactionalStore + Readiness + Clone>(store: S) {
     assert_eq!(a.resource("r").unwrap().reserved_down, "8");
     assert_eq!(b.resource("r").unwrap().reserved_down, "4");
     a.commit(dto::Commit {
-        transaction_id: id.clone(),
+        reservation_id: id.clone(),
         actuals: Some(vec![dto::Actual {
             operation_id: "op".into(),
             delta: "-2".into(),
@@ -78,18 +78,18 @@ pub fn tenancy<S: TransactionalStore + Readiness + Clone>(store: S) {
     })
     .unwrap();
     assert!(matches!(
-        b.transaction(&id).unwrap().state,
+        b.reservation(&id).unwrap().state,
         dto::State::Prepared {}
     ));
     a2.abort(&id).unwrap();
     assert_eq!(a.resource("r").unwrap().quantity, "8");
     assert_eq!(b.resource("r").unwrap().quantity, "10");
-    assert_eq!(a.transactions().unwrap().len(), 1);
-    assert_eq!(a2.transactions().unwrap().len(), 1);
-    assert_eq!(b.transactions().unwrap().len(), 1);
+    assert_eq!(a.reservations().unwrap().len(), 1);
+    assert_eq!(a2.reservations().unwrap().len(), 1);
+    assert_eq!(b.reservations().unwrap().len(), 1);
     assert!(app("absent", "one").resources().unwrap().is_empty());
     assert_eq!(
-        app("absent", "one").transaction(&id).unwrap_err().code,
+        app("absent", "one").reservation(&id).unwrap_err().code,
         rescrow_application::Code::NotFound
     );
     a.snapshot().unwrap();

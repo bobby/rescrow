@@ -60,7 +60,7 @@ fn prepare(id: &str) -> Command {
         context: Default::default(),
         authorization: None,
         namespace: None,
-        transaction_id: id.into(),
+        reservation_id: id.into(),
         operations: vec![Operation {
             operation_id: "o".into(),
             resource_id: "r".into(),
@@ -88,7 +88,7 @@ fn show<S: LogStore + Send + Sync + 'static>(service: &Service<S>) -> (String, S
 fn lapsed(output: Output) -> bool {
     matches!(
         output,
-        Output::Transaction(Transaction {
+        Output::Reservation(Reservation {
             state: State::Aborted {
                 cause: AbortReason::Lapsed,
                 ..
@@ -104,8 +104,8 @@ fn lapses(store: &MemoryStore, id: &str) -> usize {
         .unwrap()
         .into_iter()
         .filter(|e| match &e.record {
-            Record::Transaction(tx) => {
-                tx.request.transaction_id == id
+            Record::Reservation(tx) => {
+                tx.request.reservation_id == id
                     && matches!(
                         tx.state,
                         State::Aborted {
@@ -180,7 +180,7 @@ fn concurrent_writes_commit_together_without_over_reserving() {
     assert!(batches < 10, "{batches} batches for {writes} writes");
     // Every rejection is recorded, and the in-memory state matches history.
     let snapshot = Application::new(store.clone()).snapshot().unwrap();
-    assert_eq!(snapshot.transactions.len(), 40);
+    assert_eq!(snapshot.reservations.len(), 40);
     assert_eq!(snapshot.resources[0].reserved_down, "5");
     assert_eq!(
         service.execute(Command::ListResources).unwrap(),
@@ -237,10 +237,10 @@ fn another_writer_is_detected_and_reloaded() {
         service.execute(prepare(&id(3))).unwrap_err().code,
         Code::Capacity
     );
-    // A transaction the other writer prepared is visible to settle.
+    // A reservation the other writer prepared is visible to settle.
     service
         .execute(Command::Abort {
-            transaction_id: theirs,
+            reservation_id: theirs,
         })
         .unwrap();
     assert_eq!(show(), ("2".into(), "1".into()));
@@ -281,7 +281,7 @@ fn an_unknown_outcome_reaches_every_write_in_its_batch_and_reloads() {
         service.execute(prepare(id)).unwrap();
     }
     let snapshot = Application::new(store.clone()).snapshot().unwrap();
-    assert_eq!(snapshot.transactions.len(), 5);
+    assert_eq!(snapshot.reservations.len(), 5);
     assert_eq!(snapshot.resources[0].reserved_down, "5");
 }
 
@@ -301,8 +301,8 @@ fn an_idle_service_lapses_a_hold_at_its_deadline() {
         );
         thread::sleep(Duration::from_millis(5));
     }
-    let show_tx = Command::ShowTransaction {
-        transaction_id: tx.clone(),
+    let show_tx = Command::ShowReservation {
+        reservation_id: tx.clone(),
     };
     assert!(lapsed(service.execute(show_tx.clone()).unwrap()));
     // The lapse is a durable decision, which replay accepts.

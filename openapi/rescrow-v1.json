@@ -3,7 +3,7 @@
   "info": {
     "title": "Rescrow HTTP API",
     "version": "1.0.0",
-    "description": "M2 API. Quantities are canonical signed decimal strings; UTC timestamps are epoch milliseconds. Resources are tenant-scoped and transactions are tenant+authorized-namespace scoped. Unknown outcomes may have applied: never replace their transaction identity. Atomic memory and local file adapters only; no regional or enterprise qualification."
+    "description": "M2 API. Quantities are canonical signed decimal strings; UTC timestamps are epoch milliseconds. Resources are tenant-scoped and reservations are tenant+authorized-namespace scoped. Unknown outcomes may have applied: never replace their reservation identity. Atomic memory and local file adapters only; no regional or enterprise qualification."
   },
   "security": [
     {
@@ -60,7 +60,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "Relative resource/transaction status path; no tenant in path."
+                "description": "Relative resource/reservation status path; no tenant in path."
               },
               "Retry-After": {
                 "schema": {
@@ -107,7 +107,10 @@
           }
         },
         "x-response-schema": "ResourcePageEnvelope",
-        "x-scope": "read"
+        "x-scope": "read",
+        "tags": [
+          "Resources"
+        ]
       }
     },
     "/v1/resources/{id}": {
@@ -153,7 +156,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "Relative resource/transaction status path; no tenant in path."
+                "description": "Relative resource/reservation status path; no tenant in path."
               },
               "Retry-After": {
                 "schema": {
@@ -200,8 +203,616 @@
           }
         },
         "x-response-schema": "ResourceEnvelope",
-        "x-scope": "read"
+        "x-scope": "read",
+        "tags": [
+          "Resources"
+        ]
+      }
+    },
+    "/v1/reservations": {
+      "get": {
+        "operationId": "list_reservations",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/X-Request-ID"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Durability-Profile"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Authority-Generation"
+          },
+          {
+            "$ref": "#/components/parameters/limit"
+          },
+          {
+            "$ref": "#/components/parameters/cursor"
+          },
+          {
+            "$ref": "#/components/parameters/prefix"
+          },
+          {
+            "$ref": "#/components/parameters/state"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authoritative replay/decision, sampled resource, or list.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/reservation status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReservationPageEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-response-schema": "ReservationPageEnvelope",
+        "x-scope": "read",
+        "tags": [
+          "Reservations"
+        ]
       },
+      "post": {
+        "operationId": "prepare",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/X-Request-ID"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Durability-Profile"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Authority-Generation"
+          },
+          {
+            "$ref": "#/components/parameters/Idempotency-Key"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authoritative replay/decision, sampled resource, or list.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/reservation status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReservationEnvelope"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "New resource or durable preparation.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/reservation status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReservationEnvelope"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Exact durable matching preparation confirmed while the original operation is still pending; Location and Retry-After are present.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/reservation status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReservationEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-response-schema": "ReservationEnvelope",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Prepare"
+              }
+            }
+          }
+        },
+        "x-scope": "reservation:prepare",
+        "tags": [
+          "Reservations"
+        ]
+      }
+    },
+    "/v1/reservations/{id}": {
+      "get": {
+        "operationId": "get_reservation",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/X-Request-ID"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Durability-Profile"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Authority-Generation"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authoritative replay/decision, sampled resource, or list.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/reservation status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReservationEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-response-schema": "ReservationEnvelope",
+        "x-scope": "read",
+        "tags": [
+          "Reservations"
+        ]
+      }
+    },
+    "/v1/reservations/{id}/commit": {
+      "post": {
+        "operationId": "commit",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/X-Request-ID"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Durability-Profile"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Authority-Generation"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authoritative replay/decision, sampled resource, or list.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/reservation status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReservationEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-response-schema": "ReservationEnvelope",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Commit"
+              }
+            }
+          }
+        },
+        "x-scope": "reservation:commit",
+        "tags": [
+          "Reservations"
+        ]
+      }
+    },
+    "/v1/reservations/{id}/abort": {
+      "post": {
+        "operationId": "abort",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/X-Request-ID"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Durability-Profile"
+          },
+          {
+            "$ref": "#/components/parameters/Require-Authority-Generation"
+          },
+          {
+            "$ref": "#/components/parameters/id"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Authoritative replay/decision, sampled resource, or list.",
+            "headers": {
+              "X-Request-ID": {
+                "schema": {
+                  "$ref": "#/components/schemas/Id"
+                },
+                "description": "Response correlation ID."
+              },
+              "Durability-Profile": {
+                "schema": {
+                  "$ref": "#/components/schemas/Profile"
+                },
+                "description": "Actual authority durability profile."
+              },
+              "Authority-Generation": {
+                "schema": {
+                  "$ref": "#/components/schemas/UuidV7"
+                },
+                "description": "Stable initialized authority identity; changes when authority is replaced."
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Relative resource/reservation status path; no tenant in path."
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "description": "Integer seconds before retry of identical request."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReservationEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "403": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "404": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "405": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "409": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "415": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "422": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "429": {
+            "$ref": "#/components/responses/Problem"
+          },
+          "503": {
+            "$ref": "#/components/responses/Problem"
+          }
+        },
+        "x-response-schema": "ReservationEnvelope",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Empty"
+              }
+            }
+          }
+        },
+        "x-scope": "reservation:abort",
+        "tags": [
+          "Reservations"
+        ]
+      }
+    },
+    "/admin/v1/resources/{id}": {
       "put": {
         "operationId": "create_resource",
         "parameters": [
@@ -244,7 +855,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "Relative resource/transaction status path; no tenant in path."
+                "description": "Relative resource/reservation status path; no tenant in path."
               },
               "Retry-After": {
                 "schema": {
@@ -287,7 +898,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "Relative resource/transaction status path; no tenant in path."
+                "description": "Relative resource/reservation status path; no tenant in path."
               },
               "Retry-After": {
                 "schema": {
@@ -344,595 +955,10 @@
             }
           }
         },
-        "x-scope": "resource:create"
-      }
-    },
-    "/v1/transactions": {
-      "get": {
-        "operationId": "list_transactions",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/X-Request-ID"
-          },
-          {
-            "$ref": "#/components/parameters/Require-Durability-Profile"
-          },
-          {
-            "$ref": "#/components/parameters/Require-Authority-Generation"
-          },
-          {
-            "$ref": "#/components/parameters/limit"
-          },
-          {
-            "$ref": "#/components/parameters/cursor"
-          },
-          {
-            "$ref": "#/components/parameters/prefix"
-          },
-          {
-            "$ref": "#/components/parameters/state"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Authoritative replay/decision, sampled resource, or list.",
-            "headers": {
-              "X-Request-ID": {
-                "schema": {
-                  "$ref": "#/components/schemas/Id"
-                },
-                "description": "Response correlation ID."
-              },
-              "Durability-Profile": {
-                "schema": {
-                  "$ref": "#/components/schemas/Profile"
-                },
-                "description": "Actual authority durability profile."
-              },
-              "Authority-Generation": {
-                "schema": {
-                  "$ref": "#/components/schemas/UuidV7"
-                },
-                "description": "Stable initialized authority identity; changes when authority is replaced."
-              },
-              "Location": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Relative resource/transaction status path; no tenant in path."
-              },
-              "Retry-After": {
-                "schema": {
-                  "type": "integer",
-                  "minimum": 1
-                },
-                "description": "Integer seconds before retry of identical request."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TransactionPageEnvelope"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "403": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "404": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "405": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "409": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "415": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "422": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "429": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "503": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "x-response-schema": "TransactionPageEnvelope",
-        "x-scope": "read"
-      },
-      "post": {
-        "operationId": "prepare",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/X-Request-ID"
-          },
-          {
-            "$ref": "#/components/parameters/Require-Durability-Profile"
-          },
-          {
-            "$ref": "#/components/parameters/Require-Authority-Generation"
-          },
-          {
-            "$ref": "#/components/parameters/Idempotency-Key"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Authoritative replay/decision, sampled resource, or list.",
-            "headers": {
-              "X-Request-ID": {
-                "schema": {
-                  "$ref": "#/components/schemas/Id"
-                },
-                "description": "Response correlation ID."
-              },
-              "Durability-Profile": {
-                "schema": {
-                  "$ref": "#/components/schemas/Profile"
-                },
-                "description": "Actual authority durability profile."
-              },
-              "Authority-Generation": {
-                "schema": {
-                  "$ref": "#/components/schemas/UuidV7"
-                },
-                "description": "Stable initialized authority identity; changes when authority is replaced."
-              },
-              "Location": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Relative resource/transaction status path; no tenant in path."
-              },
-              "Retry-After": {
-                "schema": {
-                  "type": "integer",
-                  "minimum": 1
-                },
-                "description": "Integer seconds before retry of identical request."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TransactionEnvelope"
-                }
-              }
-            }
-          },
-          "201": {
-            "description": "New resource or durable preparation.",
-            "headers": {
-              "X-Request-ID": {
-                "schema": {
-                  "$ref": "#/components/schemas/Id"
-                },
-                "description": "Response correlation ID."
-              },
-              "Durability-Profile": {
-                "schema": {
-                  "$ref": "#/components/schemas/Profile"
-                },
-                "description": "Actual authority durability profile."
-              },
-              "Authority-Generation": {
-                "schema": {
-                  "$ref": "#/components/schemas/UuidV7"
-                },
-                "description": "Stable initialized authority identity; changes when authority is replaced."
-              },
-              "Location": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Relative resource/transaction status path; no tenant in path."
-              },
-              "Retry-After": {
-                "schema": {
-                  "type": "integer",
-                  "minimum": 1
-                },
-                "description": "Integer seconds before retry of identical request."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TransactionEnvelope"
-                }
-              }
-            }
-          },
-          "202": {
-            "description": "Exact durable matching preparation confirmed while the original operation is still pending; Location and Retry-After are present.",
-            "headers": {
-              "X-Request-ID": {
-                "schema": {
-                  "$ref": "#/components/schemas/Id"
-                },
-                "description": "Response correlation ID."
-              },
-              "Durability-Profile": {
-                "schema": {
-                  "$ref": "#/components/schemas/Profile"
-                },
-                "description": "Actual authority durability profile."
-              },
-              "Authority-Generation": {
-                "schema": {
-                  "$ref": "#/components/schemas/UuidV7"
-                },
-                "description": "Stable initialized authority identity; changes when authority is replaced."
-              },
-              "Location": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Relative resource/transaction status path; no tenant in path."
-              },
-              "Retry-After": {
-                "schema": {
-                  "type": "integer",
-                  "minimum": 1
-                },
-                "description": "Integer seconds before retry of identical request."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TransactionEnvelope"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "403": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "404": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "405": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "409": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "415": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "422": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "429": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "503": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "x-response-schema": "TransactionEnvelope",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Prepare"
-              }
-            }
-          }
-        },
-        "x-scope": "transaction:prepare"
-      }
-    },
-    "/v1/transactions/{id}": {
-      "get": {
-        "operationId": "get_transaction",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/X-Request-ID"
-          },
-          {
-            "$ref": "#/components/parameters/Require-Durability-Profile"
-          },
-          {
-            "$ref": "#/components/parameters/Require-Authority-Generation"
-          },
-          {
-            "$ref": "#/components/parameters/id"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Authoritative replay/decision, sampled resource, or list.",
-            "headers": {
-              "X-Request-ID": {
-                "schema": {
-                  "$ref": "#/components/schemas/Id"
-                },
-                "description": "Response correlation ID."
-              },
-              "Durability-Profile": {
-                "schema": {
-                  "$ref": "#/components/schemas/Profile"
-                },
-                "description": "Actual authority durability profile."
-              },
-              "Authority-Generation": {
-                "schema": {
-                  "$ref": "#/components/schemas/UuidV7"
-                },
-                "description": "Stable initialized authority identity; changes when authority is replaced."
-              },
-              "Location": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Relative resource/transaction status path; no tenant in path."
-              },
-              "Retry-After": {
-                "schema": {
-                  "type": "integer",
-                  "minimum": 1
-                },
-                "description": "Integer seconds before retry of identical request."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TransactionEnvelope"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "403": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "404": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "405": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "409": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "415": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "422": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "429": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "503": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "x-response-schema": "TransactionEnvelope",
-        "x-scope": "read"
-      }
-    },
-    "/v1/transactions/{id}/commit": {
-      "post": {
-        "operationId": "commit",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/X-Request-ID"
-          },
-          {
-            "$ref": "#/components/parameters/Require-Durability-Profile"
-          },
-          {
-            "$ref": "#/components/parameters/Require-Authority-Generation"
-          },
-          {
-            "$ref": "#/components/parameters/id"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Authoritative replay/decision, sampled resource, or list.",
-            "headers": {
-              "X-Request-ID": {
-                "schema": {
-                  "$ref": "#/components/schemas/Id"
-                },
-                "description": "Response correlation ID."
-              },
-              "Durability-Profile": {
-                "schema": {
-                  "$ref": "#/components/schemas/Profile"
-                },
-                "description": "Actual authority durability profile."
-              },
-              "Authority-Generation": {
-                "schema": {
-                  "$ref": "#/components/schemas/UuidV7"
-                },
-                "description": "Stable initialized authority identity; changes when authority is replaced."
-              },
-              "Location": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Relative resource/transaction status path; no tenant in path."
-              },
-              "Retry-After": {
-                "schema": {
-                  "type": "integer",
-                  "minimum": 1
-                },
-                "description": "Integer seconds before retry of identical request."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TransactionEnvelope"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "403": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "404": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "405": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "409": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "415": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "422": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "429": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "503": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "x-response-schema": "TransactionEnvelope",
-        "requestBody": {
-          "required": false,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Commit"
-              }
-            }
-          }
-        },
-        "x-scope": "transaction:commit"
-      }
-    },
-    "/v1/transactions/{id}/abort": {
-      "post": {
-        "operationId": "abort",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/X-Request-ID"
-          },
-          {
-            "$ref": "#/components/parameters/Require-Durability-Profile"
-          },
-          {
-            "$ref": "#/components/parameters/Require-Authority-Generation"
-          },
-          {
-            "$ref": "#/components/parameters/id"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Authoritative replay/decision, sampled resource, or list.",
-            "headers": {
-              "X-Request-ID": {
-                "schema": {
-                  "$ref": "#/components/schemas/Id"
-                },
-                "description": "Response correlation ID."
-              },
-              "Durability-Profile": {
-                "schema": {
-                  "$ref": "#/components/schemas/Profile"
-                },
-                "description": "Actual authority durability profile."
-              },
-              "Authority-Generation": {
-                "schema": {
-                  "$ref": "#/components/schemas/UuidV7"
-                },
-                "description": "Stable initialized authority identity; changes when authority is replaced."
-              },
-              "Location": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Relative resource/transaction status path; no tenant in path."
-              },
-              "Retry-After": {
-                "schema": {
-                  "type": "integer",
-                  "minimum": 1
-                },
-                "description": "Integer seconds before retry of identical request."
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/TransactionEnvelope"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "403": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "404": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "405": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "409": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "415": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "422": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "429": {
-            "$ref": "#/components/responses/Problem"
-          },
-          "503": {
-            "$ref": "#/components/responses/Problem"
-          }
-        },
-        "x-response-schema": "TransactionEnvelope",
-        "requestBody": {
-          "required": false,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Empty"
-              }
-            }
-          }
-        },
-        "x-scope": "transaction:abort"
+        "x-scope": "resource:create",
+        "tags": [
+          "Admin"
+        ]
       }
     }
   },
@@ -1035,7 +1061,7 @@
             "aborted"
           ]
         },
-        "description": "Transaction state filter."
+        "description": "Reservation state filter."
       }
     },
     "schemas": {
@@ -1302,7 +1328,7 @@
       "Request": {
         "type": "object",
         "properties": {
-          "transaction_id": {
+          "reservation_id": {
             "$ref": "#/components/schemas/Id"
           },
           "namespace": {
@@ -1335,7 +1361,7 @@
           }
         },
         "required": [
-          "transaction_id",
+          "reservation_id",
           "operations",
           "hold_ms"
         ],
@@ -1344,7 +1370,7 @@
       "Hold": {
         "type": "object",
         "properties": {
-          "transaction_id": {
+          "reservation_id": {
             "$ref": "#/components/schemas/Id"
           },
           "delta": {
@@ -1355,7 +1381,7 @@
           }
         },
         "required": [
-          "transaction_id",
+          "reservation_id",
           "delta"
         ],
         "additionalProperties": false
@@ -1484,7 +1510,7 @@
           }
         ]
       },
-      "TransactionRecord": {
+      "ReservationRecord": {
         "type": "object",
         "properties": {
           "request": {
@@ -1511,11 +1537,11 @@
         ],
         "additionalProperties": false
       },
-      "Transaction": {
+      "Reservation": {
         "type": "object",
         "properties": {
-          "transaction": {
-            "$ref": "#/components/schemas/TransactionRecord"
+          "reservation": {
+            "$ref": "#/components/schemas/ReservationRecord"
           },
           "request_digest": {
             "$ref": "#/components/schemas/Digest"
@@ -1541,7 +1567,7 @@
           }
         },
         "required": [
-          "transaction",
+          "reservation",
           "request_digest",
           "actuals_digest",
           "consistency",
@@ -1736,13 +1762,13 @@
         ],
         "additionalProperties": false
       },
-      "TransactionPage": {
+      "ReservationPage": {
         "type": "object",
         "properties": {
           "items": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/Transaction"
+              "$ref": "#/components/schemas/Reservation"
             }
           },
           "next_cursor": {
@@ -1763,11 +1789,11 @@
         ],
         "additionalProperties": false
       },
-      "TransactionEnvelope": {
+      "ReservationEnvelope": {
         "type": "object",
         "properties": {
           "data": {
-            "$ref": "#/components/schemas/Transaction"
+            "$ref": "#/components/schemas/Reservation"
           },
           "metadata": {
             "$ref": "#/components/schemas/Metadata"
@@ -1783,11 +1809,11 @@
         ],
         "additionalProperties": false
       },
-      "TransactionPageEnvelope": {
+      "ReservationPageEnvelope": {
         "type": "object",
         "properties": {
           "data": {
-            "$ref": "#/components/schemas/TransactionPage"
+            "$ref": "#/components/schemas/ReservationPage"
           },
           "metadata": {
             "$ref": "#/components/schemas/Metadata"
@@ -1872,7 +1898,7 @@
           "request_id": {
             "$ref": "#/components/schemas/Id"
           },
-          "transaction_id": {
+          "reservation_id": {
             "anyOf": [
               {
                 "$ref": "#/components/schemas/Id"
@@ -1896,7 +1922,7 @@
           "status",
           "detail",
           "request_id",
-          "transaction_id",
+          "reservation_id",
           "retryable"
         ],
         "additionalProperties": false
@@ -2053,5 +2079,19 @@
       "type": "urn:rescrow:problem:revision_exhausted",
       "retryable": false
     }
-  }
+  },
+  "tags": [
+    {
+      "name": "Resources",
+      "description": "Resource observations available to authorized callers."
+    },
+    {
+      "name": "Reservations",
+      "description": "Prepare, inspect and decide reservations."
+    },
+    {
+      "name": "Admin",
+      "description": "Privileged resource administration."
+    }
+  ]
 }

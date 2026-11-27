@@ -27,20 +27,24 @@ target/debug/rescrow --endpoint http://127.0.0.1:8080 \
 work=$(target/debug/rescrow new-id)
 target/debug/rescrow --endpoint http://127.0.0.1:8080 \
   --token-file .rescrow-http-dev/token --require-profile local \
-  --json transaction prepare "$work" --operations examples/operations.json
+  --json reservation prepare "$work" --operations examples/operations.json
 ```
 
-All resource/transaction commands and their typed CLI output shapes are shared with local mode. Authentication facts and the credential namespace appear in remote transaction DTOs. Remote `init` is rejected: initialization belongs to server composition. `RESCROW_TOKEN` is an alternative to `--token-file`; there is no token argument on the command line. `new-id` stays local. The development helper never overwrites existing credentials; its token expires after one hour. Use your workload issuer's public keys and restricted grants for a deployment.
+All resource/reservation commands and their typed CLI output shapes are shared with local mode. Authentication facts and the credential namespace appear in remote reservation DTOs. Remote `init` is rejected: initialization belongs to server composition. `RESCROW_TOKEN` is an alternative to `--token-file`; there is no token argument on the command line. `new-id` stays local. The development helper never overwrites existing credentials; its token expires after one hour. Use your workload issuer's public keys and restricted grants for a deployment.
 
 Configuration selects `backend: {"type":"file","path":".rescrow"}` or explicit disposable `{"type":"memory"}`. The file backend opens an existing initialized authority and supports only tenant `local` with no namespace. Memory supports isolated tenants and namespaces, initializes once at startup, and reports `simulation`. Its state and generation change on restart. Neither serves regional or enterprise durability. The file format is schema 4; older formats fail closed and have no migration in this pre-release project.
 
 Plain HTTP binds only loopback addresses. Other listeners require `tls: {"certificate":"fullchain.pem","private_key":"key.pem"}`; `tls: null` selects loopback HTTP. The executable accepts SIGINT/SIGTERM, stops new storage dispatch, lets requests finish, and drains actual blocking operations even when a request timed out or disconnected. Infrastructure readiness and the selected profile are checked before binding. The `authority_generation` UUID comes from the initialized store, survives file reopen/checkpoints, and cannot be supplied as a serving label.
 
+Resource administration uses `/admin/v1`; regular resource reads and reservation operations use `/v1`. Resource creation remains protected by `resource:create`. The admin prefix supports separate routing and access policies; it does not grant privileges.
+
+This pre-release interface replaces the earlier transaction routes, names, payload fields and scopes directly. API, package and storage schema version numbers remain unchanged; pre-release stores written with the earlier field names may need to be recreated.
+
 ## Identity and permissions
 
 Each request supplies one `Authorization: Bearer …` header. Configure `issuers` with an exact issuer, audience and one or more `{kid,algorithm,public_key_pem}` entries. Supported pinned algorithms are RS256, ES256 and EdDSA; symmetric algorithms, expired tokens, future `nbf`, nested/encrypted/critical JWT extensions and duplicate claim/header keys are rejected. Public keys are loaded at startup; token-selected URLs are never fetched. Restart with an updated trusted key set for rotation. `Authenticator` is pluggable and runs in a bounded blocking lane; another implementation can inspect verified peer extensions for mTLS.
 
-Verified custom claims are `tenant`, `namespace`, stable `credential_id`, `scopes`, `resources`, and optional `max_hold_ms`. Non-local tenants require a namespace. `resources` contains 1–64 grants of `{resource_prefix,debit,credit,max_amount}`; `*` matches every resource, otherwise the prefix is literal. Maximum amounts are positive decimal i128 strings. Scopes are `resource:create`, `transaction:prepare`, `transaction:commit`, `transaction:abort`, and `read`. Creation requires the explicit admin scope. Reads filter lists to visible resources and manifests. Every replay rechecks the current credential, including the original manifest for decisions. A resource outside read scope and objects in another tenant/namespace return 404. Request context cannot grant permissions. An optional prepare `namespace` only asserts equality with the credential's namespace.
+Verified custom claims are `tenant`, `namespace`, stable `credential_id`, `scopes`, `resources`, and optional `max_hold_ms`. Non-local tenants require a namespace. `resources` contains 1–64 grants of `{resource_prefix,debit,credit,max_amount}`; `*` matches every resource, otherwise the prefix is literal. Maximum amounts are positive decimal i128 strings. Scopes are `resource:create`, `reservation:prepare`, `reservation:commit`, `reservation:abort`, and `read`. Creation requires the explicit admin scope. Reads filter lists to visible resources and manifests. Every replay rechecks the current credential, including the original manifest for decisions. A resource outside read scope and objects in another tenant/namespace return 404. Request context cannot grant permissions. An optional prepare `namespace` only asserts equality with the credential's namespace.
 
 Admitted requests persist three bounded SHA-256 fingerprints: principal, stable credential and policy. Bearer tokens, subjects and issuer URLs are not stored. Credential IDs must stay stable across ordinary token renewal for outstanding-hold quotas to follow the credential. Current grants govern access, including access by a rotated credential to a shared authorized namespace. There is no vendor SDK or live identity-provider dependency during requests.
 
@@ -48,24 +52,24 @@ Admitted requests persist three bounded SHA-256 fingerprints: principal, stable 
 
 | Method/path | Scope | Success |
 | --- | --- | --- |
-| `PUT /v1/resources/{id}` | `resource:create` | 201 new; 200 identical immutable specification |
+| `PUT /admin/v1/resources/{id}` | `resource:create` | 201 new; 200 identical immutable specification |
 | `GET /v1/resources/{id}` | `read` | 200 sampled resource |
 | `GET /v1/resources` | `read` | 200 visible resources |
-| `POST /v1/transactions` | `transaction:prepare` | 201 new; 200 replay; 202 confirmed preparation while original response is pending |
-| `GET /v1/transactions/{id}` | `read` | 200 authoritative transaction status |
-| `GET /v1/transactions` | `read` | 200 visible transactions in the credential namespace |
-| `POST /v1/transactions/{id}/commit` | `transaction:commit` | 200, including identical actuals replay |
-| `POST /v1/transactions/{id}/abort` | `transaction:abort` | 200, including identical abort replay |
+| `POST /v1/reservations` | `reservation:prepare` | 201 new; 200 replay; 202 confirmed preparation while original response is pending |
+| `GET /v1/reservations/{id}` | `read` | 200 authoritative reservation status |
+| `GET /v1/reservations` | `read` | 200 visible reservations in the credential namespace |
+| `POST /v1/reservations/{id}/commit` | `reservation:commit` | 200, including identical actuals replay |
+| `POST /v1/reservations/{id}/abort` | `reservation:abort` | 200, including identical abort replay |
 
 Quantities and deltas are canonical signed i128 decimal **strings**. Units are trimmed, nonempty, control-free strings of at most 64 UTF-8 bytes. Timestamps are UTC epoch milliseconds; RFC 3339 is not duplicated on the wire. A resource separates immutable `spec` from sampled `observation`, including the observation interval, quantity, holds, totals and availability. Admission always requires a preparation; displayed availability is not a reservation. Reads do not lapse overdue holds. These atomic adapters have `materialization: complete` and `finalization_pending: false`.
 
 A success envelope has `data`, `metadata` and `links`. Metadata contains `request_id`, `serving_region`, `deployment_cell`, `authority_generation` and actual `durability_profile`. The last two and `X-Request-ID` are also response headers. `self`, decision and pagination links are relative to the configured origin. `Location` identifies the returned object; 202 also includes integer-seconds `Retry-After`. Dot-only Domain IDs use `~Lg` for `.` and `~Li4` for `..` in paths to survive URL normalization.
 
-Lists accept `limit`, literal ID `prefix`, and opaque `cursor`; transactions also accept `state=prepared|committed|aborted`. IDs sort lexicographically. `data.next_cursor` and `links.next` provide continuation. Signed cursors expire after 15 minutes and bind the authority, tenant, namespace, policy, endpoint and filters; they cannot be reused across those contexts. Keep filters when paging. Pages are keyset samples, with no snapshot across requests. The current authorities inspect retained records before slicing; pagination bounds responses rather than storage scan cost.
+Lists accept `limit`, literal ID `prefix`, and opaque `cursor`; reservations also accept `state=prepared|committed|aborted`. IDs sort lexicographically. `data.next_cursor` and `links.next` provide continuation. Signed cursors expire after 15 minutes and bind the authority, tenant, namespace, policy, endpoint and filters; they cannot be reused across those contexts. Keep filters when paging. Pages are keyset samples, with no snapshot across requests. The current authorities inspect retained records before slicing; pagination bounds responses rather than storage scan cost.
 
 ## Replay, deadlines and fallback
 
-`Idempotency-Key` is one canonical lowercase UUIDv7, created once before the first attempt. Preserve it together with intent and actuals across process/workflow retries. The server chooses tenant and namespace from verified identity. New IDs older than 24 hours or more than 5 minutes in the future are rejected. Prepared transactions replay at any age; terminal creation/decision replay follows the README's bounded window. Never generate a replacement identity to recover an uncertain outcome.
+`Idempotency-Key` is one canonical lowercase UUIDv7, created once before the first attempt. Preserve it together with intent and actuals across process/workflow retries. The server chooses tenant and namespace from verified identity. New IDs older than 24 hours or more than 5 minutes in the future are rejected. Prepared reservations replay at any age; terminal creation/decision replay follows the README's bounded window. Never generate a replacement identity to recover an uncertain outcome.
 
 The prepare digest is `sha256:` plus lowercase hex of SHA-256 over `rescrow.prepare.v1`, NUL, then compact canonical UTF-8 JSON. Its recursively sorted object keys are `context`, `hold_ms`, `operations`; operations sort by operation ID, each with `delta`, `operation_id`, `resource_id`. Omitted context/hold become `{}`/`null`. Decimal spelling is validated; array order and JSON whitespace do not change intent. No Unicode normalization occurs. Identity, namespace, headers and authorization facts are excluded. Actuals encode as a recursively sorted object `{ "actuals": [...] }`, sort by operation ID, and use the separate `rescrow.actuals.v1` tag. Omitting actuals means full reserved usage, which hashes identically to explicit full actuals. Duplicate JSON keys at any depth fail before admission.
 
@@ -77,7 +81,7 @@ Alternate endpoints are an explicit ordered list. Multiple endpoints require the
 
 ## Problems
 
-Problems use `application/problem+json` with required `type`, `code`, `category`, `status`, `detail`, `request_id`, nullable `transaction_id`, and `retryable`; capacity rejection also carries its frozen `capacity` facts. Type is `urn:rescrow:problem:<code>` for every row below. Unknown outcomes may have applied: retryability only authorizes retrying the identical request. Storage paths and internal exception details are not exposed.
+Problems use `application/problem+json` with required `type`, `code`, `category`, `status`, `detail`, `request_id`, nullable `reservation_id`, and `retryable`; capacity rejection also carries its frozen `capacity` facts. Type is `urn:rescrow:problem:<code>` for every row below. Unknown outcomes may have applied: retryability only authorizes retrying the identical request. Storage paths and internal exception details are not exposed.
 
 | Code | HTTP | Retryable |
 | --- | --- | --- |
@@ -104,7 +108,7 @@ Problems use `application/problem+json` with required `type`, `code`, `category`
 | `missing_store` | 503 | false |
 | `revision_exhausted` | 503 | false |
 
-401 includes `WWW-Authenticate: Bearer`. Retryable problems include integer-seconds `Retry-After`. Known transaction identities also get a status `Location`. Invalid correlation IDs receive a safe replacement correlation value. The Application retries CAS contention at most 32 times; HTTP bounds how long a caller waits without abandoning an actual write.
+401 includes `WWW-Authenticate: Bearer`. Retryable problems include integer-seconds `Retry-After`. Known reservation identities also get a status `Location`. Invalid correlation IDs receive a safe replacement correlation value. The Application retries CAS contention at most 32 times; HTTP bounds how long a caller waits without abandoning an actual write.
 
 ## Limits and admission
 
@@ -116,7 +120,7 @@ Problems use `application/problem+json` with required `type`, `code`, `category`
 | `operation_count` | 64 / 1024, also applies to explicit actuals |
 | `numeric_magnitude` | decimal `170141183460469231731687303715884105728` (2^127); Domain reservation rules still exclude signed minimum |
 | `context_bytes` | 4096 / 4096; max 32 keys, key 1–64 ASCII bytes, value at most 1024 UTF-8 bytes |
-| `pending.tenant`, `pending.credential` | 4096 / 256 outstanding prepared transactions; configurable positive limits, credential ≤ tenant |
+| `pending.tenant`, `pending.credential` | 4096 / 256 outstanding prepared reservations; configurable positive limits, credential ≤ tenant |
 | `request_timeout_ms`, `queue_timeout_ms` | 5000 / 100; request ceiling 300000 |
 | `page_size`, `max_tenants` | 100 / 1024; ceilings 1000 / 10000 |
 | Global `admission` concurrency / queue | 32 / 128 |
@@ -126,7 +130,7 @@ Problems use `application/problem+json` with required `type`, `code`, `category`
 
 Traffic rates, concurrency and queues are per serving process. The bounded tenant registry is retained until restart; reaching `max_tenants` sheds unregistered tenants. Admission, decisions and recovery have separate storage and authentication capacity. Saturation, rate exhaustion, full queues and queue timeouts return 429. Setting global admission concurrency to zero disables new writes in that class while preserving decision/recovery capacity. Positive decision/recovery concurrency is required. Authentication runs off async workers; the permit survives request cancellation.
 
-Outstanding-hold counts are tenant-wide across server instances sharing an authority and count a transaction once per admitting credential. Replay never increments them. Commit, abort and lapse release them in the same atomic publication as the transaction/resources. This adds one tenant counter dependency to authenticated transitions; unrelated authenticated admissions can therefore contend on that quota record. Local unauthenticated embedded/CLI use has no such counter. Expired holds still count until a write lapses them; there is no independent background sweeper in this milestone.
+Outstanding-hold counts are tenant-wide across server instances sharing an authority and count a reservation once per admitting credential. Replay never increments them. Commit, abort and lapse release them in the same atomic publication as the reservation/resources. This adds one tenant counter dependency to authenticated transitions; unrelated authenticated admissions can therefore contend on that quota record. Local unauthenticated embedded/CLI use has no such counter. Expired holds still count until a write lapses them; there is no independent background sweeper in this milestone.
 
 ## Generate and verify clients
 

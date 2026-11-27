@@ -76,9 +76,9 @@ impl Case {
             dto::Command::Prepare(request) => {
                 process
                     .args([
-                        "transaction",
+                        "reservation",
                         "prepare",
-                        &request.transaction_id,
+                        &request.reservation_id,
                         "--operations",
                     ])
                     .arg(self.input(name, &request.operations));
@@ -87,13 +87,13 @@ impl Case {
                 }
             }
             dto::Command::Commit(request) => {
-                process.args(["transaction", "commit", &request.transaction_id]);
+                process.args(["reservation", "commit", &request.reservation_id]);
                 if let Some(actuals) = request.actuals {
                     process.arg("--actuals").arg(self.input(name, &actuals));
                 }
             }
-            dto::Command::Abort { transaction_id } => {
-                process.args(["transaction", "abort", &transaction_id]);
+            dto::Command::Abort { reservation_id } => {
+                process.args(["reservation", "abort", &reservation_id]);
             }
             dto::Command::ShowResource { resource_id } => {
                 process.args(["resource", "show", &resource_id]);
@@ -101,11 +101,11 @@ impl Case {
             dto::Command::ListResources => {
                 process.args(["resource", "list"]);
             }
-            dto::Command::ShowTransaction { transaction_id } => {
-                process.args(["transaction", "show", &transaction_id]);
+            dto::Command::ShowReservation { reservation_id } => {
+                process.args(["reservation", "show", &reservation_id]);
             }
-            dto::Command::ListTransactions => {
-                process.args(["transaction", "list"]);
+            dto::Command::ListReservations => {
+                process.args(["reservation", "list"]);
             }
         }
         process

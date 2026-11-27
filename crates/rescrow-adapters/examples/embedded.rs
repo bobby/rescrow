@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         context: Default::default(),
         authorization: None,
         namespace: None,
-        transaction_id: work.clone(),
+        reservation_id: work.clone(),
         operations: vec![Operation {
             operation_id: "spend".into(),
             resource_id: "example".into(),
@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         hold_ms: None,
     })?;
     app.commit(Commit {
-        transaction_id: work,
+        reservation_id: work,
         actuals: Some(vec![Actual {
             operation_id: "spend".into(),
             delta: "-25".into(),

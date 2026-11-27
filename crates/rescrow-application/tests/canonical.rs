@@ -33,7 +33,7 @@ fn canonical_request_vectors_match_an_independent_sha256_encoding() {
         );
         request.operations.reverse();
         request.namespace = Some("another-namespace".into());
-        request.transaction_id = uuid_v7(1000, 2);
+        request.reservation_id = uuid_v7(1000, 2);
         assert_eq!(
             canonical::prepare_digest(&request).unwrap(),
             vector["digest"]
@@ -41,9 +41,9 @@ fn canonical_request_vectors_match_an_independent_sha256_encoding() {
     }
     let actuals: Vec<dto::Actual> =
         serde_json::from_value(vectors["actuals"][0]["actuals"].clone()).unwrap();
-    let tx = dto::Transaction {
+    let tx = dto::Reservation {
         request: dto::Prepare {
-            transaction_id: uuid_v7(1000, 1),
+            reservation_id: uuid_v7(1000, 1),
             namespace: None,
             hold_ms: None,
             context: Default::default(),

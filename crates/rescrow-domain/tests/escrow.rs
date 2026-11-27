@@ -53,14 +53,14 @@ fn construction_and_numeric_edges() {
     assert_eq!(min.resources()[&id("min")].quantity(), -1);
     Ledger::restore(
         min.resources().values().cloned().collect(),
-        min.transactions().values().cloned().collect(),
+        min.reservations().values().cloned().collect(),
     )
     .unwrap();
     let max = Ledger::default()
         .create(resource("max", 0, None, i128::MAX))
         .unwrap();
     let rejected = max.prepare(req("t", &[("o", "max", 1)]), 0).unwrap();
-    assert!(rejected.transactions()[&id("t")].rejection().is_some());
+    assert!(rejected.reservations()[&id("t")].rejection().is_some());
 }
 #[test]
 fn directions_do_not_fund_each_other_and_participants_are_atomic() {
@@ -85,7 +85,7 @@ fn directions_do_not_fund_each_other_and_participants_are_atomic() {
         .unwrap();
     assert_eq!(rejected.resources(), original.resources());
     assert_eq!(
-        rejected.transactions()[&id("multi")].rejection(),
+        rejected.reservations()[&id("multi")].rejection(),
         Some(Rejection::Capacity(
             CapacityFailure::new(id("s"), -2, 1).unwrap()
         ))
@@ -95,7 +95,7 @@ fn directions_do_not_fund_each_other_and_participants_are_atomic() {
         .unwrap();
     assert_eq!(missing.resources(), original.resources());
     assert_eq!(
-        missing.transactions()[&id("missing")].rejection(),
+        missing.reservations()[&id("missing")].rejection(),
         Some(Rejection::NotFound)
     );
     let created = missing.create(resource("unknown", 0, Some(10), 0)).unwrap();
@@ -107,7 +107,7 @@ fn directions_do_not_fund_each_other_and_participants_are_atomic() {
     );
     Ledger::restore(
         missing.resources().values().cloned().collect(),
-        missing.transactions().values().cloned().collect(),
+        missing.reservations().values().cloned().collect(),
     )
     .unwrap();
 }
@@ -207,7 +207,7 @@ fn enumerate_reservations_outcomes_and_decision_orders() {
                 let la = start.prepare(req("a", &[("o", "r", a)]), 0).unwrap();
                 let admissible_a = a.min(0).abs() <= q && a.max(0) <= 4 - q;
                 assert_eq!(
-                    la.transactions()[&id("a")].rejection().is_none(),
+                    la.reservations()[&id("a")].rejection().is_none(),
                     admissible_a
                 );
                 if !admissible_a {
@@ -217,7 +217,7 @@ fn enumerate_reservations_outcomes_and_decision_orders() {
                 let admissible_b =
                     a.min(0).abs() + b.min(0).abs() <= q && a.max(0) + b.max(0) <= 4 - q;
                 assert_eq!(
-                    lab.transactions()[&id("b")].rejection().is_none(),
+                    lab.reservations()[&id("b")].rejection().is_none(),
                     admissible_b
                 );
                 if !admissible_b {
@@ -239,7 +239,7 @@ fn enumerate_reservations_outcomes_and_decision_orders() {
                         assert!((0..=4).contains(&expected));
                         Ledger::restore(
                             ab.resources().values().cloned().collect(),
-                            ab.transactions().values().cloned().collect(),
+                            ab.reservations().values().cloned().collect(),
                         )
                         .unwrap();
                     }
@@ -263,7 +263,7 @@ fn overflowing_totals_are_retained_rejections_without_partial_holds() {
             .unwrap();
         assert_eq!(rejected.resources(), held.resources());
         assert_eq!(
-            rejected.transactions()[&id("overflow")].rejection(),
+            rejected.reservations()[&id("overflow")].rejection(),
             Some(Rejection::Overflow)
         );
         let released = rejected.abort(&id("first")).unwrap();
@@ -275,7 +275,7 @@ fn overflowing_totals_are_retained_rejections_without_partial_holds() {
         );
         Ledger::restore(
             released.resources().values().cloned().collect(),
-            released.transactions().values().cloned().collect(),
+            released.reservations().values().cloned().collect(),
         )
         .unwrap();
     }

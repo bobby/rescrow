@@ -185,7 +185,7 @@ impl Context {
     }
 }
 
-/// One versioned tenant record counts prepared authenticated transactions. It
+/// One versioned tenant record counts prepared authenticated reservations. It
 /// participates in the same publication as holds, so separate servers cannot
 /// pass a quota check concurrently using stale counts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -205,10 +205,10 @@ impl Pending {
         Ok(next)
     }
     pub fn from_prepared<'a>(
-        transactions: impl IntoIterator<Item = &'a crate::Transaction>,
+        reservations: impl IntoIterator<Item = &'a crate::Reservation>,
     ) -> Result<Self, Error> {
         let mut pending = Self::default();
-        for tx in transactions {
+        for tx in reservations {
             if *tx.state() == crate::State::Prepared
                 && let Some(facts) = tx.request().authorization()
             {
@@ -219,8 +219,8 @@ impl Pending {
     }
     pub fn apply(
         &self,
-        before: Option<&crate::Transaction>,
-        after: &crate::Transaction,
+        before: Option<&crate::Reservation>,
+        after: &crate::Reservation,
     ) -> Result<Self, Error> {
         if before.is_some_and(|tx| tx.request() != after.request()) {
             return Err(Error::InvalidLedger);

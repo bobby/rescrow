@@ -57,7 +57,7 @@ enum Action {
     Commit(Target, Actuals),
     Abort(Target),
     InspectResource(u8),
-    InspectTransaction(Target),
+    InspectReservation(Target),
     InspectAll(bool),
 }
 #[derive(Clone, Copy, Debug)]
@@ -121,7 +121,7 @@ fn step() -> impl Strategy<Value = Step> {
         6=>(target(),actuals).prop_map(|(t,a)|Action::Commit(t,a)),
         4=>target().prop_map(Action::Abort),
         1=>(0_u8..4).prop_map(Action::InspectResource),
-        1=>target().prop_map(Action::InspectTransaction),
+        1=>target().prop_map(Action::InspectReservation),
         1=>any::<bool>().prop_map(Action::InspectAll),
     ];
     (action,prop_oneof![6=>Just(Effect::Clean),2=>Just(Effect::Conflicts),1=>Just(Effect::BeforePublication),1=>Just(Effect::LostResponse)],any::<bool>()).prop_map(|(action,effect,reload)|Step {action,effect,reload})
@@ -129,7 +129,7 @@ fn step() -> impl Strategy<Value = Step> {
 impl Model {
     fn missing(&self, slot: u8) -> u16 {
         let mut id = 4000 + u16::from(slot);
-        while self.transactions.contains_key(&id) {
+        while self.reservations.contains_key(&id) {
             id += 1;
         }
         id
@@ -142,7 +142,7 @@ impl Model {
             Target::Missing(i) => return self.missing(*i),
         };
         let candidates: Vec<_> = self
-            .transactions
+            .reservations
             .iter()
             .filter(|(_, tx)| filter(&tx.state))
             .map(|(id, _)| *id)
@@ -190,7 +190,7 @@ impl Model {
             } => {
                 let id = self.select(target);
                 let (mut operations, mut hold) = self
-                    .transactions
+                    .reservations
                     .get(&id)
                     .map(|tx| (tx.operations.clone(), tx.hold))
                     .unwrap_or_else(|| {
@@ -219,7 +219,7 @@ impl Model {
             }
             Action::Commit(target, mode) => {
                 let id = self.select(target);
-                let Some(tx) = self.transactions.get(&id) else {
+                let Some(tx) = self.reservations.get(&id) else {
                     return Some(Command::Commit(id, None));
                 };
                 if matches!(mode, Actuals::Full) {
@@ -249,12 +249,12 @@ impl Model {
             }
             Action::Abort(target) => Command::Abort(self.select(target)),
             Action::InspectResource(id) => Command::Resource(*id),
-            Action::InspectTransaction(t) => Command::Transaction(self.select(t)),
+            Action::InspectReservation(t) => Command::Reservation(self.select(t)),
             Action::InspectAll(resources) => {
                 if *resources {
                     Command::Resources
                 } else {
-                    Command::Transactions
+                    Command::Reservations
                 }
             }
         })
@@ -317,7 +317,7 @@ impl<S: TransactionalStore + Send + Sync + 'static> Harness<S> {
             .map_err(|e| TestCaseError::fail(format!("unexpected lapse error: {e}")))?;
         let expected: Vec<_> = self.model.lapse_all().into_iter().map(tx_id).collect();
         for tx in lapsed {
-            prop_assert!(expected.contains(&tx.request.transaction_id), "{:?}", tx);
+            prop_assert!(expected.contains(&tx.request.reservation_id), "{:?}", tx);
         }
         prop_assert_eq!(self.snapshot()?, self.model.snapshot(self.model.position));
         Ok(())
@@ -362,8 +362,8 @@ impl<S: TransactionalStore + Send + Sync + 'static> Harness<S> {
                 command
             );
             prop_assert_eq!(
-                error.transaction_id.clone(),
-                command.transaction_id().map(tx_id)
+                error.reservation_id.clone(),
+                command.reservation_id().map(tx_id)
             );
             if matches!(effect, Effect::BeforePublication) {
                 prop_assert_eq!(self.snapshot()?, self.model.snapshot(self.model.position));
@@ -438,7 +438,7 @@ fn check_error(error: Error, failure: &Failure, command: &Command) -> TestResult
         "{:?}",
         command
     );
-    prop_assert_eq!(error.transaction_id, command.transaction_id().map(tx_id));
+    prop_assert_eq!(error.reservation_id, command.reservation_id().map(tx_id));
     prop_assert_eq!(error.capacity.as_deref().cloned(), failure.capacity());
     Ok(())
 }
@@ -464,7 +464,7 @@ fn history<S: TransactionalStore + Send + Sync + 'static>(
         }
     }
     h.apply(Command::Resources, Effect::Clean, true)?;
-    h.apply(Command::Transactions, Effect::Clean, false)
+    h.apply(Command::Reservations, Effect::Clean, false)
 }
 /// Run shrinking sequential histories and guaranteed successful lifecycles
 /// against a fresh adapter supplied by the caller. Each reload uses a new

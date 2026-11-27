@@ -25,7 +25,7 @@ type Evaluation = (transition::Changes, Result<Output, Error>);
 pub(crate) struct View {
     read: Read,
     live: d::Live,
-    transactions: BTreeMap<d::Id, (u64, d::Transaction)>,
+    reservations: BTreeMap<d::Id, (u64, d::Reservation)>,
     now_ms: u64,
     complete: bool,
     terminal_since_ms: u64,
@@ -35,7 +35,7 @@ impl View {
     fn from_read(read: Read, now: u64) -> Result<Self, Error> {
         let mut resources = Vec::new();
         let mut prepared = Vec::new();
-        let mut transactions = BTreeMap::new();
+        let mut reservations = BTreeMap::new();
         let mut now_ms = now.max(read.recorded_at_ms);
         let mut pending = d::access::Pending::default();
         for (key, value) in &read.records {
@@ -45,12 +45,12 @@ impl View {
                 match &value.value {
                     Value::Pending(value) => pending = value.clone().try_into().map_err(corrupt)?,
                     Value::Resource(r) => resources.push(r.clone().try_into().map_err(corrupt)?),
-                    Value::Transaction(tx) => {
-                        let tx: d::Transaction = tx.clone().try_into().map_err(corrupt)?;
+                    Value::Reservation(tx) => {
+                        let tx: d::Reservation = tx.clone().try_into().map_err(corrupt)?;
                         if *tx.state() == d::State::Prepared {
                             prepared.push(tx.clone());
                         }
-                        transactions.insert(tx.request().id().clone(), (value.recorded_at_ms, tx));
+                        reservations.insert(tx.request().id().clone(), (value.recorded_at_ms, tx));
                     }
                 }
             }
@@ -62,17 +62,17 @@ impl View {
             .any(|(id, count)| pending.for_credential(id) < *count)
         {
             return Err(corrupt(
-                "pending counter omits loaded prepared transactions",
+                "pending counter omits loaded prepared reservations",
             ));
         }
         let live = d::Live::restore(resources, prepared).map_err(corrupt)?;
-        for (_, tx) in transactions.values() {
+        for (_, tx) in reservations.values() {
             transition::validate_participants(tx, live.resources()).map_err(corrupt)?;
         }
         Ok(Self {
             read,
             live,
-            transactions,
+            reservations,
             now_ms,
             complete: false,
             terminal_since_ms: 0,
@@ -83,11 +83,11 @@ impl View {
         &self.live
     }
     fn advance(&mut self, changes: &transition::Changes) -> Result<(), Error> {
-        let pending = match changes.transaction() {
+        let pending = match changes.reservation() {
             Some(tx) => self
                 .pending
                 .apply(
-                    self.transactions.get(tx.request().id()).map(|(_, tx)| tx),
+                    self.reservations.get(tx.request().id()).map(|(_, tx)| tx),
                     tx,
                 )
                 .map_err(corrupt)?,
@@ -95,8 +95,8 @@ impl View {
         };
         self.live = self.live.apply(changes);
         self.pending = pending;
-        if let Some(tx) = changes.transaction() {
-            self.transactions
+        if let Some(tx) = changes.reservation() {
+            self.reservations
                 .insert(tx.request().id().clone(), (self.now_ms, tx.clone()));
         }
         Ok(())
@@ -172,13 +172,13 @@ impl<S: TransactionalStore> Application<S> {
         view.complete = true;
         Ok(view)
     }
-    pub(crate) fn transaction_in(&self, view: &View, id: &str) -> Result<dto::Transaction, Error> {
+    pub(crate) fn reservation_in(&self, view: &View, id: &str) -> Result<dto::Reservation, Error> {
         let scoped = self.scoped_id(id)?;
         self.lookup(view, &scoped, 0)?
             .as_ref()
             .map(Into::into)
             .ok_or_else(|| Error::domain(d::Error::NotFound))
-            .map_err(|e| e.with_transaction(id))
+            .map_err(|e| e.with_reservation(id))
     }
     pub(crate) fn qualify(&self, write: Write) -> Result<Write, Error> {
         Ok(match write {
@@ -229,33 +229,33 @@ impl<S: TransactionalStore> Application<S> {
     pub fn execute(&self, command: Command) -> Result<Output, Error> {
         match command {
             Command::CreateResource(v) => self.create_resource(v).map(Output::Resource),
-            Command::Prepare(v) => self.prepare(v).map(Output::Transaction),
-            Command::Commit(v) => self.commit(v).map(Output::Transaction),
-            Command::Abort { transaction_id } => {
-                self.abort(&transaction_id).map(Output::Transaction)
+            Command::Prepare(v) => self.prepare(v).map(Output::Reservation),
+            Command::Commit(v) => self.commit(v).map(Output::Reservation),
+            Command::Abort { reservation_id } => {
+                self.abort(&reservation_id).map(Output::Reservation)
             }
             Command::ShowResource { resource_id } => {
                 self.resource(&resource_id).map(Output::Resource)
             }
             Command::ListResources => self.resources().map(Output::Resources),
-            Command::ShowTransaction { transaction_id } => {
-                self.transaction(&transaction_id).map(Output::Transaction)
+            Command::ShowReservation { reservation_id } => {
+                self.reservation(&reservation_id).map(Output::Reservation)
             }
-            Command::ListTransactions => self.transactions().map(Output::Transactions),
+            Command::ListReservations => self.reservations().map(Output::Reservations),
         }
     }
     pub fn execute_detailed(&self, command: Command) -> Result<Execution, Error> {
-        let transaction_id = match &command {
-            Command::Prepare(v) => Some(v.transaction_id.clone()),
-            Command::Commit(v) => Some(v.transaction_id.clone()),
-            Command::Abort { transaction_id } => Some(transaction_id.clone()),
+        let reservation_id = match &command {
+            Command::Prepare(v) => Some(v.reservation_id.clone()),
+            Command::Commit(v) => Some(v.reservation_id.clone()),
+            Command::Abort { reservation_id } => Some(reservation_id.clone()),
             _ => None,
         };
         let write = match command {
             Command::CreateResource(v) => Write::create(v),
             Command::Prepare(v) => Write::prepare(v),
             Command::Commit(v) => Write::commit(v),
-            Command::Abort { transaction_id } => Write::abort(&transaction_id),
+            Command::Abort { reservation_id } => Write::abort(&reservation_id),
             read => {
                 return self.execute(read).map(|output| Execution {
                     output,
@@ -267,8 +267,8 @@ impl<S: TransactionalStore> Application<S> {
             .and_then(|w| self.qualify(w))
             .and_then(|w| self.write_detailed(&w))
             .map_err(|mut e| {
-                if transaction_id.is_some() {
-                    e.transaction_id = transaction_id;
+                if reservation_id.is_some() {
+                    e.reservation_id = reservation_id;
                 }
                 e
             })
@@ -280,8 +280,8 @@ impl<S: TransactionalStore> Application<S> {
         &self,
         context: &crate::access::AccessContext,
         request: dto::Prepare,
-    ) -> Result<Option<dto::Transaction>, Error> {
-        let id = request.transaction_id.clone();
+    ) -> Result<Option<dto::Reservation>, Error> {
+        let id = request.reservation_id.clone();
         (|| {
             context.validate_at((self.clock)())?;
             let app = self.scoped(context.scope().clone());
@@ -314,7 +314,7 @@ impl<S: TransactionalStore> Application<S> {
             }
             Ok(Some((&tx).into()))
         })()
-        .map_err(|e: Error| e.with_transaction(&id))
+        .map_err(|e: Error| e.with_reservation(&id))
     }
     pub fn execute_authorized(
         &self,
@@ -322,17 +322,17 @@ impl<S: TransactionalStore> Application<S> {
         command: Command,
     ) -> Result<Execution, Error> {
         let id = match &command {
-            Command::Prepare(v) => Some(v.transaction_id.clone()),
-            Command::Commit(v) => Some(v.transaction_id.clone()),
-            Command::Abort { transaction_id } | Command::ShowTransaction { transaction_id } => {
-                Some(transaction_id.clone())
+            Command::Prepare(v) => Some(v.reservation_id.clone()),
+            Command::Commit(v) => Some(v.reservation_id.clone()),
+            Command::Abort { reservation_id } | Command::ShowReservation { reservation_id } => {
+                Some(reservation_id.clone())
             }
             _ => None,
         };
         self.execute_authorized_inner(context, command)
             .map_err(|mut e| {
-                if e.transaction_id.is_none() {
-                    e.transaction_id = id;
+                if e.reservation_id.is_none() {
+                    e.reservation_id = id;
                 }
                 e
             })
@@ -353,26 +353,26 @@ impl<S: TransactionalStore> Application<S> {
             Command::Prepare(request) => Command::Prepare(context.bind_prepare(request)?),
             Command::Commit(commit) => {
                 context.require(Action::Commit)?;
-                let tx = app.transaction(&commit.transaction_id)?;
+                let tx = app.reservation(&commit.reservation_id)?;
                 context.request(Action::Commit, &tx.request)?;
                 Command::Commit(commit)
             }
-            Command::Abort { transaction_id } => {
+            Command::Abort { reservation_id } => {
                 context.require(Action::Abort)?;
-                let tx = app.transaction(&transaction_id)?;
+                let tx = app.reservation(&reservation_id)?;
                 context.request(Action::Abort, &tx.request)?;
-                Command::Abort { transaction_id }
+                Command::Abort { reservation_id }
             }
             Command::ShowResource { resource_id } => {
                 context.resource(Action::Read, &resource_id, None)?;
                 Command::ShowResource { resource_id }
             }
-            Command::ShowTransaction { transaction_id } => {
+            Command::ShowReservation { reservation_id } => {
                 context.require(Action::Read)?;
-                let tx = app.transaction(&transaction_id)?;
+                let tx = app.reservation(&reservation_id)?;
                 context.request(Action::Read, &tx.request)?;
                 return Ok(Execution {
-                    output: Output::Transaction(tx),
+                    output: Output::Reservation(tx),
                     replayed: false,
                 });
             }
@@ -390,16 +390,16 @@ impl<S: TransactionalStore> Application<S> {
                     replayed: false,
                 });
             }
-            Command::ListTransactions => {
+            Command::ListReservations => {
                 context.require(Action::Read)?;
                 let mut visible = Vec::new();
-                for tx in app.transactions()? {
+                for tx in app.reservations()? {
                     if context.request(Action::Read, &tx.request).is_ok() {
                         visible.push(tx);
                     }
                 }
                 return Ok(Execution {
-                    output: Output::Transactions(visible),
+                    output: Output::Reservations(visible),
                     replayed: false,
                 });
             }
@@ -412,8 +412,8 @@ impl<S: TransactionalStore> Application<S> {
             _ => unreachable!(),
         }
     }
-    pub fn prepare(&self, mut request: dto::Prepare) -> Result<dto::Transaction, Error> {
-        let id = request.transaction_id.clone();
+    pub fn prepare(&self, mut request: dto::Prepare) -> Result<dto::Reservation, Error> {
+        let id = request.reservation_id.clone();
         let result = (|| {
             if request
                 .namespace
@@ -426,18 +426,18 @@ impl<S: TransactionalStore> Application<S> {
             }
             request.namespace = self.scope.namespace().map(str::to_owned);
             let write = Write::prepare(request)?;
-            self.write(&write).map(crate::transaction_output)
+            self.write(&write).map(crate::reservation_output)
         })();
-        result.map_err(|e| e.with_transaction(&id))
+        result.map_err(|e| e.with_reservation(&id))
     }
     fn scoped_id(&self, id: &str) -> Result<d::Id, Error> {
-        match self.scope.transaction(id)? {
-            RecordKey::Transaction(id) => Ok(id),
+        match self.scope.reservation(id)? {
+            RecordKey::Reservation(id) => Ok(id),
             _ => unreachable!(),
         }
     }
-    pub fn commit(&self, command: dto::Commit) -> Result<dto::Transaction, Error> {
-        let id = command.transaction_id.clone();
+    pub fn commit(&self, command: dto::Commit) -> Result<dto::Reservation, Error> {
+        let id = command.reservation_id.clone();
         (|| {
             let Write::Commit { actuals, .. } = Write::commit(command)? else {
                 unreachable!()
@@ -446,15 +446,15 @@ impl<S: TransactionalStore> Application<S> {
                 id: self.scoped_id(&id)?,
                 actuals,
             })
-            .map(crate::transaction_output)
+            .map(crate::reservation_output)
         })()
-        .map_err(|e: Error| e.with_transaction(&id))
+        .map_err(|e: Error| e.with_reservation(&id))
     }
-    pub fn abort(&self, id: &str) -> Result<dto::Transaction, Error> {
+    pub fn abort(&self, id: &str) -> Result<dto::Reservation, Error> {
         self.scoped_id(id)
             .and_then(|id| self.write(&Write::Abort(id)))
-            .map(crate::transaction_output)
-            .map_err(|e| e.with_transaction(id))
+            .map(crate::reservation_output)
+            .map_err(|e| e.with_reservation(id))
     }
     pub fn resource(&self, id: &str) -> Result<dto::Resource, Error> {
         let key = RecordKey::resource(id)?;
@@ -470,21 +470,21 @@ impl<S: TransactionalStore> Application<S> {
     pub fn resources(&self) -> Result<Vec<dto::Resource>, Error> {
         Ok(self.snapshot()?.resources)
     }
-    pub fn transaction(&self, id: &str) -> Result<dto::Transaction, Error> {
+    pub fn reservation(&self, id: &str) -> Result<dto::Reservation, Error> {
         (|| {
             let txid = self.scoped_id(id)?;
-            let view = self.load_keys(BTreeSet::from([RecordKey::Transaction(txid.clone())]), 0)?;
+            let view = self.load_keys(BTreeSet::from([RecordKey::Reservation(txid.clone())]), 0)?;
             self.lookup(&view, &txid, 0)?
                 .as_ref()
                 .map(Into::into)
                 .ok_or_else(|| Error::domain(d::Error::NotFound))
         })()
-        .map_err(|e: Error| e.with_transaction(id))
+        .map_err(|e: Error| e.with_reservation(id))
     }
-    pub fn transactions(&self) -> Result<Vec<dto::Transaction>, Error> {
+    pub fn reservations(&self) -> Result<Vec<dto::Reservation>, Error> {
         Ok(self
             .snapshot()?
-            .transactions
+            .reservations
             .into_iter()
             .filter(|tx| tx.request.namespace.as_deref() == self.scope.namespace())
             .collect())
@@ -495,7 +495,7 @@ impl<S: TransactionalStore> Application<S> {
         let inspection = self.store.scan(self.scope.tenant())?;
         let view = View::from_read(inspection.read, (self.clock)())?;
         let mut live = d::Live::default();
-        let mut transactions = BTreeMap::<d::Id, d::Transaction>::new();
+        let mut reservations = BTreeMap::<d::Id, d::Reservation>::new();
         let mut revision = 0u64;
         let mut identities = BTreeSet::new();
         let mut times = BTreeMap::<RecordKey, u64>::new();
@@ -511,9 +511,9 @@ impl<S: TransactionalStore> Application<S> {
                         transition::create(spec.clone(), live.resources().get(spec.id()))
                             .map_err(corrupt)?
                     }
-                    dto::Record::Transaction(tx) => {
-                        let tx: d::Transaction = tx.try_into().map_err(corrupt)?;
-                        let prior = transactions.get(tx.request().id());
+                    dto::Record::Reservation(tx) => {
+                        let tx: d::Reservation = tx.try_into().map_err(corrupt)?;
+                        let prior = reservations.get(tx.request().id());
                         let changes = match (tx.state(), prior) {
                             (
                                 d::State::Prepared | d::State::Aborted(d::AbortReason::Rejected(_)),
@@ -535,13 +535,13 @@ impl<S: TransactionalStore> Application<S> {
                             (d::State::Aborted(d::AbortReason::Lapsed), Some(prior)) => {
                                 transition::lapse(prior, live.resources(), now)
                             }
-                            _ => return Err(corrupt("transaction history out of order")),
+                            _ => return Err(corrupt("reservation history out of order")),
                         }
                         .map_err(corrupt)?;
-                        if changes.transaction() != Some(&tx) {
+                        if changes.reservation() != Some(&tx) {
                             return Err(corrupt("history does not reproduce its transition"));
                         }
-                        transactions.insert(tx.request().id().clone(), tx);
+                        reservations.insert(tx.request().id().clone(), tx);
                         changes
                     }
                 };
@@ -554,8 +554,8 @@ impl<S: TransactionalStore> Application<S> {
                     .map(|r| RecordKey::Resource(r.spec().id().clone()))
                     .chain(
                         changes
-                            .transaction()
-                            .map(|tx| RecordKey::Transaction(tx.request().id().clone())),
+                            .reservation()
+                            .map(|tx| RecordKey::Reservation(tx.request().id().clone())),
                     );
                 for key in keys {
                     if times.get(&key).is_some_and(|time| *time > now) {
@@ -570,23 +570,23 @@ impl<S: TransactionalStore> Application<S> {
             }
         }
         if live != view.live
-            || transactions.len() != view.transactions.len()
-            || transactions
+            || reservations.len() != view.reservations.len()
+            || reservations
                 .iter()
-                .any(|(id, tx)| view.transactions.get(id).map(|(_, tx)| tx) != Some(tx))
+                .any(|(id, tx)| view.reservations.get(id).map(|(_, tx)| tx) != Some(tx))
         {
             return Err(corrupt("records disagree with history"));
         }
         if view.pending
-            != d::access::Pending::from_prepared(transactions.values()).map_err(corrupt)?
+            != d::access::Pending::from_prepared(reservations.values()).map_err(corrupt)?
         {
             return Err(corrupt(
-                "pending counter disagrees with transaction history",
+                "pending counter disagrees with reservation history",
             ));
         }
         let ledger = d::Ledger::restore(
             live.resources().values().cloned().collect(),
-            transactions.into_values().collect(),
+            reservations.into_values().collect(),
         )
         .map_err(corrupt)?;
         Ok(dto::Snapshot::from_ledger(&ledger, revision))
@@ -612,10 +612,10 @@ impl<S: TransactionalStore> Application<S> {
                         Value::Pending(_) => (),
                         Value::Resource(r) => {
                             let r: d::Resource = r.clone().try_into().map_err(corrupt)?;
-                            keys.extend(r.holds().keys().cloned().map(RecordKey::Transaction));
+                            keys.extend(r.holds().keys().cloned().map(RecordKey::Reservation));
                         }
-                        Value::Transaction(tx) => {
-                            let tx: d::Transaction = tx.clone().try_into().map_err(corrupt)?;
+                        Value::Reservation(tx) => {
+                            let tx: d::Reservation = tx.clone().try_into().map_err(corrupt)?;
                             if tx.request().authorization().is_some() {
                                 keys.insert(RecordKey::Pending);
                             }
@@ -644,11 +644,11 @@ impl<S: TransactionalStore> Application<S> {
                 .operations()
                 .iter()
                 .map(|op| RecordKey::Resource(op.resource().clone()))
-                .chain([RecordKey::Transaction(request.id().clone())])
+                .chain([RecordKey::Reservation(request.id().clone())])
                 .chain(request.authorization().map(|_| RecordKey::Pending))
                 .collect(),
             Write::Commit { id, .. } | Write::Abort(id) => {
-                BTreeSet::from([RecordKey::Transaction(id.clone())])
+                BTreeSet::from([RecordKey::Reservation(id.clone())])
             }
             Write::Lapse => BTreeSet::new(),
         }
@@ -675,16 +675,16 @@ impl<S: TransactionalStore> Application<S> {
         view: &View,
         id: &d::Id,
         since_ms: u64,
-    ) -> Result<Option<d::Transaction>, Error> {
+    ) -> Result<Option<d::Reservation>, Error> {
         Ok(view
-            .transactions
+            .reservations
             .get(id)
             .filter(|(recorded, tx)| *tx.state() == d::State::Prepared || *recorded >= since_ms)
             .map(|(_, tx)| tx.clone()))
     }
     fn admit(&self, view: &View, request: &d::Request) -> Result<u64, Error> {
         let created = uuid_v7_millis(request.id().as_str()).ok_or_else(|| {
-            Error::input("a new transaction ID must be a UUIDv7 in canonical lowercase form")
+            Error::input("a new reservation ID must be a UUIDv7 in canonical lowercase form")
         })?;
         let skew = millis(self.window.skew);
         if created < view.now_ms.saturating_sub(millis(self.window.max_age)) {
@@ -692,18 +692,18 @@ impl<S: TransactionalStore> Application<S> {
                 category: Category::Input,
                 code: Code::Expired,
                 message: format!(
-                    "transaction ID was created at {created} ms, older than the {:?} retry \
+                    "reservation ID was created at {created} ms, older than the {:?} retry \
                      window; an earlier attempt may have been admitted, but it can no longer \
                      be replayed",
                     self.window.max_age
                 ),
-                transaction_id: None,
+                reservation_id: None,
                 capacity: None,
             });
         }
         if created > view.now_ms.saturating_add(skew) {
             return Err(Error::input(format!(
-                "transaction ID was created at {created} ms, more than {:?} ahead of the \
+                "reservation ID was created at {created} ms, more than {:?} ahead of the \
                  store's clock",
                 self.window.skew
             )));
@@ -752,12 +752,12 @@ impl<S: TransactionalStore> Application<S> {
                 )
                 .map_err(Error::domain)?;
                 let tx = changes
-                    .transaction()
+                    .reservation()
                     .or(existing.as_ref())
                     .ok_or(Error::domain(d::Error::InvalidLedger))?;
                 let output = match tx.rejection() {
                     Some(reason) => Err(Error::rejection(reason)),
-                    None => Ok(Output::Transaction(tx.into())),
+                    None => Ok(Output::Reservation(tx.into())),
                 };
                 Ok((changes, output))
             }
@@ -767,8 +767,8 @@ impl<S: TransactionalStore> Application<S> {
                     .ok_or(Error::domain(d::Error::NotFound))?;
                 let changes = transition::commit(&tx, actuals.clone(), view.live.resources())
                     .map_err(Error::domain)?;
-                let output = changes.transaction().unwrap_or(&tx).into();
-                Ok((changes, Ok(Output::Transaction(output))))
+                let output = changes.reservation().unwrap_or(&tx).into();
+                Ok((changes, Ok(Output::Reservation(output))))
             }
             Write::Abort(id) => {
                 let tx = self
@@ -776,13 +776,13 @@ impl<S: TransactionalStore> Application<S> {
                     .ok_or(Error::domain(d::Error::NotFound))?;
                 let changes =
                     transition::abort(&tx, view.live.resources()).map_err(Error::domain)?;
-                let output = changes.transaction().unwrap_or(&tx).into();
-                Ok((changes, Ok(Output::Transaction(output))))
+                let output = changes.reservation().unwrap_or(&tx).into();
+                Ok((changes, Ok(Output::Reservation(output))))
             }
             // Its lapses are all it changes, and `lapse_due` records them.
             Write::Lapse => Ok((
                 transition::Changes::default(),
-                Ok(Output::Transactions(vec![])),
+                Ok(Output::Reservations(vec![])),
             )),
         }
     }
@@ -838,7 +838,7 @@ impl<S: TransactionalStore> Application<S> {
                 dependencies.extend(Self::keys(write));
                 match write {
                     Write::Commit { id, .. } | Write::Abort(id) => {
-                        if let Some((_, tx)) = view.transactions.get(id) {
+                        if let Some((_, tx)) = view.reservations.get(id) {
                             dependencies.extend(
                                 tx.request()
                                     .operations()
@@ -861,7 +861,7 @@ impl<S: TransactionalStore> Application<S> {
                     |lapsed| match write {
                         Write::Lapse => Ok(Execution {
                             replayed: lapsed.is_empty(),
-                            output: Output::Transactions(lapsed.iter().map(Into::into).collect()),
+                            output: Output::Reservations(lapsed.iter().map(Into::into).collect()),
                         }),
                         _ => self.evaluate(&view, write).and_then(|(next, output)| {
                             let replayed = next.is_empty();
@@ -876,7 +876,7 @@ impl<S: TransactionalStore> Application<S> {
             }
             for (_, change) in &changes {
                 if change
-                    .transaction()
+                    .reservation()
                     .is_some_and(|tx| tx.request().authorization().is_some())
                 {
                     dependencies.insert(RecordKey::Pending);
@@ -889,8 +889,8 @@ impl<S: TransactionalStore> Application<S> {
                 );
                 dependencies.extend(
                     change
-                        .transaction()
-                        .map(|tx| RecordKey::Transaction(tx.request().id().clone())),
+                        .reservation()
+                        .map(|tx| RecordKey::Reservation(tx.request().id().clone())),
                 );
             }
             // Hydration validates the connected hold graph. Only the resources
@@ -990,7 +990,7 @@ fn lapse_due(
     view: &mut View,
     write: &Write,
     entries: &mut Vec<(u64, transition::Changes)>,
-) -> Result<Vec<d::Transaction>, Error> {
+) -> Result<Vec<d::Reservation>, Error> {
     let (live, now) = (&view.live, view.now_ms);
     let on = |request: &d::Request| {
         live.due(request.operations().iter().map(d::Operation::resource), now)
@@ -1012,7 +1012,7 @@ fn lapse_due(
     for tx in due {
         let changes = transition::lapse(&tx, view.live.resources(), now).map_err(Error::domain)?;
         push(view, &changes, entries)?;
-        lapsed.extend(changes.transaction().cloned());
+        lapsed.extend(changes.reservation().cloned());
     }
     Ok(lapsed)
 }
@@ -1059,7 +1059,7 @@ impl<S: TransactionalStore + Readiness> ReadyApplication<S> {
         context: &crate::access::AccessContext,
         request: dto::Prepare,
         required: DurabilityProfile,
-    ) -> Result<Option<dto::Transaction>, Error> {
+    ) -> Result<Option<dto::Reservation>, Error> {
         self.capabilities.require(required)?;
         if !self.capabilities.multi_tenant && *context.scope() != Scope::local() {
             return Err(Error::new(

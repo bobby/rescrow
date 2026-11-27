@@ -19,7 +19,7 @@ pub struct Prepare {
 impl Prepare {
     pub fn into_command(self, id: String) -> dto::Prepare {
         dto::Prepare {
-            transaction_id: id,
+            reservation_id: id,
             namespace: self.namespace,
             operations: self.operations,
             hold_ms: self.hold_ms,
@@ -151,8 +151,8 @@ impl Resource {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Transaction {
-    pub transaction: dto::Transaction,
+pub struct Reservation {
+    pub reservation: dto::Reservation,
     pub request_digest: String,
     pub actuals_digest: Option<String>,
     pub consistency: Consistency,
@@ -164,29 +164,29 @@ pub struct Transaction {
 pub enum Materialization {
     Complete,
 }
-impl Transaction {
-    pub fn validated(self) -> Result<dto::Transaction, Error> {
-        let _: rescrow_domain::Transaction = self
-            .transaction
+impl Reservation {
+    pub fn validated(self) -> Result<dto::Reservation, Error> {
+        let _: rescrow_domain::Reservation = self
+            .reservation
             .clone()
             .try_into()
             .map_err(|e: rescrow_domain::Error| Error::input(e.to_string()))?;
-        let canonical = Self::from_dto(self.transaction.clone())?;
+        let canonical = Self::from_dto(self.reservation.clone())?;
         if canonical.request_digest != self.request_digest
             || canonical.actuals_digest != self.actuals_digest
-            || (self.processing && !matches!(self.transaction.state, dto::State::Prepared {}))
+            || (self.processing && !matches!(self.reservation.state, dto::State::Prepared {}))
         {
             return Err(Error::input(
-                "invalid transaction response digest or processing state",
+                "invalid reservation response digest or processing state",
             ));
         }
-        Ok(self.transaction)
+        Ok(self.reservation)
     }
-    pub fn from_dto(transaction: dto::Transaction) -> Result<Self, Error> {
+    pub fn from_dto(reservation: dto::Reservation) -> Result<Self, Error> {
         Ok(Self {
-            request_digest: crate::canonical::prepare_digest(&transaction.request)?,
-            actuals_digest: crate::canonical::actuals_digest(&transaction)?,
-            transaction,
+            request_digest: crate::canonical::prepare_digest(&reservation.request)?,
+            actuals_digest: crate::canonical::actuals_digest(&reservation)?,
+            reservation,
             consistency: Consistency::Authoritative,
             materialization: Materialization::Complete,
             processing: false,
@@ -203,7 +203,7 @@ pub struct Problem {
     pub status: u16,
     pub detail: String,
     pub request_id: String,
-    pub transaction_id: Option<String>,
+    pub reservation_id: Option<String>,
     pub retryable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<Box<dto::CapacityFailure>>,
@@ -240,7 +240,7 @@ impl Problem {
             Code::CorruptState=>"authority state failed validation; operator attention is required".to_string(),
             Code::UnsupportedSchema=>"authority schema is unsupported; operator attention is required".to_string(),
             Code::MissingStore=>"selected authority is not initialized or is unavailable".to_string(),
-            Code::UnknownOutcome|Code::DeadlineExceeded=>"outcome is unconfirmed and may have been applied; inspect or retry only the same transaction identity and request".to_string(),
+            Code::UnknownOutcome|Code::DeadlineExceeded=>"outcome is unconfirmed and may have been applied; inspect or retry only the same reservation identity and request".to_string(),
             _=>error.message,
         };
         if detail.len() > 1024 {
@@ -258,7 +258,7 @@ impl Problem {
             status,
             detail,
             request_id,
-            transaction_id: error.transaction_id,
+            reservation_id: error.reservation_id,
             retryable,
             capacity: error.capacity,
         }
@@ -268,7 +268,7 @@ impl Problem {
             category: self.category,
             code: self.code,
             message: self.detail,
-            transaction_id: self.transaction_id,
+            reservation_id: self.reservation_id,
             capacity: self.capacity,
         }
     }

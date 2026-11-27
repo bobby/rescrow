@@ -85,7 +85,7 @@ fn matches(call: &Call, model: &Model, revision: u64, result: Result<(), Failure
                 && error.code == code
                 && error.category == category
                 && !error.message.is_empty()
-                && error.transaction_id == call.command.transaction_id().map(tx_id)
+                && error.reservation_id == call.command.reservation_id().map(tx_id)
                 && error.capacity.as_deref() == failure.capacity().as_ref()
         }
         _ => false,
@@ -239,7 +239,7 @@ mod tests {
                         code,
                         category,
                         message: "model rejection".into(),
-                        transaction_id: command.transaction_id().map(tx_id),
+                        reservation_id: command.reservation_id().map(tx_id),
                         capacity: failure.capacity().map(Box::new),
                     };
                     Response {

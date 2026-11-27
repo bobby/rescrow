@@ -139,7 +139,7 @@ async fn blocked_io_and_cancelled_requests_do_not_block_workers_or_release_capac
 }
 
 #[tokio::test]
-async fn an_unknown_task_delivery_keeps_the_original_transaction_identity() {
+async fn an_unknown_task_delivery_keeps_the_original_reservation_identity() {
     use rescrow_application::{Code, system_clock, uuid_v7};
     let store = Gated {
         inner: MemoryAuthority::default(),
@@ -156,7 +156,7 @@ async fn an_unknown_task_delivery_keeps_the_original_transaction_identity() {
     let command = dto::Command::Prepare(dto::Prepare {
         context: Default::default(),
         authorization: None,
-        transaction_id: id.clone(),
+        reservation_id: id.clone(),
         namespace: None,
         hold_ms: None,
         operations: vec![dto::Operation {
@@ -171,7 +171,7 @@ async fn an_unknown_task_delivery_keeps_the_original_transaction_identity() {
         .await
         .unwrap_err();
     assert_eq!(error.code, Code::UnknownOutcome);
-    assert_eq!(error.transaction_id, Some(id));
+    assert_eq!(error.reservation_id, Some(id));
     server
         .execute(command, DurabilityProfile::Simulation)
         .await

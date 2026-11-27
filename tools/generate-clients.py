@@ -135,8 +135,8 @@ for path, entry in spec["paths"].items():
             tsargs += ["query?: Record<string, string | number>"]
             query = "query"
             tsquery = "query"
-        identity = "id" if "/transactions/{id}" in path else "None"
-        tsidentity = "id" if "/transactions/{id}" in path else "undefined"
+        identity = "id" if "/reservations/{id}" in path else "None"
+        tsidentity = "id" if "/reservations/{id}" in path else "undefined"
         pypath = (
             "f" + repr(path.replace("{id}", "{path_id(id)}"))
             if "{id}" in path

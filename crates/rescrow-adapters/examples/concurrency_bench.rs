@@ -37,7 +37,7 @@ fn prepare(id: &str) -> Command {
         context: Default::default(),
         authorization: None,
         namespace: None,
-        transaction_id: id.into(),
+        reservation_id: id.into(),
         operations: vec![Operation {
             operation_id: "o".into(),
             resource_id: "r".into(),
@@ -131,7 +131,7 @@ fn run(path: &Path, writers: usize, readers: usize, service: bool) {
                 for pair in 0..PAIRS {
                     let id = uuid_v7(system_clock(), (w * PAIRS + pair) as u128);
                     latencies.push(write(&*execute, prepare(&id), &contended));
-                    let abort = Command::Abort { transaction_id: id };
+                    let abort = Command::Abort { reservation_id: id };
                     latencies.push(write(&*execute, abort, &contended));
                 }
                 latencies

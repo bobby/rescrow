@@ -134,7 +134,7 @@ impl LogStore for MemoryStore {
         }
         Ok(())
     }
-    fn find(&self, transaction_id: &str, since_ms: u64) -> Result<Option<Entry>, StoreError> {
+    fn find(&self, reservation_id: &str, since_ms: u64) -> Result<Option<Entry>, StoreError> {
         let state = self.0.lock().unwrap();
         Ok(state
             .entries
@@ -142,8 +142,8 @@ impl LogStore for MemoryStore {
             .rev()
             .take_while(|entry| entry.recorded_at_ms >= since_ms)
             .find(|entry| match &entry.record {
-                Record::Transaction(tx) => {
-                    tx.request.transaction_id == transaction_id
+                Record::Reservation(tx) => {
+                    tx.request.reservation_id == reservation_id
                         && !matches!(tx.state, TxState::Prepared {})
                 }
                 Record::ResourceCreated(_) => false,

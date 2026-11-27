@@ -60,7 +60,7 @@ fn unknown(id: Option<&str>) -> Error {
         Code::DeadlineExceeded,
         "remote outcome is unconfirmed; inspect or retry only the identical identity and request",
     );
-    e.transaction_id = id.map(str::to_owned);
+    e.reservation_id = id.map(str::to_owned);
     e
 }
 impl Client {
@@ -208,7 +208,7 @@ impl Client {
                             Code::Conflict,
                             "endpoint belongs to a different authority generation",
                         );
-                        e.transaction_id = id.map(str::to_owned);
+                        e.reservation_id = id.map(str::to_owned);
                         return Err(e);
                     }
                     *expected = Some(generation.clone());
@@ -242,7 +242,7 @@ impl Client {
                     if problem.status != status.as_u16()
                         || api::status(&problem.code) != (problem.status, problem.retryable)
                         || problem
-                            .transaction_id
+                            .reservation_id
                             .as_deref()
                             .is_some_and(|v| id.is_some_and(|id| id != v))
                     {
@@ -279,8 +279,8 @@ impl Client {
             }
             tokio::time::sleep(delay).await;
         }
-        if last.transaction_id.is_none() {
-            last.transaction_id = id.map(str::to_owned);
+        if last.reservation_id.is_none() {
+            last.reservation_id = id.map(str::to_owned);
         }
         Err(last)
     }
@@ -293,7 +293,7 @@ impl Client {
         let (method, path, body, id, key, resource, list) = match command {
             dto::Command::CreateResource(v) => (
                 Method::PUT,
-                format!("/v1/resources/{}", api::path_id(&v.resource_id)?),
+                format!("/admin/v1/resources/{}", api::path_id(&v.resource_id)?),
                 Some(encode(&api::ResourceCreate {
                     lower: v.lower,
                     upper: v.upper,
@@ -326,16 +326,16 @@ impl Client {
             ),
             dto::Command::Prepare(v) => {
                 if v.authorization.is_some()
-                    || rescrow_application::uuid_v7_millis(&v.transaction_id).is_none()
+                    || rescrow_application::uuid_v7_millis(&v.reservation_id).is_none()
                 {
                     return Err(Error::input(
                         "prepare requires a caller-created UUIDv7 and no client authorization facts",
                     ));
                 }
-                let id = v.transaction_id;
+                let id = v.reservation_id;
                 (
                     Method::POST,
-                    "/v1/transactions".into(),
+                    "/v1/reservations".into(),
                     Some(encode(&api::Prepare {
                         operations: v.operations,
                         hold_ms: v.hold_ms,
@@ -351,36 +351,36 @@ impl Client {
             dto::Command::Commit(v) => (
                 Method::POST,
                 format!(
-                    "/v1/transactions/{}/commit",
-                    api::path_id(&v.transaction_id)?
+                    "/v1/reservations/{}/commit",
+                    api::path_id(&v.reservation_id)?
                 ),
                 Some(encode(&api::Commit { actuals: v.actuals })?),
-                Some(v.transaction_id),
+                Some(v.reservation_id),
                 false,
                 false,
                 false,
             ),
-            dto::Command::Abort { transaction_id } => (
+            dto::Command::Abort { reservation_id } => (
                 Method::POST,
-                format!("/v1/transactions/{}/abort", api::path_id(&transaction_id)?),
+                format!("/v1/reservations/{}/abort", api::path_id(&reservation_id)?),
                 Some(b"{}".to_vec()),
-                Some(transaction_id),
+                Some(reservation_id),
                 false,
                 false,
                 false,
             ),
-            dto::Command::ShowTransaction { transaction_id } => (
+            dto::Command::ShowReservation { reservation_id } => (
                 Method::GET,
-                format!("/v1/transactions/{}", api::path_id(&transaction_id)?),
+                format!("/v1/reservations/{}", api::path_id(&reservation_id)?),
                 None,
-                Some(transaction_id),
+                Some(reservation_id),
                 false,
                 false,
                 false,
             ),
-            dto::Command::ListTransactions => (
+            dto::Command::ListReservations => (
                 Method::GET,
-                "/v1/transactions".into(),
+                "/v1/reservations".into(),
                 None,
                 None,
                 false,
@@ -390,7 +390,7 @@ impl Client {
         };
         if list {
             let mut resources = Vec::new();
-            let mut transactions = Vec::new();
+            let mut reservations = Vec::new();
             let mut next = Some(path.clone());
             let mut previous = None;
             while let Some(current) = next.take() {
@@ -409,15 +409,15 @@ impl Client {
                     );
                     result.data.next_cursor
                 } else {
-                    let result: Envelope<Page<api::Transaction>> = self
+                    let result: Envelope<Page<api::Reservation>> = self
                         .request(method.clone(), &current, None, None, false, deadline)
                         .await?;
-                    transactions.extend(
+                    reservations.extend(
                         result
                             .data
                             .items
                             .into_iter()
-                            .map(api::Transaction::validated)
+                            .map(api::Reservation::validated)
                             .collect::<Result<Vec<_>, _>>()
                             .map_err(|_| unknown(None))?,
                     );
@@ -439,7 +439,7 @@ impl Client {
             Ok(if resource {
                 dto::Output::Resources(resources)
             } else {
-                dto::Output::Transactions(transactions)
+                dto::Output::Reservations(reservations)
             })
         } else if resource {
             let result: Envelope<api::Resource> = self
@@ -454,7 +454,7 @@ impl Client {
                 result.data.validated().map_err(|_| unknown(None))?,
             ))
         } else {
-            let result: Envelope<api::Transaction> = self
+            let result: Envelope<api::Reservation> = self
                 .request(method, &path, body, id.as_deref(), key, deadline)
                 .await?;
             if expected_prepare
@@ -467,13 +467,13 @@ impl Client {
                 .data
                 .validated()
                 .map_err(|_| unknown(id.as_deref()))?;
-            if id.as_deref() != Some(tx.request.transaction_id.as_str()) {
+            if id.as_deref() != Some(tx.request.reservation_id.as_str()) {
                 return Err(unknown(id.as_deref()));
             }
-            Ok(dto::Output::Transaction(tx))
+            Ok(dto::Output::Reservation(tx))
         }
     }
-    pub async fn prepare(&self, preparation: &Preparation) -> Result<dto::Transaction, Error> {
+    pub async fn prepare(&self, preparation: &Preparation) -> Result<dto::Reservation, Error> {
         match self
             .execute(dto::Command::Prepare(
                 preparation
@@ -483,7 +483,7 @@ impl Client {
             ))
             .await?
         {
-            dto::Output::Transaction(value) => Ok(value),
+            dto::Output::Reservation(value) => Ok(value),
             _ => unreachable!(),
         }
     }

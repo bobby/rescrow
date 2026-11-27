@@ -36,7 +36,7 @@ fn empty() -> Read {
 }
 fn key_supported(key: &RecordKey) -> bool {
     match key {
-        RecordKey::Resource(id) | RecordKey::Transaction(id) => id.namespace().is_none(),
+        RecordKey::Resource(id) | RecordKey::Reservation(id) => id.namespace().is_none(),
         RecordKey::Pending => true,
     }
 }
@@ -50,12 +50,12 @@ fn receipt(history: &HistoryRecord, position: u64) -> Result<Receipt, StoreError
             dto::Record::ResourceCreated(spec) => {
                 put(RecordKey::resource(&spec.resource_id).map_err(storage)?)
             }
-            dto::Record::Transaction(tx) => {
-                let tx: rescrow_domain::Transaction = tx
+            dto::Record::Reservation(tx) => {
+                let tx: rescrow_domain::Reservation = tx
                     .clone()
                     .try_into()
                     .map_err(|e: rescrow_domain::Error| StoreError::Corrupt(e.to_string()))?;
-                put(RecordKey::Transaction(tx.request().id().clone()));
+                put(RecordKey::Reservation(tx.request().id().clone()));
                 if tx.request().authorization().is_some() {
                     put(RecordKey::Pending);
                 }
@@ -161,18 +161,18 @@ impl<S: LogStore> TransactionalStore for S {
                         .map(|r| Value::Resource(r.into())),
                     view.recorded_at_ms,
                 ),
-                RecordKey::Transaction(id) => {
+                RecordKey::Reservation(id) => {
                     if let Some(tx) = view.live.prepared().get(id) {
-                        (Some(Value::Transaction(tx.into())), view.recorded_at_ms)
+                        (Some(Value::Reservation(tx.into())), view.recorded_at_ms)
                     } else if let Some((time, tx)) = view.terminal.get(id) {
-                        (Some(Value::Transaction(tx.into())), *time)
+                        (Some(Value::Reservation(tx.into())), *time)
                     } else {
                         match LogStore::find(self, id.as_str(), terminal_since_ms)?
                             .filter(|e| e.sequence < view.position)
                         {
                             Some(entry) => match entry.record {
-                                dto::Record::Transaction(tx) => {
-                                    (Some(Value::Transaction(tx)), entry.recorded_at_ms)
+                                dto::Record::Reservation(tx) => {
+                                    (Some(Value::Reservation(tx)), entry.recorded_at_ms)
                                 }
                                 _ => {
                                     return Err(StoreError::Corrupt(
@@ -242,19 +242,19 @@ impl<S: LogStore> TransactionalStore for S {
                 }),
             );
         }
-        for tx in snapshot.transactions {
-            let domain: rescrow_domain::Transaction = tx
+        for tx in snapshot.reservations {
+            let domain: rescrow_domain::Reservation = tx
                 .clone()
                 .try_into()
                 .map_err(|e: rescrow_domain::Error| StoreError::Corrupt(e.to_string()))?;
-            let key = RecordKey::Transaction(domain.request().id().clone());
+            let key = RecordKey::Reservation(domain.request().id().clone());
             let time = history
                 .iter()
                 .flat_map(|(h, _)| &h.records)
                 .rev()
                 .find_map(|r| match &r.record {
-                    dto::Record::Transaction(t)
-                        if t.request.transaction_id == tx.request.transaction_id =>
+                    dto::Record::Reservation(t)
+                        if t.request.reservation_id == tx.request.reservation_id =>
                     {
                         Some(r.recorded_at_ms)
                     }
@@ -266,7 +266,7 @@ impl<S: LogStore> TransactionalStore for S {
                 Some(Versioned {
                     version: version(view.position),
                     recorded_at_ms: time,
-                    value: Value::Transaction(tx),
+                    value: Value::Reservation(tx),
                 }),
             );
         }

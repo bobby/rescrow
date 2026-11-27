@@ -1,7 +1,7 @@
 //! Cooperative same-user Linux authority: a checkpoint of live state in
 //! `live.json` and an append-only log of checksummed records, split into
 //! segments. A synchronized append is the commit point. A full segment is
-//! sealed by writing an immutable index of its finished transactions, so
+//! sealed by writing an immutable index of its finished reservations, so
 //! lookups of old decisions read indexes rather than the whole log. Path
 //! manipulation and network filesystems are outside this adapter's contract.
 //! The lock inode is never replaced or removed.
@@ -72,7 +72,7 @@ struct LiveFile {
     checkpoint: Checkpoint,
 }
 
-/// Immutable index of a sealed segment's finished transactions, sorted by ID.
+/// Immutable index of a sealed segment's finished reservations, sorted by ID.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Index {
@@ -93,7 +93,7 @@ struct PublicationIndex {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IndexEntry {
-    transaction_id: String,
+    reservation_id: String,
     sequence: u64,
     offset: u64,
 }
@@ -326,7 +326,7 @@ impl FileStore {
         let sorted = index
             .entries
             .windows(2)
-            .all(|w| w[0].transaction_id < w[1].transaction_id);
+            .all(|w| w[0].reservation_id < w[1].reservation_id);
         let publications_sorted = index
             .publications
             .windows(2)
@@ -559,7 +559,7 @@ impl FileStore {
         let bytes = serde_json::to_vec(live).map_err(|e| StoreError::Corrupt(e.to_string()))?;
         self.publish(&self.directory.join(LIVE), &bytes, directory)
     }
-    /// Seal the active segment with an index of its finished transactions and
+    /// Seal the active segment with an index of its finished reservations and
     /// start the next one. Nothing is appended, so failures here are plain I/O
     /// errors: the log's contents are unchanged.
     fn roll(&self, tail: &Tail, next: u64) -> Result<(), StoreError> {
@@ -584,9 +584,9 @@ impl FileStore {
                 .entries
                 .into_iter()
                 .filter_map(|(entry, start, _)| match entry.record {
-                    Record::Transaction(tx) if !matches!(tx.state, TxState::Prepared {}) => {
+                    Record::Reservation(tx) if !matches!(tx.state, TxState::Prepared {}) => {
                         Some(IndexEntry {
-                            transaction_id: tx.request.transaction_id,
+                            reservation_id: tx.request.reservation_id,
                             sequence: entry.sequence,
                             offset: start,
                         })
@@ -594,7 +594,7 @@ impl FileStore {
                     _ => None,
                 })
                 .collect();
-            entries.sort_by(|a, b| a.transaction_id.cmp(&b.transaction_id));
+            entries.sort_by(|a, b| a.reservation_id.cmp(&b.reservation_id));
             let index = Index {
                 segment: tail.active,
                 length: scan.valid_end,
@@ -830,9 +830,9 @@ impl LogStore for FileStore {
     /// Search the active segment, then sealed indexes from newest to oldest.
     /// Records are in time order, so a segment is skipped, with every older
     /// one, once the segment after it starts before `since_ms`.
-    fn find(&self, transaction_id: &str, since_ms: u64) -> Result<Option<Entry>, StoreError> {
+    fn find(&self, reservation_id: &str, since_ms: u64) -> Result<Option<Entry>, StoreError> {
         let directory = self.directory_file()?;
-        self.unlocked(|| self.find_unlocked(transaction_id, since_ms, &directory))
+        self.unlocked(|| self.find_unlocked(reservation_id, since_ms, &directory))
     }
     fn history(&self) -> Result<Vec<Entry>, StoreError> {
         let directory = self.directory_file()?;
@@ -920,15 +920,15 @@ impl FileStore {
     }
     fn find_unlocked(
         &self,
-        transaction_id: &str,
+        reservation_id: &str,
         since_ms: u64,
         directory: &File,
     ) -> Result<Option<Entry>, StoreError> {
         self.read_live()?;
         let segments = self.segments()?;
         let terminal = |entry: &Entry| {
-            matches!(&entry.record, Record::Transaction(tx)
-                if tx.request.transaction_id == transaction_id
+            matches!(&entry.record, Record::Reservation(tx)
+                if tx.request.reservation_id == reservation_id
                     && !matches!(tx.state, TxState::Prepared {}))
         };
         let mut newer_starts_ms = u64::MAX;
@@ -965,7 +965,7 @@ impl FileStore {
             }
             let Ok(at) = index
                 .entries
-                .binary_search_by(|e| e.transaction_id.as_str().cmp(transaction_id))
+                .binary_search_by(|e| e.reservation_id.as_str().cmp(reservation_id))
             else {
                 continue;
             };

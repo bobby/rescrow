@@ -87,18 +87,18 @@ impl<S: TransactionalStore + Send + Sync + 'static> Service<S> {
         match command {
             Command::CreateResource(spec) => self.write(Write::create(spec)),
             Command::Prepare(request) => {
-                let id = request.transaction_id.clone();
+                let id = request.reservation_id.clone();
                 self.write(Write::prepare(request))
-                    .map_err(|e| e.with_transaction(&id))
+                    .map_err(|e| e.with_reservation(&id))
             }
             Command::Commit(command) => {
-                let id = command.transaction_id.clone();
+                let id = command.reservation_id.clone();
                 self.write(Write::commit(command))
-                    .map_err(|e| e.with_transaction(&id))
+                    .map_err(|e| e.with_reservation(&id))
             }
-            Command::Abort { transaction_id } => self
-                .write(Write::abort(&transaction_id))
-                .map_err(|e| e.with_transaction(&transaction_id)),
+            Command::Abort { reservation_id } => self
+                .write(Write::abort(&reservation_id))
+                .map_err(|e| e.with_reservation(&reservation_id)),
             Command::ShowResource { resource_id } => {
                 resource_in(&self.current.load(), &resource_id).map(Output::Resource)
             }
@@ -111,19 +111,19 @@ impl<S: TransactionalStore + Send + Sync + 'static> Service<S> {
                     .map(Into::into)
                     .collect(),
             )),
-            Command::ShowTransaction { transaction_id } => self
+            Command::ShowReservation { reservation_id } => self
                 .app
-                .transaction_in(&self.current.load(), &transaction_id)
-                .map(Output::Transaction),
-            Command::ListTransactions => self.app.transactions().map(Output::Transactions),
+                .reservation_in(&self.current.load(), &reservation_id)
+                .map(Output::Reservation),
+            Command::ListReservations => self.app.reservations().map(Output::Reservations),
         }
     }
     /// Lapse every overdue hold now, rather than at the writer's next timer,
-    /// and return the lapsed transactions.
-    pub fn lapse(&self) -> Result<Vec<dto::Transaction>, Error> {
+    /// and return the lapsed reservations.
+    pub fn lapse(&self) -> Result<Vec<dto::Reservation>, Error> {
         match self.write(Ok(Write::Lapse))? {
-            Output::Transactions(lapsed) => Ok(lapsed),
-            _ => unreachable!("a lapse outputs the transactions it lapsed"),
+            Output::Reservations(lapsed) => Ok(lapsed),
+            _ => unreachable!("a lapse outputs the reservations it lapsed"),
         }
     }
     pub fn stats(&self) -> &Stats {

@@ -89,9 +89,9 @@ async fn executable_selects_existing_file_or_disposable_memory_and_handles_sigte
             None,
             &[
                 "resource:create",
-                "transaction:prepare",
-                "transaction:commit",
-                "transaction:abort",
+                "reservation:prepare",
+                "reservation:commit",
+                "reservation:abort",
                 "read",
             ],
         );
@@ -125,7 +125,7 @@ async fn executable_selects_existing_file_or_disposable_memory_and_handles_sigte
         }
         assert!(ready, "last connection error: {last_error:?}");
         let response = client
-            .put(&url)
+            .put(url.replacen("/v1/resources/", "/admin/v1/resources/", 1))
             .bearer_auth(&token)
             .json(&spec())
             .send()

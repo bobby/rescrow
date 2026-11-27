@@ -28,5 +28,5 @@ try:
     raise AssertionError("changed actuals were accepted")
 except ProblemError as error:
     assert error.problem["code"] == "conflict"
-assert client.list_transactions()["data"]["items"]
+assert client.list_reservations()["data"]["items"]
 print("Python lifecycle, stable key, partial settlement and conflict passed")
