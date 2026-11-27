@@ -239,9 +239,22 @@ The same Domain and Application are intended to support:
 - Regional HTTP deployments with explicit backend durability guarantees.
 - Enterprise services spanning multiple US Regions, with qualified regional-loss RPO zero and RTO at most 60 seconds.
 
-Local use is first-class and requires no cloud account or HTTP server. The first implementation uses a versioned JSON file, OS locking, and synchronized atomic replacement so independent CLI invocations share one local authority. Local qualification covers process interruption/restart and simulated I/O failures on the tested filesystems; physical power-loss/device qualification remains outstanding. SQLite remains a possible later adapter if the simple file store becomes insufficient. Enterprise deployments add globally consistent authority, regional redundancy, identity, isolation, and independent audit evidence. The reference enterprise authority is DynamoDB MRSC; S3 Standard provides checkpoints/retained evidence, and Express can provide disposable acceleration. These are proposed designs and acceptance targets requiring validation.
+Local use is first-class and requires no cloud account or HTTP server. The first implementation uses a versioned JSON file, OS locking, and synchronized atomic replacement so independent CLI invocations share one local authority. Local qualification covers process interruption/restart and simulated I/O failures on the tested filesystems; physical power-loss/device qualification remains outstanding. SQLite remains a possible later adapter if the simple file store becomes insufficient. Enterprise deployments add globally consistent authority, regional redundancy, identity, isolation, and independent audit evidence. The enterprise authority is Aurora DSQL multi-Region, which commits multi-record transactions synchronously across two active Regions with a witness. Regional deployments use PostgreSQL/Aurora or SlateDB on S3. DESIGN.md §6.4 compares these candidates, including DynamoDB, which is out of scope for now. S3 Standard provides checkpoints and retained evidence, and Express can provide disposable acceleration. These are proposed designs and acceptance targets requiring validation.
 
 All shapes preserve escrow bounds, durable decisions, retry identity, and safe settlement/refund rules. A backend must meet the selected profile; selecting local operation cannot silently weaken an enterprise namespace.
+
+## Roadmap
+
+Server work is tracked as GitHub milestones, roughly in order. Each builds on the earlier ones, although work in M3–M5 can overlap.
+
+1. [M1 · Server foundation](https://github.com/bobby/rescrow/milestone/1): a transactional storage port, an async boundary, tenants, durability profiles, and an adapter conformance suite.
+2. [M2 · HTTP API v1](https://github.com/bobby/rescrow/milestone/2): the `/v1` resources of DESIGN.md §8, with idempotency, errors, authentication, limits, and clients.
+3. [M3 · Regional backends](https://github.com/bobby/rescrow/milestone/3): PostgreSQL/Aurora and SlateDB on S3.
+4. [M4 · Operability](https://github.com/bobby/rescrow/milestone/4): telemetry, health, configuration, releases, background work, SLOs, and scaling signals, without assuming a platform.
+5. [M5 · Hot resources and throughput](https://github.com/bobby/rescrow/milestone/5): rights shards, batching, rebalancing, and the DESIGN.md §9.3 gates.
+6. [M6 · Multi-Region on Aurora DSQL](https://github.com/bobby/rescrow/milestone/6): the enterprise profile, with regional failover and drills.
+7. [M7 · Agents and long-lived work](https://github.com/bobby/rescrow/milestone/7): renewal, execution claims, receipts, events, and hierarchical budgets.
+8. [M8 · Security, audit and GA readiness](https://github.com/bobby/rescrow/milestone/8): audit export, a formal model, restore qualification, and review.
 
 ## Contributing
 

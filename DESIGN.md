@@ -6,7 +6,7 @@ Date: 2026-11-13.
 
 The implementation so far is local: a pure Domain, Application/transfer types, and separate CLI invocations sharing a log-structured file store, documented in [README.md](README.md). It establishes escrow semantics before adding the distributed protocol. The broader mechanisms and acceptance targets below remain proposed.
 
-Deployment spectrum: embedded Rust, concurrent local CLI use, an optional local service, regional APIs, and the enterprise multi-region service. The enterprise profile requires active capacity across three US AWS Regions, synchronously replicated authority, and automatic regional traffic failover. S3 Standard and Express are the first object-storage backends; the reference enterprise authority is DynamoDB multi-Region strong consistency (MRSC).
+Deployment spectrum: embedded Rust, concurrent local CLI use, an optional local service, regional APIs, and the enterprise multi-region service. The enterprise profile requires active capacity across three US AWS Regions, synchronously replicated authority, and automatic regional traffic failover. S3 Standard and Express are the first object-storage backends. The enterprise authority is an Aurora DSQL multi-Region cluster, subject to prototype gates (§6.4).
 
 Design decision: enterprise recovery and security are release requirements for the enterprise profile. Local and regional deployments are first-class uses with explicitly narrower failure domains. A direct S3-only authority cannot meet the enterprise contract. Globally consistent KV authority is a v1 enterprise dependency; local applications must not require that infrastructure or its SDKs.
 
@@ -190,7 +190,7 @@ flowchart LR
     W[Recovery and materialization workers] --> APP
     APP --> P[Pure domain functions and types]
     APP --> S[Application-defined conditional storage port]
-    S --> B[Profile-qualified authority / local file or MRSC]
+    S --> B[Profile-qualified authority / local file or multi-Region store]
     B --> E[Durable transition history]
     B --> O[S3 Standard checkpoints / Express caches]
     E --> V[Audit exporter and verifier]
@@ -211,7 +211,7 @@ An enterprise-wide ceiling spanning several domains requires conserved suballoca
 
 Local transactions then charge local ancestors backed by those grants. This removes the global parent from every child request while conserving its ceiling. Reporting distinguishes unallocated, delegated, reserved, and consumed amounts rather than calling a parent allocation immediate external consumption. Model issuance, publication, returns, replay, and child loss before enabling cross-domain delegation. It is required qualification for enterprises that need several domains under one ceiling, not an implicit cross-store transaction. Without it, keep the shared ceiling and its consumers in one sufficiently provisioned domain.
 
-Run service instances across multiple AZs in each of three Regions. A reference US topology is `us-east-1`, `us-east-2`, and `us-west-2`, subject to service availability and enterprise residency approval. Provision three full authority replicas rather than a witness-only third location so every Region has a read/write service destination. APIs accept traffic in all Regions; prefer one Region for a hot shard to reduce conflicts, with that preference carrying no exclusive-write authority.
+A DSQL multi-Region cluster spans three Regions: two active peers that both serve reads and writes, and a witness that holds the transaction log but serves neither (§6.4). A reference US topology is active peers in `us-east-1` and `us-west-2` with the witness in `us-east-2`, subject to service availability and enterprise residency approval. Run service instances across multiple AZs in both active Regions. The witness Region has no write path, so after one active Region is lost, the survivor alone must carry the full contracted peak; provision each active Region for that. APIs accept traffic in both active Regions; prefer one Region for a hot shard to reduce conflicts, with that preference carrying no exclusive-write authority.
 
 Keep the tenant directory, trust roots, admitted policy versions, resource-generation manifests, namespace/HMAC configuration, and active schema compatibility information recoverable through the same regional-loss contract. Deploy immutable signed bundles into each Region and verify their authoritative activation before use. Existing tenants must continue admitting and settling work when account provisioning, human SSO configuration, billing, or the central deployment pipeline is unavailable. Do not require the failed Region to mint tokens, decrypt a manifest, sign a receipt, resolve a directory entry, or approve failover.
 
@@ -237,9 +237,16 @@ The first four are on the safety path. Enumeration schedules recovery; it never 
 
 Capabilities must explicitly report consistency scope, durability/failure domain, supported Regions, maximum encoded record size, and behavior under a regional partition. A regional implementation of this interface is insufficient for enterprise admission even if its method names match. Independent writes to three buckets are not a substitute for a globally ordered conditional-write protocol.
 
-An illustrative Rust boundary, defined by the Application and implemented by outer adapters, is:
+Authorities come in two shapes:
 
-The local file store instead uses a narrower port: load a checkpoint and the entries after it, and conditionally append entries at an expected log position. Its single serialized log does not implement the separate-key protocol below. Introduce the broader interface when independent participant publication is actually needed.
+- A **transactional authority** applies a set of conditional record changes atomically: every affected cell, descriptor and history record of one transition, or none of them. On one, prepare and commit are each a single atomic transition over the affected records, exactly as the local log commits them. Because no participant can be left partially written, there is no reader-visible `PREPARING` state, no recovery ticket, no asynchronous materialization and no abort fence.
+- A **single-key authority** offers atomic conditions only on one key at a time. It requires the separate-key protocol of §7: tickets, `PREPARING`, cell-then-descriptor reads, and fenced finalization.
+
+Prefer the transactional shape where an authority offers it, since it removes most of the protocol's moving parts. Both shapes share the Domain, the meaning of every record, and the conformance suite.
+
+The local file store is a transactional authority with a narrower port: load a checkpoint and the entries after it, and conditionally append entries at an expected log position. Its single serialized log commits each transition's affected records together, so it needs none of the separate-key protocol below.
+
+A sketch of the single-key boundary, defined by the Application and implemented by outer adapters, follows. Introduce it only for an authority that actually requires separate-key publication:
 
 ```rust
 // Sketch: concrete async/object-safety and buffer types are implementation choices.
@@ -315,9 +322,32 @@ S3-compatible products require their own conformance results. API similarity alo
 
 ### 6.4 Enterprise authority and additional adapters
 
-**DynamoDB MRSC, v1 reference authority:** AWS documents synchronous replication to another Region before write success, latest-version conditional evaluation, globally strong reads, and zero regional-loss RPO. MRSC uses exactly three Regions and currently does not support transaction APIs. See [global-table semantics](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/V2globaltables_HowItWorks.html). These properties make it a candidate implementation of the single-key protocol; they do not by themselves establish Rescrow's end-to-end SLO.
+**Authority candidates.** These are the semantics the vendors document as of this revision. Each candidate must still pass Rescrow's conformance, partition and failover tests before a profile can claim it.
 
-Require `ConsistentRead` on authoritative base-table reads, revision-conditional mutations, immutable history items, and partitioned work-ticket discovery. Preserve the common multi-key escrow protocol rather than depending on native multi-item transactions. Treat replicated-write conflicts as retriable conditions with rereads; classify uncertain write outcomes separately. GSIs can schedule discovery but cannot authorize decisions. Verify configured consistency and replica topology at provisioning and admission readiness; ordinary eventually consistent global tables must be rejected. Regional strongly consistent reads on an eventually replicated global table do not repair cross-region conditional-write safety.
+| Authority | Shape (§6.1) | Failure domain and RPO | Notes |
+| --- | --- | --- | --- |
+| DynamoDB MRSC global table | Single-key | Each write is replicated synchronously to at least one other Region before it succeeds; zero regional-loss RPO | Exactly three Regions: either three replicas, or two replicas and a witness that serves no reads or writes. Strongly consistent reads, and conditions evaluated against the latest version. A write that conflicts with one in another Region fails with a retriable `ReplicatedWriteConflictException`. Transaction APIs are not supported: invoking one on an MRSC replica returns an error. See [global tables](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/V2globaltables_HowItWorks.html). |
+| DynamoDB table, single Region | Transactional | Regional, across AZs | [`TransactWriteItems`](https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_TransactWriteItems.html) applies up to 100 conditional actions atomically. Regional profile only. |
+| Aurora DSQL multi-Region cluster | Transactional | Commits synchronously across two active peer Regions, with a witness Region holding the transaction log | PostgreSQL-compatible, with [optimistic concurrency](https://aws.amazon.com/blogs/database/concurrency-control-in-amazon-aurora-dsql/): a conflicting transaction fails at commit and is retried. A transaction modifies at most 3,000 rows and 10 MiB and runs for at most 5 minutes ([quotas](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html)). Two Regions serve reads and writes; the witness serves neither ([resilience](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/disaster-recovery-resiliency.html)). |
+| PostgreSQL / Aurora PostgreSQL | Transactional | Regional (multi-AZ on Aurora) | Aurora Global Database replicates asynchronously: an unplanned cross-Region failover has a [non-zero RPO measured in seconds](https://docs.aws.amazon.com/r53recovery/latest/dg/aurora-global-database-block.html). Regional profile only; Global Database cannot meet the enterprise RPO. |
+| SlateDB on S3 | Transactional, single writer | The bucket's: regional on S3 Standard, one AZ on Express One Zone | An embedded LSM tree on object storage, with one writer per database. A newly opened writer advances a writer epoch in the manifest using conditional object writes, so a stale writer can no longer publish. Offers snapshot and serializable-snapshot [transactions](https://docs.rs/crate/slatedb/latest/source/src/db_transaction.rs). Regional profile. Throughput comes from group commit in the one writer; latency comes from object-store writes. |
+
+MRSC's lack of transactions is why this design originally required the separate-key protocol everywhere. Of the candidates above, only MRSC needs it. DSQL offers zero-RPO multi-Region commits *and* multi-record transactions, but with only two serving Regions. **Decision:** the enterprise authority is Aurora DSQL multi-Region. A prototype must pass the §9.3 gates, measuring latency, conflict rate on hot cells, cost per decision and failover behavior, before any profile claims it. DynamoDB, in either global-table mode, is out of scope for now:
+
+- **MREC tables** support transactions, but each is atomic only in the Region that ran it, and Regions resolve concurrent writes by last writer wins. Two Regions could each admit a reservation against the same balance, and an acknowledged write in a lost Region may never have replicated.
+- **MRSC tables** are strongly consistent but have no transactions, so they would need §7's separate-key protocol.
+
+That protocol stays specified, in case DSQL misses its gates and MRSC is reconsidered.
+
+**On a transactional authority:**
+- Run each transition as one transaction that reads the affected records and conditionally writes them together with their history.
+- Treat a serialization or optimistic-concurrency conflict as a lost race: reload and re-evaluate, as the local store does after a conflicting append.
+- Treat a commit whose outcome is unknown, such as a connection lost after `COMMIT`, as `Unknown`. Resolve it by reading the transition's history record, never by blindly retrying.
+- DSQL's row and size limits also bound participants per transaction and batch size.
+
+**On SlateDB:** run one writer per transaction domain or shard group. A writer that finds itself fenced stops and reports an unknown outcome for its in-flight batch, as the local service does after an uncertain append. Its writer epoch is the atomically checked epoch that §7.7 requires of an exclusive owner, but only within the failure domain of one bucket.
+
+**If MRSC is reconsidered:** require `ConsistentRead` on authoritative base-table reads, revision-conditional mutations, immutable history items, and partitioned work-ticket discovery. Preserve the common multi-key escrow protocol rather than depending on native multi-item transactions. Treat replicated-write conflicts as retriable conditions with rereads; classify uncertain write outcomes separately. GSIs can schedule discovery but cannot authorize decisions. Verify configured consistency and replica topology at provisioning and admission readiness; ordinary eventually consistent global tables must be rejected. Regional strongly consistent reads on an eventually replicated global table do not repair cross-region conditional-write safety.
 
 Benchmark item size, replicated write units, partition distribution, account quotas, and cross-region latency before sizing a cell. Authority data must contain all information needed during failover; an item may not point to a regional-only S3 payload on the safety path. Native SDK retry behavior requires the same ambiguity tests as S3. A future alternative authority, including a mature quorum-replicated engine with S3 checkpoints, must pass identical partition, membership, and restore tests; implementing a new consensus protocol is not a v1 prerequisite.
 
@@ -327,9 +357,11 @@ Each record updates every affected resource and transaction of one transition to
 
 Filesystem permissions define the cooperative same-user trust boundary. Enforcing budgets against an untrusted agent requires denying it direct state writes and placing the Application behind a separately privileged local service with authenticated IPC. Durable local state survives its qualified filesystem/device/process failure model, not loss of its only device. Process-kill tests alone do not qualify survival of arbitrary power loss.
 
-**Other KV stores:** require strong per-key conditions and durable acknowledgements. Eventually consistent replicas or last-writer-wins conflict resolution are insufficient without a stronger coordination layer. A deployment cannot activate an adapter whose capability profile fails the core requirements.
+**Other KV stores:** require strong per-key conditions, or atomic multi-key transactions, and durable acknowledgements. Eventually consistent replicas or last-writer-wins conflict resolution are insufficient without a stronger coordination layer. A deployment cannot activate an adapter whose capability profile fails the core requirements.
 
 ## 7. Transaction protocol
+
+This section specifies the separate-key protocol a single-key authority needs (§6.1). No selected authority needs it today. It is kept for a single-key authority such as DynamoDB MRSC, should one be reconsidered. On a transactional authority, each step below is one atomic transition over the affected records. The state machine, decisions, retries, expiration and claims still apply. `PREPARING`, the cell-then-descriptor read order, abort fences (§7.4), recovery tickets (§7.6) and asynchronous materialization do not: no participant is ever written separately.
 
 ### 7.1 State machine
 
@@ -423,7 +455,7 @@ Every admitted recovery ticket, prepared cell entry, terminal decision, history 
 
 Regional API failover changes request routing, not ownership of a regional balance. Surviving APIs read the same authoritative records and continue the same transactions. No promotion of an S3 snapshot, counter reset, new transaction-ID namespace, or blanket expiration of old reservations occurs. A warm replacement can serve new work while background workers reconcile outstanding decisions; a full ledger replay is not on the regional RTO path.
 
-The conditional authority is the write fence: stale versions fail against the global latest version, and an isolated Region cannot acknowledge writes through an independent local authority. All mutation paths, including administration and recovery, must use it. An old frontend that still reaches the healthy authority may safely perform currently authorized operations; routing preference is not an exclusive lease. Any future exclusive shard owner or local log must add an atomically checked authority epoch before it can replace this model. DNS changes, cloud credential revocation, wall-clock leases, or a region-health flag alone are not write fences.
+The conditional authority is the write fence: stale versions fail against the global latest version, and an isolated Region cannot acknowledge writes through an independent local authority. All mutation paths, including administration and recovery, must use it. An old frontend that still reaches the healthy authority may safely perform currently authorized operations; routing preference is not an exclusive lease. Any future exclusive shard owner or local log must add an atomically checked authority epoch before it can replace this model; SlateDB's writer epoch is one, though only within its bucket's failure domain. DNS changes, cloud credential revocation, wall-clock leases, or a region-health flag alone are not write fences.
 
 | Failure | Enterprise response |
 | --- | --- |
@@ -586,7 +618,7 @@ Sharding improves throughput by reducing contention, at the cost of fragmentatio
 
 ### 9.2 Budget the actual authority and storage work
 
-With the audit scheme below, each logical head transition requires an immutable history write followed by a conditional head write. For a successful transaction with `k` participant cells and no batching, the full lifecycle normally uses:
+On a single-key authority, with the audit scheme below, each logical head transition requires an immutable history write followed by a conditional head write. For a successful transaction with `k` participant cells and no batching, the full lifecycle normally uses:
 
 ```text
 3 descriptor transitions: create, prepared, committed
@@ -595,13 +627,19 @@ approximately 1 + 2 * (3 + 2k) logical authority writes, including the recovery 
 plus reads, completion acknowledgements, receipts, scans, and retries
 ```
 
-Thus even a one-participant transaction normally costs about eleven logical writes before housekeeping. For a direct regional S3 adapter these are PUTs; for the enterprise MRSC adapter they are conditionally published items and immutable items, charged by record size and replication. Preparation and commit each include several dependent cross-region write round trips. Do not substitute local Express latency for that end-to-end cost.
+Thus even a one-participant transaction normally costs about eleven logical writes before housekeeping. For a direct regional S3 adapter these are PUTs; for an MRSC adapter they are conditionally published items and immutable items, charged by record size and replication. Preparation and commit each include several dependent cross-region write round trips. Do not substitute local Express latency for that end-to-end cost.
 
 An execution claim adds another descriptor transition and history write, normally two additional logical writes, before dispatch. Gateway action deduplication, metering, refund-right creation/consumption, policy fences, and cross-domain grants add their own operations. Include them in workflow-specific throughput and latency results rather than using the minimal counter lifecycle as a claim about complete agent execution.
 
 For one-participant transactions, batches of `b` preparations and `b` finalizations reduce the amortized write estimate toward `7 + 4/b` logical writes per transaction, including tickets. Descriptor updates and tickets remain per transaction in the initial protocol. At 100,000 committed transactions/s, even that optimized floor is roughly 700,000 logical writes/s before other work and replicated capacity-unit amplification. Provisioning and cost must be evaluated at encoded-byte and replicated-storage-request rates, not just API-request rate. Hierarchical budgets add participants and concentrate traffic on shared ancestors; benchmark those trees rather than extrapolating from unrelated counters.
 
-Qualify quotas and provisioned headroom in every Region, table, partition, key service, and network path before accepting a customer peak. AWS documents [DynamoDB throughput quotas](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ServiceQuotas.html); an on-demand billing mode is not proof of unlimited immediately available failover capacity. If three Regions normally share traffic evenly, each survivor must support at least half the total peak plus the measured retry and recovery margin after a Region is lost.
+On a transactional authority, a lifecycle is two transactions:
+- **Prepare** writes the descriptor, `k` cells and history.
+- **Commit** writes the decision, `k` cells and history.
+
+Each is one commit round trip, carrying the same encoded bytes as on a single-key authority. The cost moves from dependent writes to conflicts: every transaction touching a hot cell conflicts with every other transaction touching it at the same time. Sharding (§4.3) and in-process batching (§9.1) therefore remain the throughput levers. Measure conflict and retry rates under skew alongside write counts.
+
+Qualify quotas and headroom in every Region, cluster, key service, and network path before accepting a customer peak. AWS documents [Aurora DSQL quotas](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html); a serverless authority is not proof of unlimited immediately available failover capacity. With two active Regions sharing traffic, the survivor must support the whole peak plus the measured retry and recovery margin after a Region is lost.
 
 AWS's [S3 performance guidance](https://docs.aws.amazon.com/AmazonS3/latest/userguide/optimizing-performance.html) describes scaling with partitioned prefixes. Those figures are not per-object CAS throughput promises. Spread transaction and history keys, measure real contention, warm workloads gradually, and handle throttling with bounded exponential backoff and jitter.
 
@@ -620,7 +658,7 @@ These are engineering targets to test, not product claims:
 
 Benchmark both short and long holds, opposing directions, partial use, near-exhausted resources, skew, large transactions, saturated pending-entry limits, and failure/recovery overlap. Report p50/p95/p99, successful decisions/s, abort/rejection rates, storage requests/decision, bytes, retry amplification, audit lag, stranded rights, and cost per million decisions. Include signer and encryption overhead.
 
-If the reference authority misses latency, cost, or hot-budget targets, revisit batching, record sizes, partitioning, and a mature replicated authority implementation. Such a change must preserve the complete multi-region contract; falling back to local disk or regional S3 is not a performance optimization for enterprise namespaces. Regional escrow allocations and replicated-log authorities remain separately reviewed alternatives.
+If the selected authority misses latency, cost, or hot-budget targets, revisit batching, record sizes, partitioning, and a mature replicated authority implementation. Such a change must preserve the complete multi-region contract; falling back to local disk or regional S3 is not a performance optimization for enterprise namespaces. Regional escrow allocations and replicated-log authorities remain separately reviewed alternatives.
 
 ## 10. Security and audit evidence
 
@@ -816,7 +854,7 @@ Keep Domain tests free of effect mocks: exercise valid constructors, rejected in
 
 Qualify the local profile using independent OS processes sharing one file store, including simultaneous admission near exhaustion, process death during publication, lock contention, lost responses, and restart recovery. Demonstrate the same logical outcomes through the direct Rust API and CLI entrypoint. Local progress and authority tests must not depend on enterprise infrastructure being available.
 
-Run adapter conformance and concurrent history tests against a real three-Region MRSC authority and real Standard/Express buckets for their respective roles. Emulators are useful for development but do not establish cloud consistency semantics. Include a test in which a write succeeds remotely and its response is deliberately lost. Check linearizability of per-key transitions and transaction decisions, and check declared escrow invariants rather than asserting nonexistent global snapshot isolation. Intentionally provision an incompatible eventual global table and verify readiness refuses it.
+Run adapter conformance and concurrent history tests against a real DSQL multi-Region cluster, with its witness, and against real Standard/Express buckets in their respective roles. Emulators are useful for development but do not establish cloud consistency semantics. Include a test in which a write succeeds remotely and its response is deliberately lost. Check linearizability of per-key transitions and transaction decisions, and check declared escrow invariants rather than asserting nonexistent global snapshot isolation. Intentionally provision an incompatible authority, such as an eventually consistent global table or a single-Region DSQL cluster, and verify readiness refuses it for the enterprise profile.
 
 ### 12.2 Operations
 
@@ -850,11 +888,11 @@ Publish separately measured recovery bounds and residual uncertainty for these d
 
 1. **Protocol and domain foundation:** executable model, pure Rust Domain, Application transfer types/conversions and use cases, deterministic memory adapter, replay verifier, and explicit deployment/threat profiles. Exit when invalid local states cannot enter through the public API, conversions reject invalid external data, and adversarial schedules preserve the safety properties.
 2. **Local library and CLI:** file snapshot adapter, concurrent independent agents/processes, direct Application API, multi-resource prepare/commit/abort, partial use, replay identity, and restart qualification. Claims, expiry, external execution, hierarchy, and refunds are outside this first milestone. Exit after cross-process contention/interruption tests and a local build/run with no cloud or HTTP-server requirement.
-3. **Multi-region authority prototype:** extend Application orchestration for separate-key publication and real three-Region MRSC while retaining the pure domain rules. Add complete history/work tickets, execution claims and settlement policies, expiry/abort fences, mandatory ancestor charges, guarded refund rights, HTTP API, and regional endpoint fallback. S3 Standard/Express adapters support archive/cache roles and explicitly regional testing. Exit after regional-loss, claim/expiry, refund, and ambiguity tests.
+3. **Multi-region authority prototype:** prototype Aurora DSQL multi-Region (§6.4) against the §9.3 gates, then extend Application orchestration for atomic transitions on it, retaining the pure domain rules. If DSQL misses its gates, reconsider MRSC with §7's separate-key protocol. Add complete history/work tickets, execution claims and settlement policies, expiry/abort fences, mandatory ancestor charges, guarded refund rights, HTTP API, and regional endpoint fallback. S3 Standard/Express adapters support archive/cache roles and explicitly regional testing. Exit after regional-loss, claim/expiry, refund, and ambiguity tests.
 4. **Enterprise scale and isolation:** deployment cells, fixed rights shards, batching, internal rebalancing, qualified cross-domain grants where needed, N-1 capacity, and representative hierarchical-budget cost/latency results. Exit only with reproducible sustained-load and failover measurements.
 5. **Enterprise GA gate:** independent protocol/security review, penetration testing, signed evidence and retained checkpoints, policy/key failure exercises, repeated RPO/RTO drills, restore qualification, supply-chain controls, 24/7 runbooks, and customer-facing service objectives. Security and regional recovery are not post-GA add-ons.
 6. **Additional adapters and integrations:** alternative authorities that meet the enterprise contract, generated clients, and durable-execution examples. Every adapter declares its profile and passes the applicable safety suite; regional adapters cannot be mislabeled enterprise-capable.
 
-Before implementation, settle workload-specific defaults for shard count, reservation lifetime, pending entry limits, participant limits, hierarchical delegation, signing infrastructure, and audit retention. Validate the MRSC topology and capacity, enterprise residency boundaries, contracted peak, policy freshness, external gateway enforcement, and RPO/RTO drill method. Keep online resharding, mutable bounds, renewable holds, exact online snapshots, disconnected regional spending, and general external 2PC as separately reviewed extensions. Basic multi-region failover, zero-loss acknowledged budget state, and the enterprise security posture are required in the first production release.
+Before implementation, settle workload-specific defaults for shard count, reservation lifetime, pending entry limits, participant limits, hierarchical delegation, signing infrastructure, and audit retention. Validate the DSQL topology and capacity, enterprise residency boundaries, contracted peak, policy freshness, external gateway enforcement, and RPO/RTO drill method. Keep online resharding, mutable bounds, renewable holds, exact online snapshots, disconnected regional spending, and general external 2PC as separately reviewed extensions. Basic multi-region failover, zero-loss acknowledged budget state, and the enterprise security posture are required in the first production release.
 
 Acceptance requires a simple shared Domain and Application that preserve escrow semantics through every supported entrypoint and failure profile. The local profile must coordinate independent on-device agents durably without cloud dependencies. The enterprise profile must demonstrate that admitted promises survive any one Region loss, acknowledged budget state has RPO zero, useful service meets the regional RTO at contracted load, tenant and delegated-budget boundaries hold, and decisions remain unambiguous under retries. Measure the costs of authority, security, recovery, and audit in the profile being claimed.
