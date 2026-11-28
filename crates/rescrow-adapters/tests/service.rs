@@ -119,7 +119,10 @@ fn lapses(store: &MemoryStore, id: &str) -> usize {
         .count()
 }
 /// A service and a clock it reads, which moves only when the test moves it.
-fn clocked(store: &MemoryStore, now: u64) -> (Service<MemoryStore>, Arc<AtomicU64>) {
+fn clocked<S: LogStore + Clone + Send + Sync + 'static>(
+    store: &S,
+    now: u64,
+) -> (Service<S>, Arc<AtomicU64>) {
     let app = Application::new(store.clone());
     app.initialize().unwrap();
     app.execute(create("5")).unwrap();
@@ -332,16 +335,19 @@ fn a_hold_another_writer_lapsed_is_not_lapsed_again() {
 }
 #[test]
 fn a_failed_lapse_is_retried_after_a_pause() {
-    let store = MemoryStore::default();
+    let store = Slow::default();
     let now = system_clock();
     let (service, clock) = clocked(&store, now);
     let tx = id(0);
     service.execute(held(&tx, 10)).unwrap();
-    let appends = store.evaluations();
-    store.inject(Fault::BeforePublication);
+    let appends = store.inner.evaluations();
+    store.inner.inject(Fault::BeforePublication);
+    // History can become visible before append returns and the service swaps
+    // its cached view. Exercise that interval on every run.
+    store.delay.store(true, Ordering::Relaxed);
     clock.store(now + 100, Ordering::Relaxed);
     let start = Instant::now();
-    while lapses(&store, &tx) == 0 {
+    while show(&service).1 != "0" {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "the hold never lapsed"
@@ -349,7 +355,8 @@ fn a_failed_lapse_is_retried_after_a_pause() {
         thread::sleep(Duration::from_millis(5));
     }
     // One failed append, then one that lapsed it a second later, not a spin.
-    assert_eq!(store.evaluations() - appends, 2);
+    assert_eq!(store.inner.evaluations() - appends, 2);
+    assert_eq!(lapses(&store.inner, &tx), 1);
     assert!(start.elapsed() >= Duration::from_millis(900));
     assert_eq!(show(&service), ("5".into(), "0".into()));
 }

@@ -1,0 +1,22 @@
+[package]
+name = "rescrow-dsql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rescrow-application.workspace = true
+rescrow-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tokio = { version = "1.54", features = ["rt-multi-thread", "time", "sync"] }
+sqlx = { version = "0.9", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls-ring"] }
+# Application owns retries and unknown publication outcomes. Do not enable occ.
+aurora-dsql-sqlx-connector = { version = "0.2.2", features = ["pool"] }
+aws-config = "1.8"
+aws-sdk-dsql = "1.84"
+
+[dev-dependencies]
+rescrow-test-support.workspace = true
+url = "2.5"

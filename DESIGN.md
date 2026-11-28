@@ -1,6 +1,6 @@
 # Rescrow: durable escrow reservations in Rust
 
-Status: proposed distributed/enterprise design. The local CLI, M1 server foundation and M2 HTTP API are implemented; see README.md for supported commands and tested limits. Local development benchmark measurements are recorded in README.md; enterprise performance and durability remain unqualified.
+Status: proposed distributed/enterprise design. The local CLI, M1 server foundation and M2 HTTP API are implemented; see README.md for supported commands and tested limits. An experimental DSQL adapter and authenticated HTTP load driver are under development; [real qualification and its decision record](docs/dsql-qualification.md) remain pending. Local development benchmark measurements are recorded in README.md; enterprise performance and durability remain unqualified.
 
 Date: 2026-11-13.
 
@@ -344,6 +344,13 @@ MRSC's lack of transactions is why this design originally required the separate-
 - **MRSC tables** are strongly consistent but have no transactions, so they would need §7's separate-key protocol.
 
 That protocol stays specified, in case DSQL misses its gates and MRSC is reconsidered.
+
+Prototype evidence as of 2026-11-27: actual AWS qualification is deferred at the
+user's request. The [official AWS Emulator 1.0.665 check](docs/aws-emulator.md)
+passes DSQL control-plane and native TLS/authentication checks, but its SQL
+endpoint rejects SQLx bound queries and schema-qualified DDL. Reservation and
+HTTP tests therefore cannot run on that emulator release. This result does not
+change the DSQL selection or satisfy its real multi-Region acceptance gates.
 
 **On a transactional authority:**
 - Run each transition as one transaction that reads the affected records and conditionally writes them together with their history.
@@ -790,7 +797,7 @@ Choose a synchronous Application and storage port with bounded `spawn_blocking` 
 
 The cost is one blocking thread per dispatched operation, bounded by configuration. M2 uses this boundary with separate admission/decision/recovery lanes and graceful draining; it does not establish that blocking bridges will be optimal for later database clients. Revisit with representative adapters if measurements justify an async port. The reproducible memory spike and measured throughput/p99 are in README; hot-resource contention remains visible and is M5 work.
 
-`Readiness` returns capabilities observed from actual infrastructure. Startup and per-request profile requirements are fail-closed, and server response metadata reports the actual profile. Current memory/file authorities provide only simulation/local respectively. Future DSQL readiness must verify actual two-active-Region peering and a distinct witness before an enterprise profile can be served; a configuration label is insufficient. M2 adds HTTP over those existing authorities. No DSQL, regional authority or enterprise qualification is implemented.
+`Readiness` returns capabilities observed from actual infrastructure. Startup and per-request profile requirements are fail-closed, and server response metadata reports the actual profile. Memory/file authorities provide only simulation/local respectively. Experimental DSQL readiness requires the serving Region's live AWS `ACTIVE` attestation of completed peering, two active member ARNs, and a distinct witness before an enterprise profile can be served; a configuration label is insufficient. Startup therefore does not depend on the other Region's control plane. Qualification independently observes both peers and compares their membership and generation. M2 adds HTTP over the existing authorities. The DSQL adapter remains experimental pending real qualification; standalone regional authorities and enterprise qualification are not implemented.
 
 ## 12. Verification and operational readiness
 
