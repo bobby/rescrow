@@ -1,0 +1,66 @@
+{
+  "authenticated_http_benchmark_run": false,
+  "aws_cli_version": "aws-cli/2.42.5 Python/3.14.10 Linux/7.2.8-9-omarchy exe/x86_64.omarchy.4",
+  "control_plane": {
+    "account": "000000000000",
+    "cluster": {
+      "arn": "arn:aws:dsql:us-east-1:000000000000:cluster/01m8g3bf9rvkxb6d71jm91cyx3",
+      "creationTime": "2026-11-27T21:32:02.488876-06:00",
+      "deletionProtectionEnabled": false,
+      "encryptionDetails": {
+        "encryptionStatus": "ENABLED",
+        "encryptionType": "AWS_OWNED_KMS_KEY"
+      },
+      "endpoint": "127.0.0.1",
+      "identifier": "01m8g3bf9rvkxb6d71jm91cyx3",
+      "status": "ACTIVE",
+      "tags": {}
+    },
+    "create_cluster": "passed",
+    "get_cluster": "passed"
+  },
+  "data_plane": {
+    "adapter_prerequisites_passed": false,
+    "checks": {
+      "bound_query": {
+        "diagnostic": "this endpoint serves the simple query protocol; message type 'P' is not supported",
+        "passed": false,
+        "sqlstate": "0A000"
+      },
+      "public_schema": {
+        "diagnostic": "unknown database public",
+        "passed": false,
+        "sqlstate": "42601"
+      },
+      "repeatable_read_commands": {
+        "diagnostic": null,
+        "passed": true,
+        "sqlstate": null
+      },
+      "simple_query": {
+        "diagnostic": null,
+        "passed": true,
+        "sqlstate": null
+      },
+      "tls_authentication": {
+        "diagnostic": null,
+        "passed": true,
+        "sqlstate": null
+      }
+    },
+    "reservation_semantics_qualified": false
+  },
+  "emulator_sha256": "7062804f165cbc10964d83e50cbd49131e0c14628fea2561310a6fed7e5ca8ec",
+  "emulator_version": "Version: 1.0.665\nRelease date: 2026.11.27\nCommit: 461e190cfbed2a60f922688bafee74a0fd88eec8",
+  "kind": "aws-emulator-dsql-compatibility",
+  "note": "Passing prerequisites would permit adapter integration work, not qualification.",
+  "probe_sha256": "5b64d78c0212313121244ee1769679af5c0de3b1f7c221809f6ec9524ba8ec07",
+  "real_multi_region_qualified": false,
+  "recorded_at": "2026-11-28T03:32:04.880021+00:00",
+  "reservation_histories_run": false,
+  "sources_sha256": {
+    "Cargo.lock": "e9e0557205474f61f9bb962816292d13d902603333b92a30de05bf3daf8d703d",
+    "crates/rescrow-dsql/examples/emulator_probe.rs": "05b3849d87ba18ea25007401704bed3218de0024b6acfc591402c02e43b04c1a",
+    "tools/dsql-emulator.py": "4b1622b0424e9f02061ae15fb0b8ac66ee1fab86d0a1553953038019b9789d0a"
+  }
+}

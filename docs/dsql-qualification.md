@@ -1,8 +1,11 @@
 # DSQL adapter qualification
 
-Status: experimental implementation; real DSQL qualification and the enterprise
-performance decision are pending. PostgreSQL simulation is development evidence.
-It does not establish DSQL concurrency, replication, cost, or regional recovery.
+Status: experimental implementation; actual AWS use and real multi-Region
+qualification are deferred at the user's request. The official
+[AWS Emulator compatibility run](aws-emulator.md) passes control-plane and TLS
+checks but cannot run the adapter on release 1.0.665 because bound queries are
+unsupported. PostgreSQL simulation remains separate development evidence.
+Neither establishes DSQL concurrency, replication, cost, or regional recovery.
 
 The acceptance requirements are [#46](https://github.com/bobby/rescrow/issues/46),
 [#47](https://github.com/bobby/rescrow/issues/47), and [DESIGN §9.3](../DESIGN.md#93-provisional-performance-gates).
@@ -110,6 +113,12 @@ The implementation's capability metadata describes observed infrastructure;
 the experimental status still applies until the evidence below exists.
 
 ## Development and real qualification
+
+Use the [AWS Emulator compatibility gate](aws-emulator.md) to check official
+emulator releases locally. Its current SQL protocol gaps prevent reservation
+conformance and authenticated HTTP measurements on that target. The following
+PostgreSQL simulation remains useful for the storage algorithm, with its target
+explicitly identified; it is not an AWS Emulator run.
 
 The loopback simulator uses exactly the same schema and port implementation, but
 reports only `simulation`, with no cross-process/crash durability claim. Start a
@@ -287,7 +296,10 @@ complete measurement packet does not qualify correctness or regional recovery.
 
 ## Decision record and remaining evidence
 
-The decision remains **pending real measurements**. Keep DSQL as the selected
+The decision remains **pending real measurements**, with actual AWS work deferred
+at the user's request. AWS Emulator 1.0.665's protocol incompatibility is recorded
+in the [local compatibility result](aws-emulator.md); it is not evidence that
+actual DSQL fails the acceptance gates. Keep DSQL as the selected
 prototype candidate, without claiming the enterprise gates have passed. Attach:
 
 | Evidence | Acceptance |

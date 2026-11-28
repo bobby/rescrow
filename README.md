@@ -290,7 +290,7 @@ Server work is tracked as GitHub milestones, roughly in order. Each builds on th
 
 The following instructions apply to all contributors, human and agent, throughout this repository. Read [DESIGN.md](DESIGN.md) for the current technical proposal. Agent contributors must also read [AGENTS.md](AGENTS.md) for agent-specific instructions. Keep shared contributor guidance here and reserve AGENTS.md for instructions specific to agents.
 
-The local CLI, M1 server foundation and M2 HTTP API are implemented. The experimental DSQL adapter is under development with real cloud qualification pending; other infrastructure backends and the broader distributed/enterprise design remain proposed. Do not imply that deferred APIs, commands, guarantees, benchmarks, or crates already exist. Keep the public explanation, architecture, and implementation consistent as the project develops.
+The local CLI, M1 server foundation and M2 HTTP API are implemented. The experimental DSQL adapter is under development with real cloud qualification deferred; [official AWS Emulator compatibility](docs/aws-emulator.md) is checked separately. Other infrastructure backends and the broader distributed/enterprise design remain proposed. Do not imply that deferred APIs, commands, guarantees, benchmarks, or crates already exist. Keep the public explanation, architecture, and implementation consistent as the project develops.
 
 ### Simplicity and design judgment
 

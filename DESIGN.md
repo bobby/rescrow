@@ -345,6 +345,13 @@ MRSC's lack of transactions is why this design originally required the separate-
 
 That protocol stays specified, in case DSQL misses its gates and MRSC is reconsidered.
 
+Prototype evidence as of 2026-11-27: actual AWS qualification is deferred at the
+user's request. The [official AWS Emulator 1.0.665 check](docs/aws-emulator.md)
+passes DSQL control-plane and native TLS/authentication checks, but its SQL
+endpoint rejects SQLx bound queries and schema-qualified DDL. Reservation and
+HTTP tests therefore cannot run on that emulator release. This result does not
+change the DSQL selection or satisfy its real multi-Region acceptance gates.
+
 **On a transactional authority:**
 - Run each transition as one transaction that reads the affected records and conditionally writes them together with their history.
 - Treat a serialization or optimistic-concurrency conflict as a lost race: reload and re-evaluate, as the local store does after a conflicting append.
