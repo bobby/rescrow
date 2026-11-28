@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Barrier;
+const BILLING_GUARD_MS: u64 = 2000;
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +75,7 @@ struct Args {
     /// Alternate debit and credit requests instead of only debits.
     #[arg(long)]
     opposing: bool,
+    /// Settlement percentage, rounded toward zero to whole units of a 10-unit hold.
     #[arg(long, default_value_t = 100)]
     actual_percent: u8,
     /// Null means no automatic expiry.
@@ -92,6 +94,12 @@ struct Args {
     attempt_timeout_ms: u64,
     #[arg(long, default_value_t = 30000)]
     overall_timeout_ms: u64,
+    /// Quiescent time before/after measurement for bracketing server counters.
+    #[arg(long, default_value_t = 2000)]
+    measurement_idle_ms: u64,
+    /// Isolate a whole-minute billing window after warmup; may wait a minute.
+    #[arg(long)]
+    align_billing_window: bool,
 }
 #[derive(Clone, Serialize)]
 struct Plan {
@@ -115,6 +123,23 @@ struct Event {
 }
 fn micros(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+fn wall_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after Unix epoch")
+        .as_millis()
+        .try_into()
+        .expect("wall time fits u64 milliseconds")
+}
+async fn wait_until_ms(deadline: u64) {
+    loop {
+        let remaining = deadline.saturating_sub(wall_ms());
+        if remaining == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(remaining.min(1000))).await;
+    }
 }
 fn histogram<'a>(
     values: impl Iterator<Item = &'a Event>,
@@ -222,6 +247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         || args.hold_ms == Some(0)
         || args.hold_ms.is_some_and(|h| h > 30 * 24 * 60 * 60 * 1000)
         || args.settle_delay_ms > 300_000
+        || args.measurement_idle_ms > 10_000
     {
         return Err("invalid workload bounds".into());
     }
@@ -300,7 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     File::open(&args.output)?.sync_all()?;
     write_new(
         args.output.join("configuration.json"),
-        &json!({"run_id":run_id,"arguments":args,"resources":resources,"machine":{"os":std::env::consts::OS,"architecture":std::env::consts::ARCH,"available_cpus":std::thread::available_parallelism()?.get()},"started_at_ms":SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),"build_profile":if cfg!(debug_assertions) {"debug"} else {"release"},"measurement":"closed_loop; response latency includes client retries; HTTP body bytes exclude headers/TLS/storage; database metrics and cost require separate collection"}),
+        &json!({"run_id":run_id,"arguments":args,"resources":resources,"machine":{"os":std::env::consts::OS,"architecture":std::env::consts::ARCH,"available_cpus":std::thread::available_parallelism()?.get()},"started_at_ms":wall_ms(),"build_profile":if cfg!(debug_assertions) {"debug"} else {"release"},"build_revision":option_env!("RESCROW_BUILD_REVISION"),"build_rustc":option_env!("RESCROW_BUILD_RUSTC"),"measurement":"closed_loop; response latency includes client retries; HTTP body bytes exclude headers/TLS/storage; database metrics and cost require separate collection"}),
     )?;
     for resource_id in &resources {
         client
@@ -336,8 +362,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
     warmup_done.wait().await;
+    let earliest_start = wall_ms()
+        + args.measurement_idle_ms.max(if args.align_billing_window {
+            BILLING_GUARD_MS
+        } else {
+            0
+        });
+    let billing_started_at_ms = if args.align_billing_window {
+        Some((earliest_start / 60_000 + 1) * 60_000)
+    } else {
+        None
+    };
+    wait_until_ms(
+        billing_started_at_ms
+            .map(|start| start + BILLING_GUARD_MS)
+            .unwrap_or(earliest_start),
+    )
+    .await;
     let before = serde_json::to_value(client.measurements())?;
-    let started_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    let started_at_ms = wall_ms();
     let start = Instant::now();
     barrier.wait().await;
     let mut events = Vec::new();
@@ -345,7 +388,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         events.extend(task.await?);
     }
     let duration = start.elapsed();
-    let finished_at_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    let finished_at_ms = wall_ms();
+    let billing_finished_at_ms = args
+        .align_billing_window
+        .then(|| (finished_at_ms + BILLING_GUARD_MS).div_ceil(60_000) * 60_000);
     let mut measurements = serde_json::to_value(client.measurements())?;
     for (key, value) in measurements.as_object_mut().ok_or("invalid measurements")? {
         *value = json!(
@@ -384,6 +430,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "authority_generation":client.authority_generation(),
         "measurement_started_at_ms":started_at_ms,
         "measurement_finished_at_ms":finished_at_ms,
+        "billing_window_started_at_ms":billing_started_at_ms,
+        "billing_window_finished_at_ms":billing_finished_at_ms,
+        "billing_clock_guard_ms":args.align_billing_window.then_some(BILLING_GUARD_MS),
         "duration_seconds":duration.as_secs_f64(),
         "completed_reservations":committed,
         "completed_reservations_per_second":committed as f64/duration.as_secs_f64(),
@@ -419,6 +468,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_file.write_all(b"\n")?;
     }
     event_file.sync_all()?;
+    wait_until_ms(billing_finished_at_ms.unwrap_or(finished_at_ms) + args.measurement_idle_ms)
+        .await;
     write_new(args.output.join("summary.json"), &summary)?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     if unknown > 0 || failed_commits > 0 {

@@ -61,7 +61,8 @@ Use an existing peered cluster or agree on an AWS account/profile, two active
 Regions, witness Region and spend cap before provisioning a disposable cluster.
 Configure credentials through the normal AWS credential chain, never in JSON or
 source control. The runtime identity needs IAM database connection permission and
-`dsql:GetCluster` for both peers. Database grants must permit reading authorities,
+`dsql:GetCluster` in its serving Region; the qualification identity needs access
+to both peers. Database grants must permit reading authorities,
 reading/writing records and inserting/reading publications. Schema installation
 and authority initialization use a separately authorized administrative identity.
 
@@ -79,8 +80,13 @@ An adapter configuration file has this shape; replace the sample ARN:
 ```
 
 Create a second file for the other active cluster, keeping the authority name the
-same. Status reads both live AWS descriptions, requires active reciprocal peers
-and a distinct common witness, and verifies the derived SQL endpoint identity.
+same. Status reads live serving-Region AWS metadata, requires an `ACTIVE` cluster,
+two member ARNs and a distinct witness, and verifies the derived SQL endpoint
+identity. AWS transitions a multi-Region cluster to `ACTIVE` after
+[peering completes](https://docs.aws.amazon.com/aurora-dsql/latest/userguide/multi-region-aws-cli.html).
+Startup uses that service attestation without depending on the other Region's
+control plane. Qualification separately captures status from both peers and
+compares their membership, witness and actual authority generation.
 A single-Region cluster or requested profile label cannot pass this check.
 
 ```sh
@@ -138,6 +144,8 @@ histories, concurrent linearizability, tenant/namespace isolation, causal orderi
 absence write skew, immutable publication resolution, and a lost HTTP response
 after durable preparation. Peer qualification opens independent connections,
 reads a peer publication, writes through the peer and reopens the authority.
+Peered concurrent histories alternate port calls between independently opened
+connections, including reads and publications that reach different active peers.
 The PostgreSQL-only transport test withholds the server's completed COMMIT
 response, then verifies an unknown result resolves to exactly one publication.
 Additional real DSQL transport-loss, stale-publisher, process termination and impairment
@@ -148,13 +156,17 @@ experiments must accompany these tests before the acceptance gate passes.
 Build the load generator in release mode:
 
 ```sh
-cargo build --release -p rescrow-client --example http_bench --locked
+git diff --quiet HEAD && \
+  RESCROW_BUILD_REVISION="$(git rev-parse HEAD)" \
+  RESCROW_BUILD_RUSTC="$(rustc -Vv)" \
+  cargo build --release -p rescrow-client --example http_bench --locked
 target/release/examples/http_bench \
   --endpoint https://active-a.example \
   --token-file /path/to/short-lived-workload-token \
   --profile enterprise-mr --authority-generation ACTUAL-GENERATION-UUID \
   --clients 8 --iterations 1000 --warmup 100 \
-  --workload independent --opposing --output /path/to/new-result-directory
+  --workload independent --opposing --align-billing-window \
+  --output /path/to/new-result-directory
 ```
 
 Use dedicated test-tenant credentials that permit resource creation, preparation,
@@ -201,6 +213,77 @@ retain the pricing retrieval date. AWS documents the
 and [regional pricing](https://aws.amazon.com/rds/aurora/dsql/pricing/).
 Report DPU-only estimates separately from billed cost, storage, network, service
 compute and observability. SQL statement count is not a DPU estimate.
+
+## Assemble a measurement report
+
+The driver records its embedded build revision/toolchain and waits two quiet
+seconds before and after measurement for adapter-counter snapshots. With
+`--align-billing-window`, it also isolates full UTC minutes after warmup and
+reports their exact boundaries. Warmup traffic stays outside that billing window.
+The workload starts two seconds into the billing window and leaves at least two
+seconds before its end, guarding against small clock differences at minute
+boundaries. Client/server clocks must be synchronized within that bound and the
+test infrastructure must be dedicated for attribution.
+
+Capture `rescrow-dsql status` from each active peer into separate JSON files. Keep
+one completed server log per process, including its startup generation and DSQL
+counters. Archive the logs after measurement before assembling evidence.
+
+`tools/dsql-report.py` uses the standard Python library. Its `collect-dpu` command
+uses AWS CLI v2 and the usual login/profile flow for one read-only CloudWatch
+request; it records the exact metric, cluster, window and response. Read the
+billing boundaries from `summary.json` and collect each active cluster:
+
+```sh
+python3 tools/dsql-report.py collect-dpu \
+  --cluster-arn ACTUAL-CLUSTER-ARN --profile rescrow-qualification \
+  --start-ms BILLING-START-MS --end-ms BILLING-END-MS \
+  --output /path/to/dpu-a.json
+```
+
+Use a new output filename if metrics have not arrived yet. Missing data is not
+treated as zero. The request uses `TotalDPU`, `Sum`, and 60-second periods; the
+window must be at most 24 hours. Collect promptly because CloudWatch retains
+minute resolution for 15 days ([API behavior](https://docs.aws.amazon.com/cli/latest/reference/cloudwatch/get-metric-statistics.html)).
+
+Supply current regional prices separately in a JSON manifest. Paths to metric
+files are relative to that manifest. For example, replace both placeholders in
+each entry and include one entry per active peer:
+
+```json
+{
+  "peers": [
+    {
+      "metrics_file": "dpu-a.json",
+      "price_usd_per_million_dpu": "CURRENT-REGION-A-PRICE",
+      "pricing_source": "https://aws.amazon.com/rds/aurora/dsql/pricing/",
+      "price_checked_at": "YYYY-MM-DDTHH:MM:SSZ"
+    },
+    {
+      "metrics_file": "dpu-b.json",
+      "price_usd_per_million_dpu": "CURRENT-REGION-B-PRICE",
+      "pricing_source": "https://aws.amazon.com/rds/aurora/dsql/pricing/",
+      "price_checked_at": "YYYY-MM-DDTHH:MM:SSZ"
+    }
+  ]
+}
+```
+
+```sh
+python3 tools/dsql-report.py report /path/to/run-directory \
+  --topology /path/to/status-a.json --topology /path/to/status-b.json \
+  --server-log /path/to/server-a.log --server-log /path/to/server-b.log \
+  --dpu-manifest /path/to/prices.json
+```
+
+The resulting `evidence.json` validates request/event identities and counts,
+matches the HTTP generation and both actual peer ARN sets, requires stable
+counter boundaries, sums each peer's DPU usage once using its own price, and
+hashes source artifacts. It distinguishes SQL/payload measurements from physical
+storage traffic and labels cost per million **completed reservations** explicitly.
+Unresolved work cannot produce a successful completed-reservation cost estimate.
+Outputs never overwrite existing evidence. Missing inputs remain listed; even a
+complete measurement packet does not qualify correctness or regional recovery.
 
 ## Decision record and remaining evidence
 

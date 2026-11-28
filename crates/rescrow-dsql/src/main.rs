@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use rescrow_application::{authority::TransactionalStore, capabilities::Readiness};
+use rescrow_application::authority::TransactionalStore;
 use rescrow_dsql::{Config, DsqlStore};
 use std::{io::Read, path::PathBuf};
 
@@ -46,12 +46,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.command {
         Command::InstallSchema => store.install_schema()?,
         Command::Initialize => store.initialize()?,
-        Command::Status => println!(
-            "{}",
-            serde_json::to_string_pretty(
-                &serde_json::json!({"authority_generation":store.identity()?,"capabilities":store.readiness()?})
-            )?
-        ),
+        Command::Status => {
+            let topology = store.topology()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"authority_generation":store.identity()?,"cluster_arn":store.cluster_arn(),"cluster_arns":topology.cluster_arns,"capabilities":topology.capabilities})
+                )?
+            );
+        }
     }
     Ok(())
 }

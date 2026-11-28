@@ -24,6 +24,7 @@ use std::{
     time::Duration,
 };
 use tokio::runtime::Runtime;
+pub use topology::Topology;
 use wire::{Key, Publication, StoredValue, corrupt, decode, encode};
 
 // Below DSQL's 1 MiB column, 2 MiB row and 10 MiB transaction ceilings,
@@ -263,6 +264,31 @@ impl DsqlStore {
     }
     pub fn measurements(&self) -> Measurements {
         self.0.counters.snapshot()
+    }
+    /// SQL connection target, verified against live GetCluster during connect.
+    /// Simulation has no AWS cluster identity.
+    pub fn cluster_arn(&self) -> Option<&str> {
+        self.0
+            .config
+            .as_ref()
+            .map(|config| config.cluster_arn.as_str())
+    }
+    /// Inspect live serving-Region service metadata for this initialized
+    /// authority. Simulation has no AWS cluster members.
+    pub fn topology(&self) -> Result<Topology, StoreError> {
+        self.identity()?;
+        match &self.0.config {
+            Some(config) => self.run(topology::inspect(config), false),
+            None => Ok(Topology {
+                cluster_arns: BTreeSet::new(),
+                capabilities: Capabilities {
+                    multi_tenant: true,
+                    max_record_bytes: Some(MAX_COLUMN_BYTES as u64),
+                    max_participants: Some(MAX_PARTICIPANTS),
+                    ..Capabilities::simulation()
+                },
+            }),
+        }
     }
     async fn begin(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, StoreError> {
         self.0
@@ -734,15 +760,6 @@ impl DsqlStore {
 
 impl Readiness for DsqlStore {
     fn readiness(&self) -> Result<Capabilities, StoreError> {
-        self.identity()?;
-        match &self.0.config {
-            Some(config) => self.run(topology::inspect(config), false),
-            None => Ok(Capabilities {
-                multi_tenant: true,
-                max_record_bytes: Some(MAX_COLUMN_BYTES as u64),
-                max_participants: Some(MAX_PARTICIPANTS),
-                ..Capabilities::simulation()
-            }),
-        }
+        Ok(self.topology()?.capabilities)
     }
 }

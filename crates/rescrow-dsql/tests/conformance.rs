@@ -10,7 +10,10 @@ use rescrow_dsql::{Config, DsqlStore};
 use rescrow_test_support::{Config as SuiteConfig, concurrent, generated, qualification};
 use std::{
     path::PathBuf,
-    sync::{Arc, Barrier},
+    sync::{
+        Arc, Barrier,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 fn store() -> DsqlStore {
@@ -99,6 +102,62 @@ fn generated_histories() {
 fn concurrent_histories() {
     let failures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/dsql-histories");
     concurrent::run(store, &failures);
+}
+
+/// Deliberately route successive port calls over both independently opened
+/// peers. A read and its publication may reach different active Regions.
+#[derive(Clone)]
+struct Peered {
+    stores: [DsqlStore; 2],
+    next: Arc<AtomicUsize>,
+}
+impl Peered {
+    fn selected(&self) -> &DsqlStore {
+        &self.stores[self.next.fetch_add(1, Ordering::Relaxed) % 2]
+    }
+}
+impl TransactionalStore for Peered {
+    fn identity(&self) -> Result<String, StoreError> {
+        self.selected().identity()
+    }
+    fn initialize(&self) -> Result<(), StoreError> {
+        self.stores[0].initialize()
+    }
+    fn read(&self, tenant: &TenantId, keys: &[RecordKey], since: u64) -> Result<Read, StoreError> {
+        self.selected().read(tenant, keys, since)
+    }
+    fn scan(&self, tenant: &TenantId) -> Result<Inspection, StoreError> {
+        self.selected().scan(tenant)
+    }
+    fn commit(&self, commit: &Commit) -> Result<CommitOutcome, StoreError> {
+        self.selected().commit(commit)
+    }
+    fn resolve(&self, tenant: &TenantId, id: &TransitionId) -> Result<Resolution, StoreError> {
+        self.selected().resolve(tenant, id)
+    }
+    fn history(&self, tenant: &TenantId) -> Result<Vec<HistoryRecord>, StoreError> {
+        self.selected().history(tenant)
+    }
+}
+
+#[test]
+#[ignore = "requires an explicit PostgreSQL simulation or both real DSQL active peers"]
+fn peered_concurrent_histories() {
+    let failures =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/dsql-peered-histories");
+    concurrent::run(
+        || {
+            let authority = format!("peered-history-{}", rescrow_application::new_id().unwrap());
+            let left = connect(&authority, false);
+            left.install_schema().unwrap();
+            let right = connect(&authority, true);
+            Peered {
+                stores: [left, right],
+                next: Arc::new(AtomicUsize::new(0)),
+            }
+        },
+        &failures,
+    );
 }
 
 #[test]
