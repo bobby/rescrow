@@ -100,6 +100,13 @@ async fn lost_http_response_retries_identical_key_and_bytes_without_reserving_tw
         assert_eq!(records.len(), 2);
         assert_eq!(records[0], records[1]);
         assert_eq!(records[0].0.as_deref(), Some(id.as_str()));
+        let metrics = client.measurements();
+        assert_eq!(metrics.attempts, 2);
+        assert_eq!(metrics.retries, 1);
+        assert_eq!(metrics.responses, 2);
+        assert_eq!(metrics.retryable_responses, 1);
+        assert_eq!(metrics.request_body_bytes, (2 * records[0].1.len()) as u64);
+        assert!(metrics.response_body_bytes > 0);
     }
     let output = client
         .execute(dto::Command::ShowResource {
@@ -131,13 +138,16 @@ async fn explicit_fallback_requires_the_same_actual_authority() {
     config.authority_generation = Some(h.generation.clone());
     config.overall_timeout = Duration::from_secs(3);
     config.attempt_timeout = Duration::from_secs(1);
-    Client::new(config)
-        .unwrap()
+    let fallback = Client::new(config).unwrap();
+    fallback
         .execute(dto::Command::ShowResource {
             resource_id: "credits".into(),
         })
         .await
         .unwrap();
+    assert_eq!(fallback.measurements().attempts, 2);
+    assert_eq!(fallback.measurements().retries, 1);
+    assert_eq!(fallback.measurements().transport_failures, 1);
     let other = Harness::start(Limits::default()).await;
     let mut config = Config::new(other.endpoint.clone(), token);
     config.authority_generation = Some(h.generation.clone());

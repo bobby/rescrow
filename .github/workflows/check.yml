@@ -3,6 +3,18 @@ on: [push, pull_request]
 jobs:
   local:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -35,6 +47,12 @@ jobs:
         run: |
           RESCROW_CLI_TEST_SERVER="$GITHUB_WORKSPACE/target/debug/rescrow-http" \
           cargo test -p rescrow-cli --features remote --test cli --locked
+      - name: DSQL port and authenticated HTTP on PostgreSQL simulation
+        env:
+          RESCROW_POSTGRES_SIMULATION_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: |
+          cargo test -p rescrow-dsql --test conformance --test postgres_transport --locked -- --ignored --test-threads=1
+          cargo test -p rescrow-http --features dsql --test dsql --locked -- --ignored --test-threads=1
       - name: Validate OpenAPI and actual HTTP contract captures
         run: python3 tools/check-contract.py "$RUNNER_TEMP/rescrow-contract-http.json"
       - run: cargo build -p rescrow-cli --locked

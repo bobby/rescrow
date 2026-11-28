@@ -32,6 +32,9 @@ enum Backend {
     Memory,
     /// An existing initialized local authority. Startup never initializes/resets it.
     File { path: PathBuf },
+    /// Existing DSQL authority. Schema installation and initialization are explicit.
+    #[cfg(feature = "dsql")]
+    Dsql { config: rescrow_dsql::Config },
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,6 +72,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run(store, config).await
         }
         Backend::File { path } => run(FileStore::new(path)?, config).await,
+        #[cfg(feature = "dsql")]
+        Backend::Dsql { config: dsql } => {
+            let dsql = dsql.clone();
+            let store = tokio::task::spawn_blocking(move || rescrow_dsql::DsqlStore::connect(dsql))
+                .await??;
+            let observed = store.clone();
+            let monitor = tokio::spawn({
+                let observed = observed.clone();
+                async move {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+                    loop {
+                        interval.tick().await;
+                        if let Ok(measurements) = serde_json::to_string(&observed.measurements()) {
+                            tracing::info!(target: "rescrow_http::dsql", %measurements, "DSQL cumulative measurements");
+                        }
+                    }
+                }
+            });
+            let result = run(store, config).await;
+            monitor.abort();
+            if let Ok(measurements) = serde_json::to_string(&observed.measurements()) {
+                tracing::info!(target: "rescrow_http::dsql", %measurements, "DSQL final measurements");
+            }
+            result
+        }
     }
 }
 async fn shutdown() {
@@ -88,7 +116,9 @@ async fn run<S: TransactionalStore + Readiness + Send + Sync + 'static>(
     config: Composition,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let auth = Arc::new(JwtAuthenticator::new(config.issuers)?);
-    let api = Api::new(Application::new(store), config.api, auth)?;
+    let api =
+        tokio::task::spawn_blocking(move || Api::new(Application::new(store), config.api, auth))
+            .await??;
     let listener = std::net::TcpListener::bind(config.listen)?;
     listener.set_nonblocking(true)?;
     tracing::info!(address=%listener.local_addr()?, authority_generation=api.server().authority_generation(), "serving HTTP API");

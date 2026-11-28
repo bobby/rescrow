@@ -80,7 +80,7 @@ An unknown outcome is never a known rollback. A new reservation ID can reserve a
 
 The optional `rescrow-http` executable uses Tokio, Axum/Tower and pinned workload JWT verification over the same Application. [API.md](API.md) contains configuration, a runnable local service example, the [OpenAPI 3.1 contract](openapi/rescrow-v1.json), limits, the exhaustive problem table, and client generation/verification commands. Resource/reservation endpoints support tenant isolation, current authorization on replay, signed keyset cursors, bounded traffic lanes and atomic outstanding-hold quotas. Memory is an explicit disposable simulation; file storage retains its local durability profile.
 
-Build `cargo build -p rescrow-cli --features remote --locked` to enable `--endpoint`. The default CLI build keeps Tokio, Axum, HTTP clients and cloud SDKs out of its normal dependency graph, checked in CI. Rust, generated Python and generated TypeScript clients preserve the same identity and request through bounded retries; alternate endpoints require a pinned actual authority generation. Regional and enterprise backends remain unimplemented and unqualified.
+Build `cargo build -p rescrow-cli --features remote --locked` to enable `--endpoint`. The default CLI build keeps Tokio, Axum, HTTP clients and cloud SDKs out of its normal dependency graph, checked in CI. Rust, generated Python and generated TypeScript clients preserve the same identity and request through bounded retries; alternate endpoints require a pinned actual authority generation. The optional [experimental DSQL adapter and HTTP benchmark](docs/dsql-qualification.md) are under development; real multi-Region correctness, performance and recovery remain unqualified. Standalone regional PostgreSQL and SlateDB backends remain unimplemented.
 
 ## Rust callers and boundaries
 
@@ -90,8 +90,9 @@ The local build has four production crates; optional HTTP/client composition and
 rescrow-cli -> rescrow-adapters -> rescrow-application -> rescrow-domain
            -> rescrow-application
 rescrow-server -> rescrow-application          (bounded Tokio boundary)
-rescrow-http -> rescrow-server + rescrow-adapters (Axum/Tower + JWT + TLS)
+rescrow-http -> rescrow-server + rescrow-adapters (optional rescrow-dsql; Axum/Tower + JWT + TLS)
 rescrow-client -> rescrow-application          (reqwest + Tokio; optional CLI remote feature)
+rescrow-dsql -> rescrow-application            (SQLx + IAM; optional HTTP dsql feature)
 rescrow-test-support -> rescrow-application    (tests only)
 ```
 
@@ -289,7 +290,7 @@ Server work is tracked as GitHub milestones, roughly in order. Each builds on th
 
 The following instructions apply to all contributors, human and agent, throughout this repository. Read [DESIGN.md](DESIGN.md) for the current technical proposal. Agent contributors must also read [AGENTS.md](AGENTS.md) for agent-specific instructions. Keep shared contributor guidance here and reserve AGENTS.md for instructions specific to agents.
 
-The local CLI, M1 server foundation and M2 HTTP API are implemented; infrastructure backends and the broader distributed/enterprise design remain proposed. Do not imply that deferred APIs, commands, guarantees, benchmarks, or crates already exist. Keep the public explanation, architecture, and implementation consistent as the project develops.
+The local CLI, M1 server foundation and M2 HTTP API are implemented. The experimental DSQL adapter is under development with real cloud qualification pending; other infrastructure backends and the broader distributed/enterprise design remain proposed. Do not imply that deferred APIs, commands, guarantees, benchmarks, or crates already exist. Keep the public explanation, architecture, and implementation consistent as the project develops.
 
 ### Simplicity and design judgment
 

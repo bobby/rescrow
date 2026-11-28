@@ -9,7 +9,13 @@ use rescrow_application::{
     dto,
 };
 use serde::{Serialize, de::DeserializeOwned};
-use std::{sync::Mutex, time::Duration};
+use std::{
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::time::Instant;
 
 pub struct Config {
@@ -53,6 +59,31 @@ pub struct Client {
     endpoints: Vec<Url>,
     config: Config,
     generation: Mutex<Option<String>>,
+    counters: Counters,
+}
+/// Cumulative HTTP measurements. Byte counts cover application bodies only,
+/// excluding headers, TLS, TCP and database traffic. No credential is retained.
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct Measurements {
+    pub attempts: u64,
+    pub retries: u64,
+    pub responses: u64,
+    pub request_body_bytes: u64,
+    pub response_body_bytes: u64,
+    pub processing_responses: u64,
+    pub retryable_responses: u64,
+    pub transport_failures: u64,
+}
+#[derive(Default)]
+struct Counters {
+    attempts: AtomicU64,
+    retries: AtomicU64,
+    responses: AtomicU64,
+    request_body_bytes: AtomicU64,
+    response_body_bytes: AtomicU64,
+    processing_responses: AtomicU64,
+    retryable_responses: AtomicU64,
+    transport_failures: AtomicU64,
 }
 fn unknown(id: Option<&str>) -> Error {
     let mut e = Error::new(
@@ -138,7 +169,21 @@ impl Client {
             endpoints,
             config,
             generation,
+            counters: Counters::default(),
         })
+    }
+    pub fn measurements(&self) -> Measurements {
+        let counters = &self.counters;
+        Measurements {
+            attempts: counters.attempts.load(Ordering::Relaxed),
+            retries: counters.retries.load(Ordering::Relaxed),
+            responses: counters.responses.load(Ordering::Relaxed),
+            request_body_bytes: counters.request_body_bytes.load(Ordering::Relaxed),
+            response_body_bytes: counters.response_body_bytes.load(Ordering::Relaxed),
+            processing_responses: counters.processing_responses.load(Ordering::Relaxed),
+            retryable_responses: counters.retryable_responses.load(Ordering::Relaxed),
+            transport_failures: counters.transport_failures.load(Ordering::Relaxed),
+        }
     }
     pub fn authority_generation(&self) -> Option<String> {
         self.generation.lock().unwrap().clone()
@@ -185,8 +230,26 @@ impl Client {
                 );
             }
             let result = async {
-                let mut response = request.send().await.map_err(|_| unknown(id))?;
+                self.counters.attempts.fetch_add(1, Ordering::Relaxed);
+                if attempt > 0 {
+                    self.counters.retries.fetch_add(1, Ordering::Relaxed);
+                }
+                self.counters
+                    .request_body_bytes
+                    .fetch_add(body.as_ref().map_or(0, Vec::len) as u64, Ordering::Relaxed);
+                let mut response = request.send().await.map_err(|_| {
+                    self.counters
+                        .transport_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    unknown(id)
+                })?;
+                self.counters.responses.fetch_add(1, Ordering::Relaxed);
                 let status = response.status();
+                if status.as_u16() == 202 {
+                    self.counters
+                        .processing_responses
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let retry_after = response
                     .headers()
                     .get(header::RETRY_AFTER)
@@ -215,7 +278,15 @@ impl Client {
                 }
                 // Bound untrusted response bodies while streaming, including chunked replies.
                 let mut bytes = Vec::new();
-                while let Some(chunk) = response.chunk().await.map_err(|_| unknown(id))? {
+                while let Some(chunk) = response.chunk().await.map_err(|_| {
+                    self.counters
+                        .transport_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    unknown(id)
+                })? {
+                    self.counters
+                        .response_body_bytes
+                        .fetch_add(chunk.len() as u64, Ordering::Relaxed);
                     if bytes.len().saturating_add(chunk.len()) > 16 * 1024 * 1024 {
                         return Err(unknown(id));
                     }
@@ -249,6 +320,11 @@ impl Client {
                         return Err(unknown(id));
                     }
                     let retry = problem.retryable && matches!(status.as_u16(), 429 | 503);
+                    if retry {
+                        self.counters
+                            .retryable_responses
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     last = problem.into_error();
                     if !retry {
                         return Err(last.clone());

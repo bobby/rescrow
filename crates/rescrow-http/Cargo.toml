@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+dsql = ["dep:rescrow-dsql"]
+
 [dependencies]
+rescrow-dsql = { path = "../rescrow-dsql", optional = true }
 rescrow-application.workspace = true
 rescrow-adapters.workspace = true
 rescrow-server = { path = "../rescrow-server" }

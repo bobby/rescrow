@@ -54,8 +54,18 @@ impl<S: TransactionalStore + Readiness + Send + Sync + 'static> Server<S> {
             + limits.decisions.concurrency
             + limits.recovery.concurrency) as usize;
         let app = app.with_pending_limits(limits.pending)?;
+        let app = ReadyApplication::start(app, required)?;
+        if app
+            .capabilities()
+            .max_participants
+            .is_some_and(|max| limits.operation_count > max)
+        {
+            return Err(Error::input(
+                "HTTP operation_count exceeds the authority participant limit",
+            ));
+        }
         Ok(Self {
-            app: Arc::new(ReadyApplication::start(app, required)?),
+            app: Arc::new(app),
             permits: Arc::new(Semaphore::new(max_in_flight)),
             control: admission::Control::new(limits)?,
         })
